@@ -1,0 +1,26 @@
+# Environment / secrets
+.env
+
+# Authentication / browser sessions
+auth/storage_state.json
+playwright_profile/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Personal files
+resume/
+data/
+screenshots/
+
+# Logs / temporary files
+*.log
+*.tmp
+
+# IDE
+.vscode/
+.idea/
