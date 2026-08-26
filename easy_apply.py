@@ -3,7 +3,7 @@ import os
 import re
 
 from application_form import inspect_and_prepare_form
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ---------------------------------------
@@ -13,9 +13,22 @@ from playwright.sync_api import sync_playwright
 ANALYSIS_FILE = "data/job_analysis.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 
-MIN_MATCH_SCORE = 70
+try:
+    from config import (
+        MIN_MATCH_SCORE,
+        DAILY_APPLICATION_LIMIT,
+        AUTO_SUBMIT,
+        UNKNOWN_QUESTIONS_POLICY,
+        CHROME_CDP_URL,
+    )
+except ImportError:
+    MIN_MATCH_SCORE = 70
+    DAILY_APPLICATION_LIMIT = 15
+    AUTO_SUBMIT = True
+    UNKNOWN_QUESTIONS_POLICY = "STOP"
+    CHROME_CDP_URL = "http://127.0.0.1:9222"
 
-CHROME_CDP_URL = "http://127.0.0.1:9222"
+LAST_APPLICATION_RESULT = ""
 
 
 # ---------------------------------------
@@ -79,29 +92,52 @@ def _job_key(row):
 
 
 def get_application_statuses():
+    """
+    Return the strongest known application status for each exact job.
 
+    If older tracker rows have inconsistent Status/Application Status values,
+    a progressed status wins over NOT APPLIED/empty values.
+    """
     tracker = load_csv(TRACKER_FILE)
 
     statuses = {}
 
-    for row in tracker:
+    blocked_statuses = {
+        "APPLIED",
+        "SUBMITTED",
+        "INTERVIEW",
+        "REJECTED",
+        "WITHDRAWN",
+        "READY_FOR_REVIEW",
+    }
 
+    for row in tracker:
         key = _job_key(row)
 
         if not key:
             continue
 
-        status = (
-            row.get("Status")
-            or row.get("Application Status")
-            or "NOT APPLIED"
-        ).strip().upper()
+        status_values = [
+            (row.get("Status") or "").strip().upper(),
+            (row.get("Application Status") or "").strip().upper(),
+        ]
 
-        # Empty status means NOT APPLIED
-        if not status:
-            status = "NOT APPLIED"
+        status_values = [value for value in status_values if value]
 
-        statuses[key] = status
+        if not status_values:
+            effective_status = "NOT APPLIED"
+        else:
+            progressed = [
+                value for value in status_values
+                if value in blocked_statuses
+            ]
+            effective_status = (
+                progressed[0]
+                if progressed
+                else status_values[0]
+            )
+
+        statuses[key] = effective_status
 
     return statuses
 
@@ -236,20 +272,57 @@ def get_recommended_jobs():
 
 def update_tracker_status(job, status):
     """
-    Update the tracker row for the exact LinkedIn job.
-    Matching is done by job ID, not title, so duplicate titles are safe.
+    Update or create the tracker row for the exact LinkedIn job.
+
+    Matching is done by LinkedIn job ID/URL, not title, so duplicate titles
+    are safe. If the job was not already present in the tracker, a new row is
+    created so a confirmed application can never disappear from tracking.
     """
-    if not os.path.exists(TRACKER_FILE):
-        return False
-
     try:
-        with open(TRACKER_FILE, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-            fieldnames = list(rows[0].keys()) if rows else []
+        # Create the tracker file if it does not exist yet.
+        if not os.path.exists(TRACKER_FILE):
+            os.makedirs(os.path.dirname(TRACKER_FILE) or ".", exist_ok=True)
 
-        if not rows or not fieldnames:
-            return False
+            fieldnames = [
+                "Title",
+                "Company",
+                "Location",
+                "Match Score",
+                "Priority",
+                "Easy Apply",
+                "Application Status",
+                "Applied Date",
+                "Link",
+                "Status",
+            ]
 
+            rows = []
+        else:
+            with open(
+                TRACKER_FILE,
+                "r",
+                newline="",
+                encoding="utf-8"
+            ) as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                rows = list(reader)
+
+            if not fieldnames:
+                fieldnames = [
+                    "Title",
+                    "Company",
+                    "Location",
+                    "Match Score",
+                    "Priority",
+                    "Easy Apply",
+                    "Application Status",
+                    "Applied Date",
+                    "Link",
+                    "Status",
+                ]
+
+        # Keep both status columns synchronized.
         if "Status" not in fieldnames:
             fieldnames.append("Status")
 
@@ -259,19 +332,20 @@ def update_tracker_status(job, status):
         if "Applied Date" not in fieldnames:
             fieldnames.append("Applied Date")
 
+        if "Link" not in fieldnames:
+            fieldnames.append("Link")
+
         target_key = _job_key(job)
         today = __import__("datetime").date.today().isoformat()
 
         updated = False
 
+        # First try to update the exact existing job.
         for row in rows:
             if _job_key(row) != target_key:
                 continue
 
             row["Status"] = status
-
-            # Keep both status columns consistent because older tracker
-            # files contain both fields.
             row["Application Status"] = status
 
             if status in {"APPLIED", "SUBMITTED"}:
@@ -280,10 +354,43 @@ def update_tracker_status(job, status):
             updated = True
             break
 
+        # IMPORTANT: The previous code stopped here when the row did not
+        # already exist. That is why a successfully submitted new job such
+        # as Olyv was not added to application_tracker.csv.
         if not updated:
-            return False
+            new_row = {
+                field: ""
+                for field in fieldnames
+            }
 
-        with open(TRACKER_FILE, "w", newline="", encoding="utf-8") as f:
+            # Copy the job data into the tracker.
+            for field in (
+                "Title",
+                "Company",
+                "Location",
+                "Match Score",
+                "Priority",
+                "Easy Apply",
+                "Link",
+            ):
+                if field in new_row:
+                    new_row[field] = job.get(field, "") or ""
+
+            new_row["Status"] = status
+            new_row["Application Status"] = status
+
+            if status in {"APPLIED", "SUBMITTED"}:
+                new_row["Applied Date"] = today
+
+            rows.append(new_row)
+            print(f"Tracker row created: {status}")
+
+        with open(
+            TRACKER_FILE,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=fieldnames,
@@ -292,7 +399,9 @@ def update_tracker_status(job, status):
             writer.writeheader()
             writer.writerows(rows)
 
-        print(f"Tracker updated: {status}")
+        if updated:
+            print(f"Tracker updated: {status}")
+
         return True
 
     except Exception as e:
@@ -356,6 +465,27 @@ def interpret_application_result(result):
         return "STOPPED"
 
     return value
+
+
+# ---------------------------------------
+# Daily application limit
+# ---------------------------------------
+
+def get_daily_confirmed_applications():
+    """Count only applications actually marked APPLIED/SUBMITTED today."""
+    tracker = load_csv(TRACKER_FILE)
+    today = __import__("datetime").date.today().isoformat()
+    count = 0
+    for row in tracker:
+        status_values = {
+            (row.get("Status") or "").strip().upper(),
+            (row.get("Application Status") or "").strip().upper(),
+        }
+        applied_date = (row.get("Applied Date") or "").strip()
+
+        if status_values.intersection({"APPLIED", "SUBMITTED"}) and applied_date == today:
+            count += 1
+    return count
 
 
 # ---------------------------------------
@@ -771,6 +901,8 @@ def save_diagnostic_screenshot(page):
 # ---------------------------------------
 
 def open_easy_apply(job):
+    global LAST_APPLICATION_RESULT
+    LAST_APPLICATION_RESULT = ""
 
     link = job.get(
         "Link",
@@ -900,25 +1032,31 @@ def open_easy_apply(job):
         # ---------------------------------------
 
         try:
-
+            # LinkedIn can keep navigation pending while its app shell loads.
+            # "commit" is enough; we then wait for the page content ourselves.
             page.goto(
                 link,
-                wait_until="domcontentloaded",
-                timeout=30000
+                wait_until="commit",
+                timeout=60000
             )
-
-            page.wait_for_timeout(
-                5000
-            )
-
-        except Exception as e:
-
+        except PlaywrightTimeoutError as e:
+            # A timeout after navigation started is not automatically a failed job.
+            # If the browser reached LinkedIn, continue inspecting the page.
             print()
-            print(
-                f"Could not open job: {e}"
-            )
-
+            print("Navigation timed out while loading LinkedIn.")
+            print("Continuing with the loaded page...")
+            print(f"Navigation detail: {e}")
+        except Exception as e:
+            print()
+            print(f"Could not open job: {e}")
             return False
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
 
         print()
         print(
@@ -964,7 +1102,7 @@ def open_easy_apply(job):
             print(
                 "Skipping this job..."
             )
-
+            LAST_APPLICATION_RESULT = "CLOSED"
             return False
 
         # ---------------------------------------
@@ -1004,7 +1142,7 @@ def open_easy_apply(job):
                     job,
                     "APPLIED"
                 )
-
+                LAST_APPLICATION_RESULT = "ALREADY_APPLIED"
                 return False
 
             print()
@@ -1025,7 +1163,7 @@ def open_easy_apply(job):
             save_diagnostic_screenshot(
                 page
             )
-
+            LAST_APPLICATION_RESULT = "NOT_AVAILABLE"
             return False
 
         # ---------------------------------------
@@ -1075,7 +1213,7 @@ def open_easy_apply(job):
                 print(
                     js_error
                 )
-
+                LAST_APPLICATION_RESULT = "FAILED"
                 return False
 
         # ---------------------------------------
@@ -1115,7 +1253,7 @@ def open_easy_apply(job):
                 job,
                 "FAILED"
             )
-
+            LAST_APPLICATION_RESULT = "FAILED"
             return False
 
         # Always check the actual LinkedIn page after the form handler.
@@ -1131,7 +1269,7 @@ def open_easy_apply(job):
                 job,
                 "APPLIED"
             )
-
+            LAST_APPLICATION_RESULT = "SUBMITTED"
             return True
 
         result_status = interpret_application_result(
@@ -1164,7 +1302,7 @@ def open_easy_apply(job):
                 "Application is prepared but was "
                 "NOT confirmed as submitted."
             )
-
+            LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
             return False
 
         if result_status in {
@@ -1184,7 +1322,7 @@ def open_easy_apply(job):
             "Application submission could not be "
             "confirmed. Tracker will not be marked APPLIED."
         )
-
+        LAST_APPLICATION_RESULT = "UNKNOWN"
         return False
 
 
@@ -1193,144 +1331,125 @@ def open_easy_apply(job):
 # ---------------------------------------
 
 def main():
-
     print()
     print("=" * 70)
-    print("AI JOB AUTOMATION - EASY APPLY")
+    print("AI JOB AUTOMATION - BATCH APPLICATION RUNNER")
     print("=" * 70)
 
-    # ---------------------------------------
-    # Load eligible jobs
-    # ---------------------------------------
-
-    jobs = get_recommended_jobs()
+    daily_count = get_daily_confirmed_applications()
+    remaining = max(0, DAILY_APPLICATION_LIMIT - daily_count)
 
     print()
     print(
-        f"Eligible jobs: {len(jobs)}"
+        f"Confirmed applications today: "
+        f"{daily_count}/{DAILY_APPLICATION_LIMIT}"
     )
 
-    display_jobs(jobs)
+    if remaining == 0:
+        print("Daily application limit reached. No new applications will be attempted.")
+        return
+
+    jobs = get_recommended_jobs()
 
     if not jobs:
+        print()
+        print("No eligible jobs currently meet the configured requirements.")
         return
 
     print()
+    print(f"Eligible candidate jobs: {len(jobs)}")
+    print(f"Applications still allowed today: {remaining}")
+    print(f"Auto-submit: {'ON' if AUTO_SUBMIT else 'OFF'}")
+    print(f"Unknown-question policy: {UNKNOWN_QUESTIONS_POLICY}")
 
-    # ---------------------------------------
-    # Select starting job
-    # ---------------------------------------
+    display_jobs(jobs[:min(len(jobs), 15)])
 
-    try:
+    start_index = 0
 
-        choice = int(
-            input(
-                f"Select starting job "
-                f"(1-{len(jobs)}): "
+    # Keep manual selection available only when auto-submit is disabled.
+    if not AUTO_SUBMIT:
+        try:
+            choice = int(
+                input(
+                    f"Select starting job "
+                    f"(1-{len(jobs)}): "
+                )
             )
-        )
+        except ValueError:
+            print("Invalid selection.")
+            return
 
-    except ValueError:
+        if choice < 1 or choice > len(jobs):
+            print("Invalid selection.")
+            return
 
-        print(
-            "Invalid selection."
-        )
+        start_index = choice - 1
 
-        return
+    for index in range(start_index, len(jobs)):
+        confirmed = get_daily_confirmed_applications()
 
-    if choice < 1 or choice > len(jobs):
-
-        print(
-            "Invalid job number."
-        )
-
-        return
-
-    # ---------------------------------------
-    # Try selected and following jobs
-    # ---------------------------------------
-
-    for index in range(
-        choice - 1,
-        len(jobs)
-    ):
+        if confirmed >= DAILY_APPLICATION_LIMIT:
+            break
 
         job = jobs[index]
 
         print()
         print("=" * 70)
-
-        print(
-            f"TRYING JOB "
-            f"{index + 1}/{len(jobs)}"
-        )
-
+        print(f"TRYING CANDIDATE {index + 1}/{len(jobs)}")
         print("=" * 70)
-
-        print(
-            f"Title : "
-            f"{job.get('Title', '')}"
-        )
-
-        print(
-            f"Score : "
-            f"{job.get('Match Score', '')}"
-        )
-
-        # ---------------------------------------
-        # Try job
-        # ---------------------------------------
-        # Easy Apply is verified LIVE inside
-        # open_easy_apply(). The CSV value is only
-        # a candidate hint because LinkedIn status
-        # can change after the CSV is generated.
+        print(f"Title   : {job.get('Title', '')}")
+        print(f"Company : {job.get('Company') or 'Not available'}")
+        print(f"Location: {job.get('Location') or 'Not available'}")
+        print(f"Score   : {job.get('Match Score', '')}")
 
         success = open_easy_apply(job)
 
-        # ---------------------------------------
-        # Active Easy Apply found
-        # ---------------------------------------
-
         if success:
-
+            confirmed = get_daily_confirmed_applications()
             print()
             print("=" * 70)
             print("APPLICATION COMPLETED")
             print("=" * 70)
-
             print(
-                "The application was confirmed as submitted."
+                f"Confirmed applications today: "
+                f"{confirmed}/{DAILY_APPLICATION_LIMIT}"
             )
+            continue
 
-            return
+        # User requested a safety stop on unfamiliar required questions.
+        if LAST_APPLICATION_RESULT == "STOPPED":
+            print()
+            print("=" * 70)
+            print("AUTOMATION STOPPED FOR SAFETY")
+            print("=" * 70)
+            print(
+                "An unfamiliar required question was encountered. "
+                "No further applications will be attempted in this run."
+            )
+            break
 
-        # ---------------------------------------
-        # Try next job
-        # ---------------------------------------
+        print()
+        print(
+            f"Candidate result: "
+            f"{LAST_APPLICATION_RESULT or 'SKIPPED'}"
+        )
 
         if index + 1 < len(jobs):
+            print("Trying next eligible candidate...")
 
-            print()
-            print(
-                "Trying next eligible job..."
-            )
-
-    # ---------------------------------------
-    # No active job found
-    # ---------------------------------------
+    final_count = get_daily_confirmed_applications()
 
     print()
     print("=" * 70)
-
-    print(
-        "NO ACTIVE EASY APPLY JOB FOUND"
-    )
-
+    print("BATCH APPLICATION RUN COMPLETED")
     print("=" * 70)
-
     print(
-        "All selected/remaining jobs "
-        "were closed or unavailable."
+        f"Confirmed applications today: "
+        f"{final_count}/{DAILY_APPLICATION_LIMIT}"
+    )
+    print(
+        f"Remaining daily capacity: "
+        f"{max(0, DAILY_APPLICATION_LIMIT - final_count)}"
     )
 
 
