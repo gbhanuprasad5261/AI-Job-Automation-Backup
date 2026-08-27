@@ -210,6 +210,43 @@ def print_application_status(page: Page):
 
     print("Application page: unknown")
 
+def get_application_step(page: Page):
+    """
+    Return the current LinkedIn Easy Apply step as:
+        (current_page, total_pages)
+
+    Example:
+        1/4 -> (1, 4)
+        2/4 -> (2, 4)
+    """
+
+    try:
+        body = page.locator("body").inner_text()
+
+        # Prefer the application page indicator.
+        patterns = [
+            r"Application page\s*:?\s*(\d+)\s*/\s*(\d+)",
+            r"(\d+)\s*/\s*(\d+)"
+        ]
+
+        for pattern in patterns:
+            match = re.search(
+                pattern,
+                body,
+                re.IGNORECASE
+            )
+
+            if match:
+                return (
+                    int(match.group(1)),
+                    int(match.group(2))
+                )
+
+    except Exception:
+        pass
+
+    return None
+
 
 # ============================================================
 # Fill Name
@@ -1317,69 +1354,132 @@ def inspect_required_fields(container):
 
 
 # ============================================================
-# Find Next Button
+# Find Application Navigation Controls
 # ============================================================
 
-def find_next_button(container):
+def _control_text(element):
+    """Return the useful accessible/text attributes of a control."""
+    parts = []
+    for attr in ("aria-label", "title", "data-control-name", "name"):
+        value = safe_attribute(element, attr).strip()
+        if value:
+            parts.append(value)
+    text = safe_text(element).strip()
+    if text:
+        parts.append(text)
+    return " ".join(parts).strip().lower()
 
-    names = [
-        "Next",
-        "Continue",
-        "Review",
+
+def _find_button_in_scope(scope, purpose="next"):
+    """Find a navigation control using several LinkedIn DOM variants."""
+    if purpose == "submit":
+        patterns = [
+            r"\bsubmit\b",
+            r"submit\s+application",
+            r"send\s+application",
+        ]
+        reject = ("search", "job", "profile", "similar", "notification")
+    else:
+        patterns = [
+            r"^next$",
+            r"^continue$",
+            r"^review$",
+            r"\bnext\s*(step|page)?\b",
+            r"\bcontinue\s*(to\s*)?(next\s*)?(step|page)?\b",
+            r"\breview\s*(application|your application)?\b",
+        ]
+        reject = ("search", "job", "profile", "similar", "notification", "save")
+
+    # Prefer explicit LinkedIn application attributes when available.
+    selectors = [
+        '[data-easy-apply-next-button]',
+        '[data-control-name*="easy_apply" i]',
+        '[data-control-name*="continue" i]',
+        '[data-control-name*="next" i]',
+        '[data-control-name*="review" i]',
+        'button',
+        '[role="button"]',
     ]
 
-    for name in names:
+    candidates = []
+    seen = set()
 
+    for selector in selectors:
         try:
+            locator = scope.locator(selector)
+            for i in range(locator.count()):
+                element = locator.nth(i)
+                try:
+                    if not element.is_visible():
+                        continue
+                    key = None
+                    try:
+                        key = element.evaluate("e => e")
+                    except Exception:
+                        key = f"{selector}:{i}"
+                    # Locator identity cannot reliably be hashed, so use DOM attributes.
+                    identity = (
+                        safe_attribute(element, "data-control-name"),
+                        safe_attribute(element, "aria-label"),
+                        safe_attribute(element, "id"),
+                        safe_text(element)[:120],
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
 
-            button = container.get_by_role(
-                "button",
-                name=re.compile(
-                    f"^{re.escape(name)}$",
-                    re.IGNORECASE
-                )
-            ).first
+                    combined = _control_text(element)
+                    if not combined:
+                        continue
+                    if any(word in combined for word in reject):
+                        continue
+                    if not any(re.search(pattern, combined, re.IGNORECASE) for pattern in patterns):
+                        continue
 
-            if button.count() > 0:
+                    score = 0
+                    if "data-easy-apply-next-button" in selector:
+                        score += 100
+                    if "data-control-name" in selector:
+                        score += 40
+                    if purpose == "submit" and "submit" in combined:
+                        score += 30
+                    if purpose != "submit" and re.search(r"\b(next|continue|review)\b", combined):
+                        score += 30
+                    if safe_attribute(element, "type").lower() == "submit":
+                        score += 5
+                    if safe_attribute(element, "class") and "artdeco-button" in safe_attribute(element, "class"):
+                        score += 5
 
-                if button.is_visible():
+                    try:
+                        if not element.is_enabled():
+                            continue
+                    except Exception:
+                        pass
 
-                    return button
-
+                    candidates.append((score, element, combined))
+                except Exception:
+                    continue
         except Exception:
-            pass
+            continue
 
-    # Fallback
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
 
-    try:
+    return None
 
-        buttons = container.locator(
-            "button"
-        )
 
-        for i in range(
-            buttons.count()
-        ):
+def find_next_button(container, page=None):
+    """Find LinkedIn's application navigation button in the modal or page."""
+    button = _find_button_in_scope(container, "next")
+    if button is not None:
+        return button
 
-            button = buttons.nth(i)
-
-            if not button.is_visible():
-                continue
-
-            text = safe_text(
-                button
-            ).lower()
-
-            if text in [
-                "next",
-                "continue",
-                "review"
-            ]:
-
-                return button
-
-    except Exception:
-        pass
+    if page is not None and container is not page:
+        button = _find_button_in_scope(page, "next")
+        if button is not None:
+            print("Navigation button found in full page scope.")
+            return button
 
     return None
 
@@ -1388,34 +1488,17 @@ def find_next_button(container):
 # Find Submit Button
 # ============================================================
 
-def find_submit_button(container):
+def find_submit_button(container, page=None):
+    """Find the final submit control in the application scope."""
+    button = _find_button_in_scope(container, "submit")
+    if button is not None:
+        return button
 
-    patterns = [
-        r"submit application",
-        r"submit",
-        r"send application"
-    ]
-
-    for pattern in patterns:
-
-        try:
-
-            button = container.get_by_role(
-                "button",
-                name=re.compile(
-                    pattern,
-                    re.IGNORECASE
-                )
-            ).first
-
-            if button.count() > 0:
-
-                if button.is_visible():
-
-                    return button
-
-        except Exception:
-            pass
+    if page is not None and container is not page:
+        button = _find_button_in_scope(page, "submit")
+        if button is not None:
+            print("Submit button found in full page scope.")
+            return button
 
     return None
 
@@ -1562,157 +1645,56 @@ def _form_fingerprint(page):
 
 
 def move_to_next_page(page: Page):
+    """Click application navigation once and verify a real transition."""
     container = get_application_container(page)
-    button = find_next_button(container)
+    before = get_application_step(page)
+    before_fingerprint = _form_fingerprint(page)
+
+    button = find_next_button(container, page)
 
     if button is None:
         print()
-        print("Next/Continue/Review button not found.")
+        print("=" * 70)
+        print("NEXT BUTTON NOT FOUND")
+        print("=" * 70)
+        print("No safe LinkedIn application navigation control was detected.")
         return False
-
-    before_text = _form_fingerprint(page)
-
-    print()
-    print("Next button found.")
 
     try:
+        print(f"Navigation control: {_control_text(button)}")
         button.scroll_into_view_if_needed()
-        page.wait_for_timeout(500)
-        if not button.is_enabled():
-            print("Navigation button is disabled.")
-            return False
-        button.click()
+        page.wait_for_timeout(300)
+        button.click(timeout=10000)
     except Exception as e:
-        print(f"Could not move to next page: {e}")
+        print(f"Could not click navigation button: {e}")
         return False
 
-    # LinkedIn's Easy Apply modal is a React UI and can briefly keep the same
-    # progress indicator. Do not assume a click succeeded; verify the form
-    # content actually changed.
-    for _ in range(20):
+    for _ in range(30):
         page.wait_for_timeout(500)
-        after_text = _form_fingerprint(page)
+        after = get_application_step(page)
 
-        if before_text and after_text and after_text != before_text:
-            print("Moved to next application page.")
+        if before and after and after[1] == before[1] and after[0] > before[0]:
+            print(f"Moved to next application page: {after[0]}/{after[1]}")
             return True
 
-        # If the final Review/Submit control appeared, the form advanced even
-        # if LinkedIn reused much of the same text.
-        try:
-            current_container = get_application_container(page)
-            if find_submit_button(current_container) is not None:
-                print("Final application review page detected.")
-                return True
-        except Exception:
-            pass
+        after_fingerprint = _form_fingerprint(page)
+        if before_fingerprint and after_fingerprint and after_fingerprint != before_fingerprint:
+            # Fingerprint change is accepted only when the application container changed.
+            print("Application form content changed after navigation.")
+            return True
 
+    current = get_application_step(page)
     print()
     print("=" * 70)
     print("APPLICATION PAGE DID NOT ADVANCE")
     print("=" * 70)
-    print("The Next button was clicked, but LinkedIn did not replace the form content.")
-    print("Stopping safely instead of clicking Next repeatedly.")
+    if before:
+        print(f"Before: {before[0]}/{before[1]}")
+    if current:
+        print(f"After : {current[0]}/{current[1]}")
+    print("Stopping safely instead of clicking navigation repeatedly.")
     return False
 
-
-# ============================================================
-# Final Review / Submit
-# ============================================================
-
-def handle_final_submission(page: Page):
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "FINAL APPLICATION REVIEW"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    container = get_application_container(
-        page
-    )
-
-    submit_button = find_submit_button(
-        container
-    )
-
-    if submit_button is None:
-
-        print(
-            "Submit button not found."
-        )
-
-        return False
-
-    print(
-        "Submit button found."
-    )
-
-    if not AUTO_SUBMIT:
-
-        print()
-        print(
-            "AUTO_SUBMIT = True"
-        )
-
-        print(
-            "Application will NOT be submitted."
-        )
-
-        print(
-            "Review the application manually."
-        )
-
-        return False
-
-    # Even when AUTO_SUBMIT is enabled, require the submit button to be
-    # visible and enabled. We do not bypass LinkedIn's final UI.
-    try:
-        if not submit_button.is_visible():
-            print("Submit button is not visible. Stopping.")
-            return False
-
-        if not submit_button.is_enabled():
-            print("Submit button is disabled. Stopping.")
-            return False
-    except Exception as e:
-        print(f"Could not verify submit button state: {e}")
-        return False
-
-    try:
-
-        submit_button.click()
-
-        page.wait_for_timeout(
-            3000
-        )
-
-        print()
-        print(
-            "APPLICATION SUBMITTED"
-        )
-
-        return "SUBMITTED"
-
-    except Exception as e:
-
-        print(
-            f"Could not submit application: {e}"
-        )
-
-        return False
-
-
-# ============================================================
-# Main Application Automation
-# ============================================================
 
 def inspect_and_prepare_form(
     page: Page
@@ -1820,7 +1802,8 @@ def inspect_and_prepare_form(
         )
 
         submit_button = find_submit_button(
-            container
+            container,
+            page
         )
 
         if submit_button is not None:
