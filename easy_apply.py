@@ -5,6 +5,16 @@ import re
 from application_form import inspect_and_prepare_form
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+try:
+    from external_apply import (
+        external_apply,
+        find_external_apply_link,
+        prepare_external_application_page,
+    )
+except ImportError:
+    external_apply = None
+    find_external_apply_link = None
+
 
 # ---------------------------------------
 # Configuration
@@ -164,6 +174,7 @@ def get_recommended_jobs():
         "INTERVIEW",
         "REJECTED",
         "WITHDRAWN",
+        "READY_FOR_REVIEW",
     }
 
     for job in jobs:
@@ -232,17 +243,17 @@ def get_recommended_jobs():
         if score < MIN_MATCH_SCORE:
             continue
 
-        # ---------------------------------------
-        # Filter 2:
-        # Already applied / progressed jobs
-        # ---------------------------------------
-
         if status in blocked_statuses:
             continue
 
-        # ---------------------------------------
-        # Add job
-        # ---------------------------------------
+        # Skip jobs that clearly require more experience than the candidate has.
+        if (
+            job.get("Experience Skip", "")
+            .strip()
+            .lower()
+            == "yes"
+        ):
+            continue
 
         recommended.append(job)
 
@@ -897,6 +908,93 @@ def save_diagnostic_screenshot(page):
 
 
 # ---------------------------------------
+# External application profile
+# ---------------------------------------
+
+def get_external_profile():
+    """
+    Load external-ATS profile values from config.py or environment variables.
+
+    Supported config names:
+      FULL_NAME / NAME
+      EMAIL / EMAIL_ADDRESS
+      PHONE / MOBILE / MOBILE_NUMBER
+      RESUME_PATH
+
+    Environment variables with the same names are also supported.
+    """
+    values = {}
+
+    try:
+        import config as cfg
+
+        aliases = {
+            "name": ("FULL_NAME", "NAME"),
+            "email": ("EMAIL", "EMAIL_ADDRESS"),
+            "phone": ("PHONE", "MOBILE", "MOBILE_NUMBER"),
+            "resume": ("RESUME_PATH", "RESUME"),
+        }
+
+        for key, names in aliases.items():
+            for name in names:
+                value = getattr(cfg, name, None)
+                if value:
+                    values[key] = str(value).strip()
+                    break
+    except Exception:
+        pass
+
+    env_aliases = {
+        "name": ("JOB_NAME", "FULL_NAME", "NAME"),
+        "email": ("JOB_EMAIL", "EMAIL", "EMAIL_ADDRESS"),
+        "phone": ("JOB_PHONE", "PHONE", "MOBILE"),
+        "resume": ("JOB_RESUME_PATH", "RESUME_PATH"),
+    }
+
+    for key, names in env_aliases.items():
+        if values.get(key):
+            continue
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                values[key] = value
+                break
+
+    if not values.get("resume"):
+        default_resume = os.path.join("resume", "resume.pdf")
+        if os.path.exists(default_resume):
+            values["resume"] = default_resume
+
+    return (
+        values.get("resume", ""),
+        values.get("name", ""),
+        values.get("email", ""),
+        values.get("phone", ""),
+    )
+
+
+# ---------------------------------------
+# Detect an external tab opened by LinkedIn
+# ---------------------------------------
+
+def find_new_external_page(context, before_pages):
+    """Return a newly opened non-LinkedIn page, if one appeared."""
+    try:
+        for candidate in context.pages:
+            if candidate in before_pages:
+                continue
+            try:
+                url = (candidate.url or "").lower()
+                if url and "linkedin.com" not in url:
+                    return candidate
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------
 # Open Easy Apply
 # ---------------------------------------
 
@@ -1125,7 +1223,7 @@ def open_easy_apply(job):
         if easy_apply is None:
 
             # A submitted application no longer has an Apply button.
-            # Detect that state before reporting Easy Apply as unavailable.
+            # Detect that state before trying an external application.
             if page_shows_already_applied(page):
 
                 print()
@@ -1145,24 +1243,93 @@ def open_easy_apply(job):
                 LAST_APPLICATION_RESULT = "ALREADY_APPLIED"
                 return False
 
+            # ---------------------------------------
+            # External ATS application
+            # ---------------------------------------
+            external_url = ""
+            if find_external_apply_link is not None:
+                try:
+                    external_url = find_external_apply_link(page) or ""
+                except Exception as e:
+                    print(f"External apply-link detection failed: {e}")
+
+            if external_url and external_apply is not None:
+                print()
+                print("=" * 70)
+                print("EXTERNAL APPLICATION DETECTED")
+                print("=" * 70)
+                print(f"External URL: {external_url}")
+
+                resume_path, name, email, phone = get_external_profile()
+
+                if not name or not email or not phone:
+                    print()
+                    print("External profile is incomplete.")
+                    print("Configure FULL_NAME/EMAIL/PHONE in config.py")
+                    print("or JOB_NAME/JOB_EMAIL/JOB_PHONE environment variables.")
+                    print("Opening the application for manual review only.")
+
+                try:
+                    external_result = external_apply(
+                        external_url,
+                        resume_path,
+                        name,
+                        email,
+                        phone,
+                    )
+                except Exception as e:
+                    print()
+                    print(f"External application preparation failed: {e}")
+                    LAST_APPLICATION_RESULT = "FAILED"
+                    return False
+
+                result_status = interpret_application_result(external_result)
+
+                print()
+                print(
+                    f"External application result: "
+                    f"{result_status or 'UNKNOWN'}"
+                )
+
+                if result_status == "READY_FOR_REVIEW":
+                    update_tracker_status(
+                        job,
+                        "READY_FOR_REVIEW"
+                    )
+                    LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
+                    print(
+                        "External application prepared. "
+                        "No submission was performed."
+                    )
+                    return False
+
+                if result_status == "SUBMITTED":
+                    # external_apply must only return SUBMITTED if it
+                    # independently verified the final submitted state.
+                    update_tracker_status(
+                        job,
+                        "APPLIED"
+                    )
+                    LAST_APPLICATION_RESULT = "SUBMITTED"
+                    return True
+
+                LAST_APPLICATION_RESULT = result_status or "UNKNOWN"
+                return False
+
             print()
             print("=" * 70)
-            print("EASY APPLY NOT FOUND")
+            print("EASY APPLY / EXTERNAL APPLY NOT FOUND")
             print("=" * 70)
 
             print()
             print(
-                "LinkedIn did not expose an "
-                "Easy Apply control."
+                "LinkedIn did not expose a usable Easy Apply control "
+                "or a supported external application link."
             )
 
-            print_application_controls(
-                page
-            )
+            print_application_controls(page)
+            save_diagnostic_screenshot(page)
 
-            save_diagnostic_screenshot(
-                page
-            )
             LAST_APPLICATION_RESULT = "NOT_AVAILABLE"
             return False
 
@@ -1174,6 +1341,10 @@ def open_easy_apply(job):
         print("=" * 70)
         print("EASY APPLY BUTTON FOUND")
         print("=" * 70)
+
+        # Keep the existing page list so we can detect LinkedIn's
+        # external-application tab after clicking a generic Apply control.
+        pages_before_click = list(context.pages)
 
         try:
 
@@ -1217,12 +1388,60 @@ def open_easy_apply(job):
                 return False
 
         # ---------------------------------------
-        # Wait for application form
+        # Detect external tab opened by LinkedIn
         # ---------------------------------------
 
-        page.wait_for_timeout(
-            3000
+        page.wait_for_timeout(3000)
+
+        external_page = find_new_external_page(
+            context,
+            pages_before_click,
         )
+
+        if external_page is not None:
+            print()
+            print("=" * 70)
+            print("LINKEDIN OPENED EXTERNAL APPLICATION")
+            print("=" * 70)
+            print(f"External URL: {external_page.url}")
+
+            resume_path, name, email, phone = get_external_profile()
+
+            if not name or not email or not phone:
+                print()
+                print("External profile is incomplete.")
+                print("Configure FULL_NAME/EMAIL/PHONE in config.py")
+                print("or JOB_NAME/JOB_EMAIL/JOB_PHONE environment variables.")
+
+            try:
+                external_result = prepare_external_application_page(
+                    external_page,
+                    resume_path,
+                    name,
+                    email,
+                    phone,
+                )
+            except Exception as e:
+                print()
+                print(f"External application preparation failed: {e}")
+                LAST_APPLICATION_RESULT = "FAILED"
+                return False
+
+            result_status = interpret_application_result(external_result)
+            print()
+            print(f"External application result: {result_status or 'UNKNOWN'}")
+
+            if result_status == "READY_FOR_REVIEW":
+                update_tracker_status(job, "READY_FOR_REVIEW")
+                LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
+                return False
+
+            LAST_APPLICATION_RESULT = result_status or "UNKNOWN"
+            return False
+
+        # ---------------------------------------
+        # Wait for LinkedIn application form
+        # ---------------------------------------
 
         print()
         print("=" * 70)
