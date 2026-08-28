@@ -1,0 +1,1814 @@
+import csv
+import os
+import re
+
+from application_form import inspect_and_prepare_form
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+try:
+    from external_apply import (
+        external_apply,
+        find_external_apply_link,
+        prepare_external_application_page,
+    )
+except ImportError:
+    external_apply = None
+    find_external_apply_link = None
+
+
+# ---------------------------------------
+# Configuration
+# ---------------------------------------
+
+ANALYSIS_FILE = "data/job_analysis.csv"
+TRACKER_FILE = "data/application_tracker.csv"
+
+try:
+    from config import (
+        MIN_MATCH_SCORE,
+        DAILY_APPLICATION_LIMIT,
+        AUTO_SUBMIT,
+        UNKNOWN_QUESTIONS_POLICY,
+        CHROME_CDP_URL,
+    )
+except ImportError:
+    MIN_MATCH_SCORE = 70
+    DAILY_APPLICATION_LIMIT = 15
+    AUTO_SUBMIT = True
+    UNKNOWN_QUESTIONS_POLICY = "STOP"
+    CHROME_CDP_URL = "http://127.0.0.1:9222"
+
+LAST_APPLICATION_RESULT = ""
+
+
+# ---------------------------------------
+# Load CSV
+# ---------------------------------------
+
+def load_csv(file_path):
+
+    if not os.path.exists(file_path):
+
+        print(f"File not found: {file_path}")
+
+        return []
+
+    with open(
+        file_path,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return list(csv.DictReader(f))
+
+def _job_key(row):
+    """
+    Create a stable identifier for a LinkedIn job.
+
+    LinkedIn job ID is preferred because job titles can be duplicated.
+    """
+
+    link = (
+        row.get("Link")
+        or row.get("URL")
+        or ""
+    ).strip().lower()
+
+    # Prefer LinkedIn job ID
+    if link:
+        match = re.search(
+            r"/jobs/view/(\d+)",
+            link
+        )
+
+        if match:
+            return f"id:{match.group(1)}"
+
+        # Fallback to complete URL
+        return f"url:{link.rstrip('/')}"
+
+    # Final fallback when URL is unavailable
+    title = (
+        row.get("Title")
+        or ""
+    ).strip().lower()
+
+    company = (
+        row.get("Company")
+        or ""
+    ).strip().lower()
+
+    return f"text:{title}|{company}"
+
+
+def get_application_statuses():
+    """
+    Return the strongest known application status for each exact job.
+
+    If older tracker rows have inconsistent Status/Application Status values,
+    a progressed status wins over NOT APPLIED/empty values.
+    """
+    tracker = load_csv(TRACKER_FILE)
+
+    statuses = {}
+
+    blocked_statuses = {
+        "APPLIED",
+        "SUBMITTED",
+        "INTERVIEW",
+        "REJECTED",
+        "WITHDRAWN",
+        "READY_FOR_REVIEW",
+        "INELIGIBLE",
+        "LOGIN_REQUIRED",
+    }
+    
+
+    for row in tracker:
+        key = _job_key(row)
+
+        if not key:
+            continue
+
+        status_values = [
+            (row.get("Status") or "").strip().upper(),
+            (row.get("Application Status") or "").strip().upper(),
+        ]
+
+        status_values = [value for value in status_values if value]
+
+        if not status_values:
+            effective_status = "NOT APPLIED"
+        else:
+            progressed = [
+                value for value in status_values
+                if value in blocked_statuses
+            ]
+            effective_status = (
+                progressed[0]
+                if progressed
+                else status_values[0]
+            )
+
+        statuses[key] = effective_status
+
+    return statuses
+
+# ---------------------------------------
+# Select Recommended Jobs
+# ---------------------------------------
+
+def get_recommended_jobs():
+
+    jobs = load_csv(ANALYSIS_FILE)
+
+    if not jobs:
+        return []
+
+    statuses = get_application_statuses()
+
+    recommended = []
+
+    # Jobs with these statuses must never be
+    # automatically offered again.
+    blocked_statuses = {
+        "APPLIED",
+        "SUBMITTED",
+        "INTERVIEW",
+        "REJECTED",
+        "WITHDRAWN",
+        "READY_FOR_REVIEW",
+    }
+
+    for job in jobs:
+
+        # ---------------------------------------
+        # Match score
+        # ---------------------------------------
+
+        try:
+            score = float(
+                str(
+                    job.get(
+                        "Match Score",
+                        "0"
+                    )
+                ).replace("%", "").strip()
+            )
+
+        except (ValueError, AttributeError):
+            score = 0
+
+        # ---------------------------------------
+        # Basic job information
+        # ---------------------------------------
+
+        title = (
+            job.get(
+                "Title",
+                ""
+            )
+            or ""
+        ).strip()
+
+        link = (
+            job.get(
+                "Link",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if not title or not link:
+            continue
+
+        # ---------------------------------------
+        # Get application status
+        # ---------------------------------------
+
+        key = _job_key(job)
+
+        status = statuses.get(
+            key,
+            "NOT APPLIED"
+        )
+
+        status = (
+            status
+            or "NOT APPLIED"
+        ).strip().upper()
+
+        # ---------------------------------------
+        # Filter 1:
+        # Minimum match score
+        # ---------------------------------------
+
+        if score < MIN_MATCH_SCORE:
+            continue
+
+        if status in blocked_statuses:
+            continue
+
+        # Skip jobs that clearly require more experience than the candidate has.
+        if (
+            job.get("Experience Skip", "")
+            .strip()
+            .lower()
+            == "yes"
+        ):
+            continue
+
+        recommended.append(job)
+
+    # ---------------------------------------
+    # Highest score first
+    # ---------------------------------------
+
+    recommended.sort(
+        key=lambda job: float(
+            str(
+                job.get(
+                    "Match Score",
+                    "0"
+                )
+            ).replace("%", "").strip()
+            or 0
+        ),
+        reverse=True
+    )
+
+    return recommended
+
+
+# ---------------------------------------
+# Tracker helpers
+# ---------------------------------------
+
+def update_tracker_status(job, status):
+    """
+    Safely update or create the tracker row for the exact LinkedIn job.
+
+    Matching is done by LinkedIn job ID/URL, not title.
+    Writes are atomic so a failed write cannot leave the tracker empty.
+    """
+
+    try:
+        os.makedirs(
+            os.path.dirname(TRACKER_FILE) or ".",
+            exist_ok=True
+        )
+
+        fieldnames = [
+            "Title",
+            "Company",
+            "Location",
+            "Match Score",
+            "Priority",
+            "Easy Apply",
+            "Application Status",
+            "Applied Date",
+            "Link",
+            "Status",
+        ]
+
+        rows = []
+
+        # Read existing tracker safely.
+        if os.path.exists(TRACKER_FILE):
+            try:
+                with open(
+                    TRACKER_FILE,
+                    "r",
+                    newline="",
+                    encoding="utf-8"
+                ) as f:
+                    reader = csv.DictReader(f)
+
+                    if reader.fieldnames:
+                        # Preserve any known fields required by the tracker.
+                        existing_fields = list(reader.fieldnames)
+
+                        for field in fieldnames:
+                            if field not in existing_fields:
+                                existing_fields.append(field)
+
+                        fieldnames = existing_fields
+
+                    rows = list(reader)
+
+            except Exception as e:
+                print(
+                    f"Could not read existing tracker: {e}"
+                )
+                return False
+
+        key = _job_key(job)
+
+        updated = False
+        today = __import__("datetime").date.today().isoformat()
+
+        for row in rows:
+
+            if _job_key(row) != key:
+                continue
+
+            # Update only the fields supplied by the job.
+            for field in [
+                "Title",
+                "Company",
+                "Location",
+                "Match Score",
+                "Priority",
+                "Easy Apply",
+                "Link",
+            ]:
+                value = job.get(field)
+
+                if value not in (None, ""):
+                    row[field] = value
+
+            row["Status"] = status
+            row["Application Status"] = status
+
+            # Only confirmed application/progress states get a date.
+            if status in {
+                "APPLIED",
+                "SUBMITTED",
+                "ASSESSMENT",
+                "INTERVIEW",
+                "OFFER",
+            }:
+                if not row.get("Applied Date"):
+                    row["Applied Date"] = today
+
+            elif status in {
+                "NOT APPLIED",
+                "READY_FOR_REVIEW",
+                "LOGIN_REQUIRED",
+                "FAILED",
+            }:
+                # Do not create an application date for non-submitted states.
+                if status in {
+                    "READY_FOR_REVIEW",
+                    "LOGIN_REQUIRED",
+                    "FAILED",
+                }:
+                    row["Applied Date"] = ""
+
+            updated = True
+            break
+
+        # Create a new tracker row if necessary.
+        if not updated:
+
+            new_row = {
+                field: job.get(field, "") or ""
+                for field in fieldnames
+            }
+
+            new_row["Status"] = status
+            new_row["Application Status"] = status
+
+            if status in {
+                "APPLIED",
+                "SUBMITTED",
+                "ASSESSMENT",
+                "INTERVIEW",
+                "OFFER",
+            }:
+                new_row["Applied Date"] = today
+            else:
+                new_row["Applied Date"] = ""
+
+            rows.append(new_row)
+
+            print(
+                f"Tracker row created: {status}"
+            )
+
+        # --------------------------------------------------
+        # Atomic write
+        # --------------------------------------------------
+
+        temp_file = TRACKER_FILE + ".tmp"
+
+        with open(
+            temp_file,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore"
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(
+            temp_file,
+            TRACKER_FILE
+        )
+
+        if updated:
+            print(
+                f"Tracker updated: {status}"
+            )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"Tracker update failed: {e}"
+        )
+
+        try:
+            temp_file = TRACKER_FILE + ".tmp"
+
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        except Exception:
+            pass
+
+        return False
+
+
+def page_shows_submitted(page):
+    """
+    Detect LinkedIn's explicit post-submission state.
+    """
+    try:
+        text = page.locator("body").inner_text().lower()
+    except Exception:
+        return False
+
+    submitted_signals = [
+        "application submitted",
+        "your application has been submitted",
+        "application was submitted",
+        "you applied",
+        "applied to this job",
+    ]
+
+    return any(signal in text for signal in submitted_signals)
+
+
+def page_shows_already_applied(page):
+    """
+    Detect an already-submitted application before trying to click Apply.
+    """
+    return page_shows_submitted(page)
+
+
+def interpret_application_result(result):
+    """
+    Normalize application_form.py's return value without assuming a
+    particular return type.
+    """
+    if isinstance(result, str):
+        value = result.strip().upper()
+    elif isinstance(result, dict):
+        value = str(
+            result.get("status")
+            or result.get("result")
+            or ""
+        ).strip().upper()
+    else:
+        value = str(result or "").strip().upper()
+
+    if "SUBMITTED" in value or "APPLIED" in value:
+        return "SUBMITTED"
+
+    if "READY_FOR_REVIEW" in value:
+        return "READY_FOR_REVIEW"
+
+    if "SKIPPED" in value:
+        return "SKIPPED"
+
+    if "STOPPED" in value:
+        return "STOPPED"
+
+    return value
+
+
+# ---------------------------------------
+# Daily application limit
+# ---------------------------------------
+
+def get_daily_confirmed_applications():
+    """Count only applications actually marked APPLIED/SUBMITTED today."""
+    tracker = load_csv(TRACKER_FILE)
+    today = __import__("datetime").date.today().isoformat()
+    count = 0
+    for row in tracker:
+        status_values = {
+            (row.get("Status") or "").strip().upper(),
+            (row.get("Application Status") or "").strip().upper(),
+        }
+        applied_date = (row.get("Applied Date") or "").strip()
+
+        if status_values.intersection({"APPLIED", "SUBMITTED"}) and applied_date == today:
+            count += 1
+    return count
+
+
+# ---------------------------------------
+# Display Jobs
+# ---------------------------------------
+
+def display_jobs(jobs):
+
+    print()
+    print("=" * 70)
+    print("RECOMMENDED EASY APPLY JOBS")
+    print("=" * 70)
+
+    if not jobs:
+
+        print()
+        print(
+            "No jobs currently meet the requirements."
+        )
+
+        print()
+
+        print(
+            f"Minimum Match Score : "
+            f"{MIN_MATCH_SCORE}%"
+        )
+
+        print(
+            "Live Easy Apply     : Verified when job opens"
+        )
+
+        print(
+            "Application Status  : NOT APPLIED"
+        )
+
+        return
+
+    for index, job in enumerate(
+        jobs,
+        start=1
+    ):
+
+        print()
+
+        print(
+            f"{index}. "
+            f"{job.get('Title', '')}"
+        )
+
+        print(
+            f"   Company : "
+            f"{job.get('Company') or 'Not available'}"
+        )
+
+        print(
+            f"   Location: "
+            f"{job.get('Location') or 'Not available'}"
+        )
+
+        print(
+            f"   Score   : "
+            f"{job.get('Match Score', '0%')}"
+        )
+
+        print(
+            f"   Priority: "
+            f"{job.get('Priority', '')}"
+        )
+
+        print(
+            f"   CSV Easy Apply: "
+            f"{job.get('Easy Apply', '')}"
+        )
+
+        print(
+            "   Status  : NOT APPLIED"
+        )
+
+
+# ---------------------------------------
+# Convert LinkedIn Search URL
+# ---------------------------------------
+
+def convert_to_job_url(link):
+
+    if not link:
+
+        return ""
+
+    if "currentJobId=" in link:
+
+        match = re.search(
+            r"currentJobId=(\d+)",
+            link
+        )
+
+        if match:
+
+            job_id = match.group(1)
+
+            return (
+                "https://www.linkedin.com/jobs/view/"
+                f"{job_id}/"
+            )
+
+    return link
+
+
+# ---------------------------------------
+# Find Easy Apply Button
+# ---------------------------------------
+
+def find_easy_apply_button(page):
+    """
+    Find the MAIN LinkedIn application control.
+
+    LinkedIn can expose the main control as "Apply" rather than
+    "Easy Apply". Never select an Apply button from a related-job card.
+    """
+
+    def is_visible(element):
+        try:
+            return element.is_visible()
+        except Exception:
+            return False
+
+    def attrs(element):
+        try:
+            text = (element.inner_text() or "").strip()
+        except Exception:
+            text = ""
+        aria = element.get_attribute("aria-label") or ""
+        title = element.get_attribute("title") or ""
+        return text, aria, title
+
+    def is_main_apply(element):
+        text, aria, title = attrs(element)
+        combined = f"{text} {aria} {title}".lower()
+
+        if "easy apply" in combined:
+            return True
+
+        if "linkedin apply to this job" in combined:
+            return True
+
+        if text.lower().strip() != "apply":
+            return False
+
+        # Prefer the actual job-details/top-card area.
+        scoped = [
+            "xpath=ancestor::main[1]",
+            "xpath=ancestor::*[contains(@class,'jobs-details')][1]",
+            "xpath=ancestor::*[contains(@class,'jobs-unified-top-card')][1]",
+            "xpath=ancestor::*[contains(@class,'job-details')][1]",
+        ]
+
+        for selector in scoped:
+            try:
+                ancestor = element.locator(selector).first
+                if ancestor.count() > 0 and ancestor.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        # Explicitly reject common related-job/search-card ancestors.
+        related = [
+            "xpath=ancestor::*[contains(@class,'job-card')][1]",
+            "xpath=ancestor::*[contains(@class,'jobs-search-results')][1]",
+            "xpath=ancestor::*[contains(@class,'base-card')][1]",
+            "xpath=ancestor::*[contains(@class,'jobs-home-job-card')][1]",
+        ]
+
+        for selector in related:
+            try:
+                ancestor = element.locator(selector).first
+                if ancestor.count() > 0:
+                    return False
+            except Exception:
+                pass
+
+        return False
+
+    def scan(selector):
+        try:
+            elements = page.locator(selector)
+            for i in range(elements.count()):
+                try:
+                    element = elements.nth(i)
+                    if is_visible(element) and is_main_apply(element):
+                        return element
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    # First pass: explicit controls and main-job Apply controls.
+    for selector in [
+        "button",
+        "[role='button']",
+        "a",
+    ]:
+        found = scan(selector)
+        if found is not None:
+            print("LinkedIn main application control found.")
+            return found
+
+    try:
+        body = page.locator("body").inner_text()
+    except Exception:
+        body = ""
+
+    body_lower = body.lower()
+
+    external_signals = [
+        "apply on company website",
+        "apply on the company website",
+        "apply externally",
+        "application on company website",
+        "apply via company website",
+    ]
+
+    if any(signal in body_lower for signal in external_signals):
+        print("External application detected.")
+        return None
+
+    easy_apply_signals = [
+        "easy apply button",
+        "submit your application through the easy apply button",
+        "apply through the easy apply button",
+        "easy apply",
+    ]
+
+    if not any(signal in body_lower for signal in easy_apply_signals):
+        return None
+
+    print("Easy Apply confirmed from job description.")
+
+    # LinkedIn can render the top-card control asynchronously.
+    try:
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    for selector in [
+        "main button",
+        "main [role='button']",
+        "main a",
+        ".jobs-details button",
+        ".jobs-details [role='button']",
+        ".jobs-details a",
+        ".jobs-unified-top-card button",
+        ".jobs-unified-top-card [role='button']",
+        ".jobs-unified-top-card a",
+    ]:
+        found = scan(selector)
+        if found is not None:
+            print("LinkedIn main application control found.")
+            return found
+
+    return None
+
+
+# ---------------------------------------
+# Check Whether Job Is Closed
+# ---------------------------------------
+
+def is_job_closed(body_text):
+
+    closed_messages = [
+
+        "No longer accepting applications",
+
+        "This job is no longer accepting applications",
+
+        "Job is no longer accepting applications"
+    ]
+
+    text = body_text.lower()
+
+    for message in closed_messages:
+
+        if message.lower() in text:
+
+            return True
+
+    return False
+
+
+# ---------------------------------------
+# Print Application Controls
+# ---------------------------------------
+
+def print_application_controls(page):
+
+    print()
+    print(
+        "Visible application-related elements:"
+    )
+
+    try:
+
+        candidates = page.locator(
+            "button, a, [role='button']"
+        )
+
+        count = candidates.count()
+
+        shown = 0
+
+        for i in range(count):
+
+            if shown >= 30:
+
+                break
+
+            element = candidates.nth(i)
+
+            try:
+
+                if not element.is_visible():
+
+                    continue
+
+                text = (
+                    element.inner_text()
+                    .strip()
+                )
+
+                aria = (
+                    element.get_attribute(
+                        "aria-label"
+                    )
+                    or ""
+                )
+
+                combined = (
+                    text + " " + aria
+                ).lower()
+
+                if any(
+                    keyword in combined
+                    for keyword in [
+                        "apply",
+                        "easy",
+                        "application"
+                    ]
+                ):
+
+                    print(
+                        f"  [{i}] "
+                        f"Text: {text[:150]}"
+                    )
+
+                    if aria:
+
+                        print(
+                            f"       "
+                            f"Aria: {aria[:150]}"
+                        )
+
+                    shown += 1
+
+            except Exception:
+
+                continue
+
+    except Exception as e:
+
+        print(
+            "Could not inspect "
+            f"application controls: {e}"
+        )
+
+
+# ---------------------------------------
+# Save Diagnostic Screenshot
+# ---------------------------------------
+
+def save_diagnostic_screenshot(page):
+
+    try:
+
+        os.makedirs(
+            "screenshots",
+            exist_ok=True
+        )
+
+        path = (
+            "screenshots/"
+            "easy_apply_not_found.png"
+        )
+
+        page.screenshot(
+            path=path,
+            full_page=True
+        )
+
+        print()
+        print(
+            f"Diagnostic screenshot saved: {path}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"Screenshot failed: {e}"
+        )
+
+
+# ---------------------------------------
+# External application profile
+# ---------------------------------------
+
+def get_external_profile():
+    """
+    Load external-ATS profile values from config.py or environment variables.
+
+    Supported config names:
+      FULL_NAME / NAME
+      EMAIL / EMAIL_ADDRESS
+      PHONE / MOBILE / MOBILE_NUMBER
+      RESUME_PATH
+
+    Environment variables with the same names are also supported.
+    """
+    values = {}
+
+    try:
+        import config as cfg
+
+        aliases = {
+            "name": ("FULL_NAME", "NAME"),
+            "email": ("EMAIL", "EMAIL_ADDRESS"),
+            "phone": ("PHONE", "MOBILE", "MOBILE_NUMBER"),
+            "resume": ("RESUME_PATH", "RESUME"),
+        }
+
+        for key, names in aliases.items():
+            for name in names:
+                value = getattr(cfg, name, None)
+                if value:
+                    values[key] = str(value).strip()
+                    break
+    except Exception:
+        pass
+
+    env_aliases = {
+        "name": ("JOB_NAME", "FULL_NAME", "NAME"),
+        "email": ("JOB_EMAIL", "EMAIL", "EMAIL_ADDRESS"),
+        "phone": ("JOB_PHONE", "PHONE", "MOBILE"),
+        "resume": ("JOB_RESUME_PATH", "RESUME_PATH"),
+    }
+
+    for key, names in env_aliases.items():
+        if values.get(key):
+            continue
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                values[key] = value
+                break
+
+    if not values.get("resume"):
+        default_resume = os.path.join("resume", "resume.pdf")
+        if os.path.exists(default_resume):
+            values["resume"] = default_resume
+
+    return (
+        values.get("resume", ""),
+        values.get("name", ""),
+        values.get("email", ""),
+        values.get("phone", ""),
+    )
+
+
+# ---------------------------------------
+# Detect an external tab opened by LinkedIn
+# ---------------------------------------
+
+def find_new_external_page(context, before_pages):
+    """Return a newly opened non-LinkedIn page, if one appeared."""
+    try:
+        for candidate in context.pages:
+            if candidate in before_pages:
+                continue
+            try:
+                url = (candidate.url or "").lower()
+                if url and "linkedin.com" not in url:
+                    return candidate
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------
+# Open Easy Apply
+# ---------------------------------------
+
+def open_easy_apply(job):
+    global LAST_APPLICATION_RESULT
+    LAST_APPLICATION_RESULT = ""
+
+    link = job.get(
+        "Link",
+        ""
+    )
+
+    link = convert_to_job_url(link)
+
+    if not link:
+
+        print(
+            "Job URL not found."
+        )
+
+        return False
+
+    print()
+    print("=" * 70)
+    print("OPENING JOB")
+    print("=" * 70)
+
+    print(
+        f"Title   : "
+        f"{job.get('Title', '')}"
+    )
+
+    print(
+        f"Company : "
+        f"{job.get('Company') or 'Not available'}"
+    )
+
+    print(
+        f"Location: "
+        f"{job.get('Location') or 'Not available'}"
+    )
+
+    print(
+        f"Score   : "
+        f"{job.get('Match Score', '')}"
+    )
+
+    print(
+        f"URL     : {link}"
+    )
+
+    # ---------------------------------------
+    # Connect to existing Chrome
+    # ---------------------------------------
+
+    with sync_playwright() as p:
+
+        try:
+
+            browser = (
+                p.chromium.connect_over_cdp(
+                    CHROME_CDP_URL
+                )
+            )
+
+        except Exception as e:
+
+            print()
+            print(
+                "Could not connect to Chrome."
+            )
+
+            print(
+                "Start Chrome using:"
+            )
+
+            print(
+                ".\\start_chrome.bat"
+            )
+
+            print()
+            print(
+                f"Error: {e}"
+            )
+
+            return False
+
+        if not browser.contexts:
+
+            print(
+                "No browser context found."
+            )
+
+            return False
+
+        context = browser.contexts[0]
+
+        # ---------------------------------------
+        # Find LinkedIn page
+        # ---------------------------------------
+
+        page = None
+
+        for existing_page in context.pages:
+
+            try:
+
+                if (
+                    "linkedin.com"
+                    in existing_page.url
+                ):
+
+                    page = existing_page
+
+                    break
+
+            except Exception:
+
+                continue
+
+        if page is None:
+
+            if context.pages:
+
+                page = context.pages[0]
+
+            else:
+
+                page = context.new_page()
+
+        # ---------------------------------------
+        # Open job
+        # ---------------------------------------
+
+        try:
+            # LinkedIn can keep navigation pending while its app shell loads.
+            # "commit" is enough; we then wait for the page content ourselves.
+            page.goto(
+                link,
+                wait_until="commit",
+                timeout=60000
+            )
+        except PlaywrightTimeoutError as e:
+            # A timeout after navigation started is not automatically a failed job.
+            # If the browser reached LinkedIn, continue inspecting the page.
+            print()
+            print("Navigation timed out while loading LinkedIn.")
+            print("Continuing with the loaded page...")
+            print(f"Navigation detail: {e}")
+        except Exception as e:
+            print()
+            print(f"Could not open job: {e}")
+            return False
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
+
+        print()
+        print(
+            f"Page title: {page.title()}"
+        )
+
+        print(
+            f"Current URL: {page.url}"
+        )
+
+        # ---------------------------------------
+        # Read page
+        # ---------------------------------------
+
+        try:
+
+            body_text = (
+                page.locator(
+                    "body"
+                ).inner_text()
+            )
+
+        except Exception:
+
+            body_text = ""
+
+        # ---------------------------------------
+        # Check closed job
+        # ---------------------------------------
+
+        if is_job_closed(body_text):
+
+            print()
+            print("=" * 70)
+            print("JOB CLOSED")
+            print("=" * 70)
+
+            print(
+                "This job is no longer "
+                "accepting applications."
+            )
+
+            print(
+                "Skipping this job..."
+            )
+            LAST_APPLICATION_RESULT = "CLOSED"
+            return False
+
+        # ---------------------------------------
+        # Find Easy Apply
+        # ---------------------------------------
+
+        print()
+        print(
+            "Searching for Easy Apply button..."
+        )
+
+        easy_apply = (
+            find_easy_apply_button(page)
+        )
+
+        # ---------------------------------------
+        # Easy Apply not found
+        # ---------------------------------------
+
+        if easy_apply is None:
+
+            # A submitted application no longer has an Apply button.
+            # Detect that state before trying an external application.
+            if page_shows_already_applied(page):
+
+                print()
+                print("=" * 70)
+                print("APPLICATION ALREADY SUBMITTED")
+                print("=" * 70)
+
+                print(
+                    "LinkedIn indicates that this job "
+                    "has already been applied to."
+                )
+
+                update_tracker_status(
+                    job,
+                    "APPLIED"
+                )
+                LAST_APPLICATION_RESULT = "ALREADY_APPLIED"
+                return False
+
+            # ---------------------------------------
+            # External ATS application
+            # ---------------------------------------
+            external_url = ""
+            if find_external_apply_link is not None:
+                try:
+                    external_url = find_external_apply_link(page) or ""
+                except Exception as e:
+                    print(f"External apply-link detection failed: {e}")
+
+            if external_url and external_apply is not None:
+                print()
+                print("=" * 70)
+                print("EXTERNAL APPLICATION DETECTED")
+                print("=" * 70)
+                print(f"External URL: {external_url}")
+
+                resume_path, name, email, phone = get_external_profile()
+
+                if not name or not email or not phone:
+                    print()
+                    print("External profile is incomplete.")
+                    print("Configure FULL_NAME/EMAIL/PHONE in config.py")
+                    print("or JOB_NAME/JOB_EMAIL/JOB_PHONE environment variables.")
+                    print("Opening the application for manual review only.")
+
+                try:
+                    external_result = external_apply(
+                        external_url,
+                        resume_path,
+                        name,
+                        email,
+                        phone,
+                    )
+                except Exception as e:
+                    print()
+                    print(f"External application preparation failed: {e}")
+                    LAST_APPLICATION_RESULT = "FAILED"
+                    return False
+
+                result_status = interpret_application_result(external_result)
+
+                print()
+                print(
+                    f"External application result: "
+                    f"{result_status or 'UNKNOWN'}"
+                )
+
+                if result_status == "LOGIN_REQUIRED":
+                    update_tracker_status(
+                        job,
+                        "LOGIN_REQUIRED"
+                    )
+
+                    LAST_APPLICATION_RESULT = "LOGIN_REQUIRED"
+
+                    print()
+                    print("=" * 70)
+                    print("EXTERNAL LOGIN REQUIRED")
+                    print("=" * 70)
+                    print(
+                        "The external application requires authentication."
+                    )
+                    print(
+                        "No credentials were entered and no submission was performed."
+                    )
+
+                    return False
+                if result_status == "LOGIN_REQUIRED":
+
+                    update_tracker_status(
+                        job,
+                        "LOGIN_REQUIRED"
+                    )
+
+                    LAST_APPLICATION_RESULT = "LOGIN_REQUIRED"
+
+                    print()
+                    print("=" * 70)
+                    print("EXTERNAL LOGIN REQUIRED")
+                    print("=" * 70)
+
+                    print(
+                        "External application requires authentication."
+                    )
+
+                    print(
+                        "No credentials were entered."
+                    )
+
+                    print(
+                        "Application was NOT submitted."
+                    )
+
+                    return False
+
+                if result_status == "INELIGIBLE":
+
+                    update_tracker_status(
+                        job,
+                        "INELIGIBLE"
+                    )
+
+                    LAST_APPLICATION_RESULT = "INELIGIBLE"
+
+                    print()
+                    print("=" * 70)
+                    print("APPLICATION SKIPPED - INELIGIBLE")
+                    print("=" * 70)
+
+                    print(
+                        "External application explicitly requires "
+                        "more experience than the candidate has."
+                    )
+
+                    print(
+                        "No application was submitted."
+                    )
+
+                    return False
+
+                if result_status == "READY_FOR_REVIEW":
+                    update_tracker_status(
+                        job,
+                        "READY_FOR_REVIEW"
+                    )
+                    LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
+                    print(
+                        "External application prepared. "
+                        "No submission was performed."
+                    )
+                    return False
+
+                if result_status == "SUBMITTED":
+                    # external_apply must only return SUBMITTED if it
+                    # independently verified the final submitted state.
+                    update_tracker_status(
+                        job,
+                        "APPLIED"
+                    )
+                    LAST_APPLICATION_RESULT = "SUBMITTED"
+                    return True
+
+                LAST_APPLICATION_RESULT = result_status or "UNKNOWN"
+                return False
+
+            print()
+            print("=" * 70)
+            print("EASY APPLY / EXTERNAL APPLY NOT FOUND")
+            print("=" * 70)
+
+            print()
+            print(
+                "LinkedIn did not expose a usable Easy Apply control "
+                "or a supported external application link."
+            )
+
+            print_application_controls(page)
+            save_diagnostic_screenshot(page)
+
+            LAST_APPLICATION_RESULT = "NOT_AVAILABLE"
+            return False
+
+        # ---------------------------------------
+        # Easy Apply found
+        # ---------------------------------------
+
+        print()
+        print("=" * 70)
+        print("EASY APPLY BUTTON FOUND")
+        print("=" * 70)
+
+        # Keep the existing page list so we can detect LinkedIn's
+        # external-application tab after clicking a generic Apply control.
+        pages_before_click = list(context.pages)
+
+        try:
+
+            easy_apply.scroll_into_view_if_needed()
+
+            page.wait_for_timeout(
+                500
+            )
+
+            easy_apply.click(
+                timeout=10000
+            )
+
+        except Exception as e:
+
+            print()
+            print(
+                f"Normal click failed: {e}"
+            )
+
+            print(
+                "Trying JavaScript click..."
+            )
+
+            try:
+
+                easy_apply.evaluate(
+                    "(element) => element.click()"
+                )
+
+            except Exception as js_error:
+
+                print(
+                    "JavaScript click failed:"
+                )
+
+                print(
+                    js_error
+                )
+                LAST_APPLICATION_RESULT = "FAILED"
+                return False
+
+        # ---------------------------------------
+        # Detect external tab opened by LinkedIn
+        # ---------------------------------------
+
+        page.wait_for_timeout(3000)
+
+        external_page = find_new_external_page(
+            context,
+            pages_before_click,
+        )
+
+        if external_page is not None:
+            print()
+            print("=" * 70)
+            print("LINKEDIN OPENED EXTERNAL APPLICATION")
+            print("=" * 70)
+            print(f"External URL: {external_page.url}")
+
+            resume_path, name, email, phone = get_external_profile()
+
+            if not name or not email or not phone:
+                print()
+                print("External profile is incomplete.")
+                print("Configure FULL_NAME/EMAIL/PHONE in config.py")
+                print("or JOB_NAME/JOB_EMAIL/JOB_PHONE environment variables.")
+
+            try:
+                external_result = prepare_external_application_page(
+                    external_page,
+                    resume_path,
+                    name,
+                    email,
+                    phone,
+                )
+            except Exception as e:
+                print()
+                print(f"External application preparation failed: {e}")
+                LAST_APPLICATION_RESULT = "FAILED"
+                return False
+
+            result_status = interpret_application_result(external_result)
+            print()
+            print(f"External application result: {result_status or 'UNKNOWN'}")
+
+            if result_status == "READY_FOR_REVIEW":
+                update_tracker_status(job, "READY_FOR_REVIEW")
+                LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
+                return False
+
+            LAST_APPLICATION_RESULT = result_status or "UNKNOWN"
+            return False
+
+        # ---------------------------------------
+        # Wait for LinkedIn application form
+        # ---------------------------------------
+
+        print()
+        print("=" * 70)
+        print("EASY APPLY FORM OPENED")
+        print("=" * 70)
+
+        # ---------------------------------------
+        # Run application form automation
+        # ---------------------------------------
+
+        try:
+
+            form_result = inspect_and_prepare_form(
+                page
+            )
+
+        except Exception as e:
+
+            print()
+            print(
+                "Application form automation "
+                "failed:"
+            )
+
+            print(e)
+
+            update_tracker_status(
+                job,
+                "FAILED"
+            )
+            LAST_APPLICATION_RESULT = "FAILED"
+            return False
+
+        # Always check the actual LinkedIn page after the form handler.
+        # This is the strongest signal that submission really happened.
+        if page_shows_submitted(page):
+
+            print()
+            print("=" * 70)
+            print("APPLICATION SUBMITTED")
+            print("=" * 70)
+
+            update_tracker_status(
+                job,
+                "APPLIED"
+            )
+            LAST_APPLICATION_RESULT = "SUBMITTED"
+            return True
+
+        result_status = interpret_application_result(
+            form_result
+        )
+
+        print()
+        print(
+            f"Application form result: "
+            f"{result_status or 'UNKNOWN'}"
+        )
+
+        if result_status == "SUBMITTED":
+
+            update_tracker_status(
+                job,
+                "APPLIED"
+            )
+
+            return True
+
+        if result_status == "READY_FOR_REVIEW":
+
+            update_tracker_status(
+                job,
+                "READY_FOR_REVIEW"
+            )
+
+            print(
+                "Application is prepared but was "
+                "NOT confirmed as submitted."
+            )
+            LAST_APPLICATION_RESULT = "READY_FOR_REVIEW"
+            return False
+
+        if result_status in {
+            "SKIPPED",
+            "STOPPED",
+            "FAILED",
+        }:
+
+            print(
+                "Application was NOT confirmed "
+                "as submitted."
+            )
+
+            return False
+
+        print(
+            "Application submission could not be "
+            "confirmed. Tracker will not be marked APPLIED."
+        )
+        LAST_APPLICATION_RESULT = "UNKNOWN"
+        return False
+
+
+# ---------------------------------------
+# Main
+# ---------------------------------------
+
+def main():
+    print()
+    print("=" * 70)
+    print("AI JOB AUTOMATION - BATCH APPLICATION RUNNER")
+    print("=" * 70)
+
+    daily_count = get_daily_confirmed_applications()
+    remaining = max(0, DAILY_APPLICATION_LIMIT - daily_count)
+
+    print()
+    print(
+        f"Confirmed applications today: "
+        f"{daily_count}/{DAILY_APPLICATION_LIMIT}"
+    )
+
+    if remaining == 0:
+        print("Daily application limit reached. No new applications will be attempted.")
+        return
+
+    jobs = get_recommended_jobs()
+
+    if not jobs:
+        print()
+        print("No eligible jobs currently meet the configured requirements.")
+        return
+
+    print()
+    print(f"Eligible candidate jobs: {len(jobs)}")
+    print(f"Applications still allowed today: {remaining}")
+    print(f"Auto-submit: {'ON' if AUTO_SUBMIT else 'OFF'}")
+    print(f"Unknown-question policy: {UNKNOWN_QUESTIONS_POLICY}")
+
+    display_jobs(jobs[:min(len(jobs), 15)])
+
+    start_index = 0
+
+    # Keep manual selection available only when auto-submit is disabled.
+    if not AUTO_SUBMIT:
+        try:
+            choice = int(
+                input(
+                    f"Select starting job "
+                    f"(1-{len(jobs)}): "
+                )
+            )
+        except ValueError:
+            print("Invalid selection.")
+            return
+
+        if choice < 1 or choice > len(jobs):
+            print("Invalid selection.")
+            return
+
+        start_index = choice - 1
+
+    for index in range(start_index, len(jobs)):
+        confirmed = get_daily_confirmed_applications()
+
+        if confirmed >= DAILY_APPLICATION_LIMIT:
+            break
+
+        job = jobs[index]
+
+        print()
+        print("=" * 70)
+        print(f"TRYING CANDIDATE {index + 1}/{len(jobs)}")
+        print("=" * 70)
+        print(f"Title   : {job.get('Title', '')}")
+        print(f"Company : {job.get('Company') or 'Not available'}")
+        print(f"Location: {job.get('Location') or 'Not available'}")
+        print(f"Score   : {job.get('Match Score', '')}")
+
+        success = open_easy_apply(job)
+
+        if success:
+            confirmed = get_daily_confirmed_applications()
+            print()
+            print("=" * 70)
+            print("APPLICATION COMPLETED")
+            print("=" * 70)
+            print(
+                f"Confirmed applications today: "
+                f"{confirmed}/{DAILY_APPLICATION_LIMIT}"
+            )
+            continue
+
+        # User requested a safety stop on unfamiliar required questions.
+        if LAST_APPLICATION_RESULT == "STOPPED":
+            print()
+            print("=" * 70)
+            print("AUTOMATION STOPPED FOR SAFETY")
+            print("=" * 70)
+            print(
+                "An unfamiliar required question was encountered. "
+                "No further applications will be attempted in this run."
+            )
+            break
+
+        print()
+        print(
+            f"Candidate result: "
+            f"{LAST_APPLICATION_RESULT or 'SKIPPED'}"
+        )
+
+        if index + 1 < len(jobs):
+            print("Trying next eligible candidate...")
+
+    final_count = get_daily_confirmed_applications()
+
+    print()
+    print("=" * 70)
+    print("BATCH APPLICATION RUN COMPLETED")
+    print("=" * 70)
+    print(
+        f"Confirmed applications today: "
+        f"{final_count}/{DAILY_APPLICATION_LIMIT}"
+    )
+    print(
+        f"Remaining daily capacity: "
+        f"{max(0, DAILY_APPLICATION_LIMIT - final_count)}"
+    )
+
+
+# ---------------------------------------
+# Entry Point
+# ---------------------------------------
+
+if __name__ == "__main__":
+    main()
