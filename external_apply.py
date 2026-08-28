@@ -1,3 +1,5 @@
+import re
+
 """
 External ATS discovery and safe form preparation.
 
@@ -54,6 +56,167 @@ def detect_ats(url):
         if host == domain or host.endswith("." + domain):
             return name
     return "UNKNOWN"
+
+# ============================================================
+# External Eligibility
+# ============================================================
+
+CANDIDATE_EXPERIENCE_YEARS = 0
+
+
+def extract_external_experience_requirement(text):
+    """
+    Extract an explicit minimum professional-experience requirement.
+
+    Returns:
+        required_years: minimum clearly stated years
+        label: human-readable requirement
+        skip: True when candidate experience is insufficient
+    """
+
+    text = " ".join(
+        str(text or "").lower().split()
+    )
+
+    # Normalize common Unicode dash characters so experience ranges
+    # such as "1–3 years" and "1—3 years" are detected consistently.
+    text = (
+        text
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+
+    if not text:
+        return 0, "Not specified", False
+
+    # Explicit fresher/entry-level wording.
+    fresher_terms = (
+        "fresher",
+        "freshers",
+        "fresh graduate",
+        "recent graduate",
+        "entry level",
+        "entry-level",
+        "0 years experience",
+        "0-1 years",
+        "0 - 1 years",
+    )
+
+    # Check explicit experience requirements first.
+    patterns = [
+        # Range:
+        # 1-3 years of professional software engineering experience
+        # 1–3 years professional experience
+        r"(\d+)\s*-\s*(\d+)\s+years?\b.*?\bexperience",
+
+        # Minimum:
+        # minimum 2 years of experience
+        # minimum 2 years professional experience
+        r"minimum\s+(\d+)\s+years?\b.*?\bexperience",
+
+        # At least:
+        # at least 1 year of professional experience
+        # at least 1 year software engineering experience
+        r"at\s+least\s+(\d+)\s+years?\b.*?\bexperience",
+
+        # Plus:
+        # 2+ years of experience
+        # 2+ years professional software engineering experience
+        r"(\d+)\s*\+\s*years?\b.*?\bexperience",
+
+        # Simple:
+        # 2 years of experience
+        # 2 years professional software engineering experience
+        r"(\d+)\s+years?\b.*?\bexperience",
+    ]
+    requirements = []
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            try:
+                minimum = int(match.group(1))
+                requirements.append(minimum)
+            except (ValueError, TypeError):
+                continue
+
+    if requirements:
+        # For a range such as 1-3 years, group(1) is the
+        # minimum requirement (1), not the maximum (3).
+        required_years = min(requirements)
+
+        return (
+            required_years,
+            f"{required_years}+ years",
+            required_years > CANDIDATE_EXPERIENCE_YEARS,
+        )
+
+    if any(term in text for term in fresher_terms):
+        return 0, "Fresher / Entry Level", False
+
+    return 0, "Not specified", False
+
+
+def check_external_eligibility(page):
+    """
+    Perform a conservative eligibility check using the visible external
+    application page.
+
+    Returns:
+        ELIGIBLE
+        INELIGIBLE
+        UNKNOWN
+    """
+
+    try:
+        body_text = page.locator("body").inner_text(
+            timeout=10000
+        )
+    except Exception as e:
+        print(
+            f"Could not read external application page: {e}"
+        )
+        return "UNKNOWN"
+
+    required_years, label, should_skip = (
+        extract_external_experience_requirement(
+            body_text
+        )
+    )
+
+    print()
+    print("=" * 70)
+    print("EXTERNAL ELIGIBILITY CHECK")
+    print("=" * 70)
+
+    print(
+        f"Candidate experience : "
+        f"{CANDIDATE_EXPERIENCE_YEARS} years"
+    )
+
+    print(
+        f"External requirement  : "
+        f"{label}"
+    )
+
+    if should_skip:
+        print()
+        print(
+            "INELIGIBLE: external page explicitly requires "
+            "more professional experience."
+        )
+        return "INELIGIBLE"
+
+    if required_years == 0:
+        print(
+            "No explicit minimum experience requirement detected."
+        )
+        return "UNKNOWN"
+
+    print(
+        "External experience requirement is compatible."
+    )
+
+    return "ELIGIBLE"
 
 
 def find_external_apply_link(page):
@@ -216,10 +379,15 @@ def prepare_external_application_page(page, resume_path, name, email, phone):
     """
     Prepare an already-open external application page.
 
-    Returns READY_FOR_REVIEW after filling obvious fields and navigating through
-    a non-final Apply Now/Continue/Next step. It never submits the application.
+    Returns:
+        INELIGIBLE
+        READY_FOR_REVIEW
+
+    The function never submits an external application.
     """
+
     ats = detect_ats(page.url)
+
     print(f"External ATS detected: {ats}")
     print(f"External page: {page.url}")
 
@@ -229,44 +397,153 @@ def prepare_external_application_page(page, resume_path, name, email, phone):
         pass
 
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=15000
+        )
     except Exception:
         pass
+
     page.wait_for_timeout(1500)
 
     print("Preparing external application page...")
 
-    # Some company pages show a job-detail page first. Apply Now is a safe
-    # continuation control; it is not treated as final submission.
+    # --------------------------------------------------
+    # External eligibility gate
+    # --------------------------------------------------
+
+    eligibility = check_external_eligibility(page)
+
+    if eligibility == "INELIGIBLE":
+        print()
+        print("=" * 70)
+        print("EXTERNAL APPLICATION SKIPPED")
+        print("=" * 70)
+
+        print(
+            "Candidate does not meet the explicit "
+            "experience requirement."
+        )
+
+        print(
+            "No resume upload or application preparation "
+            "was performed."
+        )
+
+        return "INELIGIBLE"
+
+    # --------------------------------------------------
+    # Continue only when eligibility is not INELIGIBLE
+    # --------------------------------------------------
+
     clicked = _click_application_continue(page)
+
     if clicked:
-        print("External application continuation control clicked.")
+        print(
+            "External application continuation control clicked."
+        )
+
         page.wait_for_timeout(1500)
 
+    # --------------------------------------------------
+    # Fill known contact fields
+    # --------------------------------------------------
+
     filled = 0
-    if _fill_first(page, ['input[name*="name" i]', 'input[id*="name" i]', 'input[placeholder*="name" i]'], name):
-        filled += 1
-    if _fill_first(page, ['input[type="email"]', 'input[name*="email" i]', 'input[id*="email" i]'], email):
-        filled += 1
-    if _fill_first(page, ['input[type="tel"]', 'input[name*="phone" i]', 'input[name*="mobile" i]', 'input[id*="phone" i]'], phone):
+
+    if _fill_first(
+        page,
+        [
+            'input[name*="name" i]',
+            'input[id*="name" i]',
+            'input[placeholder*="name" i]'
+        ],
+        name
+    ):
         filled += 1
 
-    uploaded = _upload_resume(page, resume_path)
+    if _fill_first(
+        page,
+        [
+            'input[type="email"]',
+            'input[name*="email" i]',
+            'input[id*="email" i]'
+        ],
+        email
+    ):
+        filled += 1
 
-    print(f"Known contact fields filled: {filled}")
-    print(f"Resume uploaded: {'Yes' if uploaded else 'No / not required yet'}")
+    if _fill_first(
+        page,
+        [
+            'input[type="tel"]',
+            'input[name*="phone" i]',
+            'input[name*="mobile" i]',
+            'input[id*="phone" i]'
+        ],
+        phone
+    ):
+        filled += 1
 
-    visible_required, empty_required = _required_fields_empty(page)
-    print(f"Visible required fields: {visible_required}")
-    print(f"Required fields still empty: {empty_required}")
+    # --------------------------------------------------
+    # Resume upload
+    # --------------------------------------------------
+
+    uploaded = _upload_resume(
+        page,
+        resume_path
+    )
+
+    print(
+        f"Known contact fields filled: {filled}"
+    )
+
+    print(
+        "Resume uploaded: "
+        f"{'Yes' if uploaded else 'No / not required yet'}"
+    )
+
+    # --------------------------------------------------
+    # Required fields check
+    # --------------------------------------------------
+
+    visible_required, empty_required = (
+        _required_fields_empty(page)
+    )
+
+    print(
+        f"Visible required fields: "
+        f"{visible_required}"
+    )
+
+    print(
+        f"Required fields still empty: "
+        f"{empty_required}"
+    )
 
     if empty_required:
-        print("External application needs manual completion/review.")
+        print(
+            "External application needs "
+            "manual completion/review."
+        )
     else:
-        print("No visible required fields remain empty.")
+        print(
+            "No visible required fields remain empty."
+        )
 
-    print("External application prepared for manual review.")
-    print("No external submission was performed.")
+    # --------------------------------------------------
+    # Never submit externally
+    # --------------------------------------------------
+
+    print(
+        "External application prepared "
+        "for manual review."
+    )
+
+    print(
+        "No external submission was performed."
+    )
+
     return "READY_FOR_REVIEW"
 
 
