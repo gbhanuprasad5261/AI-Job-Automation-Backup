@@ -1,583 +1,743 @@
+"""External ATS application helpers.
+
+The module prepares external applications for review. It deliberately does
+not submit external applications automatically because ATS forms vary and
+unknown questions must never be guessed.
+"""
+
+import os
 import re
+from urllib.parse import parse_qs, unquote, urlparse
 
-"""
-External ATS discovery and safe form preparation.
+from playwright.sync_api import Page
 
-This module handles company-career-page applications opened from LinkedIn.
-It may prepare a form for manual review, but it never submits an external
-application automatically.
-"""
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-from pathlib import Path
-from urllib.parse import urlparse
+CURRENT_LOCATION = os.getenv("CURRENT_LOCATION", "Bengaluru")
+CURRENT_COMPANY = os.getenv("CURRENT_COMPANY", "N/A")
+GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/gbhanuprasad5261")
 
 
-ATS_DOMAINS = {
-    "greenhouse.io": "GREENHOUSE",
-    "boards.greenhouse.io": "GREENHOUSE",
-    "lever.co": "LEVER",
-    "jobs.lever.co": "LEVER",
-    "myworkdayjobs.com": "WORKDAY",
-    "workday.com": "WORKDAY",
-    "ashbyhq.com": "ASHBY",
-    "smartrecruiters.com": "SMARTRECRUITERS",
-}
-
-def is_external_login_required(page):
-    """
-    Detect external ATS pages that require user authentication.
-
-    This does NOT attempt to log in automatically.
-    """
+def _text(page):
     try:
-        url = (page.url or "").lower()
+        return page.locator("body").inner_text().strip()
+    except Exception:
+        return ""
 
-        if "/login" in url or "signin" in url or "sign-in" in url:
-            return True
 
-        body = (page.locator("body").inner_text() or "").lower()
+def _attr(element, name):
+    try:
+        return element.get_attribute(name) or ""
+    except Exception:
+        return ""
 
-        login_signals = [
-            "sign in to continue",
-            "continue with google",
-            "sign in with google",
-            "log in to continue",
-            "login to continue",
-        ]
 
-        return any(signal in body for signal in login_signals)
-
+def _visible(element):
+    try:
+        return element.is_visible()
     except Exception:
         return False
-    
-def detect_ats(url):
-    host = urlparse(url).netloc.lower()
-    for domain, name in ATS_DOMAINS.items():
-        if host == domain or host.endswith("." + domain):
-            return name
+
+
+def unwrap_linkedin_external_url(url: str) -> str:
+    """Extract the real destination from LinkedIn /safety/go/?url=... redirects."""
+    if not url:
+        return ""
+
+    current = url
+    for _ in range(3):
+        parsed = urlparse(current)
+        query = parse_qs(parsed.query)
+        candidates = query.get("url", []) + query.get("target", [])
+        if not candidates:
+            break
+        candidate = unquote(candidates[0]).strip()
+        if not candidate or candidate == current:
+            break
+        current = candidate
+
+    return current
+
+
+def detect_ats(url: str, body: str = "") -> str:
+    value = f"{url} {body}".lower()
+    if "greenhouse.io" in value or "boards.greenhouse" in value:
+        return "GREENHOUSE"
+    if "lever.co" in value:
+        return "LEVER"
+    if "myworkdayjobs.com" in value or "workday.com" in value:
+        return "WORKDAY"
+    if "ashbyhq.com" in value:
+        return "ASHBY"
+    if "smartrecruiters.com" in value:
+        return "SMARTRECRUITERS"
+    if "cutshort.io" in value:
+        return "CUTSHORT"
     return "UNKNOWN"
 
-# ============================================================
-# External Eligibility
-# ============================================================
 
-CANDIDATE_EXPERIENCE_YEARS = 0
-
-
-def extract_external_experience_requirement(text):
-    """
-    Extract an explicit minimum professional-experience requirement.
-
-    Returns:
-        required_years: minimum clearly stated years
-        label: human-readable requirement
-        skip: True when candidate experience is insufficient
-    """
-
-    text = " ".join(
-        str(text or "").lower().split()
-    )
-
-    # Normalize common Unicode dash characters so experience ranges
-    # such as "1–3 years" and "1—3 years" are detected consistently.
-    text = (
-        text
-        .replace("–", "-")
-        .replace("—", "-")
-    )
-
-    if not text:
-        return 0, "Not specified", False
-
-    # Explicit fresher/entry-level wording.
-    fresher_terms = (
-        "fresher",
-        "freshers",
-        "fresh graduate",
-        "recent graduate",
-        "entry level",
-        "entry-level",
-        "0 years experience",
-        "0-1 years",
-        "0 - 1 years",
-    )
-
-    # Check explicit experience requirements first.
-    patterns = [
-        # Range:
-        # 1-3 years of professional software engineering experience
-        # 1–3 years professional experience
-        r"(\d+)\s*-\s*(\d+)\s+years?\b.*?\bexperience",
-
-        # Minimum:
-        # minimum 2 years of experience
-        # minimum 2 years professional experience
-        r"minimum\s+(\d+)\s+years?\b.*?\bexperience",
-
-        # At least:
-        # at least 1 year of professional experience
-        # at least 1 year software engineering experience
-        r"at\s+least\s+(\d+)\s+years?\b.*?\bexperience",
-
-        # Plus:
-        # 2+ years of experience
-        # 2+ years professional software engineering experience
-        r"(\d+)\s*\+\s*years?\b.*?\bexperience",
-
-        # Simple:
-        # 2 years of experience
-        # 2 years professional software engineering experience
-        r"(\d+)\s+years?\b.*?\bexperience",
-    ]
-    requirements = []
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            try:
-                minimum = int(match.group(1))
-                requirements.append(minimum)
-            except (ValueError, TypeError):
-                continue
-
-    if requirements:
-        # For a range such as 1-3 years, group(1) is the
-        # minimum requirement (1), not the maximum (3).
-        required_years = min(requirements)
-
-        return (
-            required_years,
-            f"{required_years}+ years",
-            required_years > CANDIDATE_EXPERIENCE_YEARS,
-        )
-
-    if any(term in text for term in fresher_terms):
-        return 0, "Fresher / Entry Level", False
-
-    return 0, "Not specified", False
-
-
-def check_external_eligibility(page):
-    """
-    Perform a conservative eligibility check using the visible external
-    application page.
-
-    Returns:
-        ELIGIBLE
-        INELIGIBLE
-        UNKNOWN
-    """
-
-    try:
-        body_text = page.locator("body").inner_text(
-            timeout=10000
-        )
-    except Exception as e:
-        print(
-            f"Could not read external application page: {e}"
-        )
-        return "UNKNOWN"
-
-    required_years, label, should_skip = (
-        extract_external_experience_requirement(
-            body_text
-        )
-    )
-
-    print()
-    print("=" * 70)
-    print("EXTERNAL ELIGIBILITY CHECK")
-    print("=" * 70)
-
-    print(
-        f"Candidate experience : "
-        f"{CANDIDATE_EXPERIENCE_YEARS} years"
-    )
-
-    print(
-        f"External requirement  : "
-        f"{label}"
-    )
-
-    if should_skip:
-        print()
-        print(
-            "INELIGIBLE: external page explicitly requires "
-            "more professional experience."
-        )
-        return "INELIGIBLE"
-
-    if required_years == 0:
-        print(
-            "No explicit minimum experience requirement detected."
-        )
-        return "UNKNOWN"
-
-    print(
-        "External experience requirement is compatible."
-    )
-
-    return "ELIGIBLE"
-
-
-def find_external_apply_link(page):
-    """Return the strongest visible external application link on a LinkedIn page."""
+def find_external_apply_link(page: Page) -> str:
+    """Find an external application destination without guessing among unrelated links."""
+    # Prefer explicit hrefs attached to application controls.
     selectors = [
-        'a[href*="greenhouse"]',
-        'a[href*="lever.co"]',
-        'a[href*="myworkdayjobs"]',
-        'a[href*="ashbyhq"]',
-        'a[href*="smartrecruiters"]',
+        "a[href]",
+        "button",
+        "[role='button']",
+        "[role='link']",
     ]
-
     for selector in selectors:
-        links = page.locator(selector)
-        for i in range(links.count()):
-            link = links.nth(i)
-            try:
-                if not link.is_visible():
-                    continue
-                href = link.get_attribute("href") or ""
-                if href.startswith("http"):
-                    return href
-            except Exception:
-                continue
-
-    links = page.locator("a[href]")
-    for i in range(links.count()):
-        link = links.nth(i)
         try:
-            if not link.is_visible():
-                continue
-            text = (link.inner_text() or "").strip().lower()
-            href = link.get_attribute("href") or ""
-            if "apply" in text and "linkedin.com" not in href.lower():
-                return href
+            elements = page.locator(selector)
+            for i in range(elements.count()):
+                element = elements.nth(i)
+                if not _visible(element):
+                    continue
+                text = (_attr(element, "aria-label") + " " + _attr(element, "title") + " " + (element.inner_text() or "")).lower()
+                href = _attr(element, "href")
+                if any(s in text for s in (
+                    "apply on company website",
+                    "apply on the company website",
+                    "apply externally",
+                )) and href:
+                    return unwrap_linkedin_external_url(href)
         except Exception:
             continue
+
+    # Inspect all hrefs for known ATS domains. This is safe because the domain
+    # itself identifies the application destination.
+    try:
+        links = page.locator("a[href]")
+        for i in range(links.count()):
+            link = links.nth(i)
+            href = unwrap_linkedin_external_url(_attr(link, "href"))
+            if any(domain in href.lower() for domain in (
+                "greenhouse.io", "lever.co", "myworkdayjobs.com",
+                "ashbyhq.com", "smartrecruiters.com", "cutshort.io",
+            )):
+                return href
+    except Exception:
+        pass
 
     return ""
 
 
-def _fill_first(page, selectors, value):
-    if not value:
-        return False
+def check_external_eligibility(page: Page) -> str:
+    """Return INELIGIBLE only for an explicit numeric minimum above candidate experience."""
+    body = _text(page)
+    lower = body.lower()
 
-    for selector in selectors:
-        fields = page.locator(selector)
-        for i in range(fields.count()):
-            field = fields.nth(i)
-            try:
-                if not field.is_visible():
-                    continue
-                current = field.input_value()
-                if not (current or "").strip():
-                    field.fill(value)
-                    return True
-            except Exception:
-                continue
-    return False
-
-
-def _upload_resume(page, resume_path):
-    if not resume_path:
-        return False
-
-    path = Path(resume_path)
-    if not path.exists():
-        return False
-
-    inputs = page.locator('input[type="file"]')
-    for i in range(inputs.count()):
-        try:
-            inputs.nth(i).set_input_files(str(path))
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def _click_application_continue(page):
-    """
-    Click only an obvious non-final continuation control such as Apply Now.
-
-    This function deliberately does NOT click Submit/Send/Apply-to-submit
-    controls. The goal is to expose the actual application form safely.
-    """
+    # Do not interpret generic words such as 'experience' as a requirement.
     patterns = [
-        r"^apply now$",
-        r"^continue$",
-        r"^next$",
-        r"^start application$",
+        r"(?:minimum|required|at least|minimum of)\D{0,60}(\d+)\+?\s*years?",
+        r"(\d+)\+?\s*years?\s*(?:of\s*)?(?:professional\s*)?experience\s*(?:required|minimum|needed)",
     ]
-
+    years = []
     for pattern in patterns:
-        try:
-            button = page.get_by_role("button", name=__import__("re").compile(pattern, __import__("re").IGNORECASE)).first
-            if button.count() > 0 and button.is_visible():
-                button.click(timeout=10000)
-                return True
-        except Exception:
-            pass
+        for match in re.finditer(pattern, lower):
+            try:
+                years.append(int(match.group(1)))
+            except ValueError:
+                pass
 
-        try:
-            link = page.get_by_role("link", name=__import__("re").compile(pattern, __import__("re").IGNORECASE)).first
-            if link.count() > 0 and link.is_visible():
-                link.click(timeout=10000)
-                return True
-        except Exception:
-            pass
-
-    # Text fallback for sites that expose Apply Now as a div/span control.
-    controls = page.locator('[role="button"], button, a')
-    for i in range(controls.count()):
-        try:
-            control = controls.nth(i)
-            if not control.is_visible():
-                continue
-            text = (control.inner_text() or "").strip().lower()
-            if text in {"apply now", "continue", "next", "start application"}:
-                control.click(timeout=10000)
-                return True
-        except Exception:
-            continue
-
-    return False
-
-
-def _required_fields_empty(page):
-    required = page.locator(
-        'input[required], textarea[required], select[required], '
-        '[aria-required="true"]'
-    )
-
-    empty = 0
-    visible_required = 0
-
-    for i in range(required.count()):
-        field = required.nth(i)
-        try:
-            if not field.is_visible():
-                continue
-
-            visible_required += 1
-            tag = field.evaluate("e => e.tagName")
-
-            if tag in {"INPUT", "TEXTAREA", "SELECT"}:
-                value = field.input_value()
-            else:
-                value = field.inner_text()
-
-            if not str(value or "").strip():
-                empty += 1
-        except Exception:
-            continue
-
-    return visible_required, empty
-
-
-def prepare_external_application_page(page, resume_path, name, email, phone):
-    """
-    Prepare an already-open external application page.
-
-    Returns:
-        INELIGIBLE
-        READY_FOR_REVIEW
-
-    The function never submits an external application.
-    """
-
-    ats = detect_ats(page.url)
-
-    print(f"External ATS detected: {ats}")
-    print(f"External page: {page.url}")
-
-    try:
-        page.bring_to_front()
-    except Exception:
-        pass
-
-    try:
-        page.wait_for_load_state(
-            "domcontentloaded",
-            timeout=15000
-        )
-    except Exception:
-        pass
-
-    page.wait_for_timeout(1500)
-
-    print("Preparing external application page...")
-
-    # --------------------------------------------------
-    # External eligibility gate
-    # --------------------------------------------------
-
-    eligibility = check_external_eligibility(page)
-
-    if eligibility == "INELIGIBLE":
-        print()
-        print("=" * 70)
-        print("EXTERNAL APPLICATION SKIPPED")
-        print("=" * 70)
-
-        print(
-            "Candidate does not meet the explicit "
-            "experience requirement."
-        )
-
-        print(
-            "No resume upload or application preparation "
-            "was performed."
-        )
-
+    candidate_years = 0
+    if any(year > candidate_years for year in years):
+        required = max(years)
+        print(f"External requirement : {required}+ years")
         return "INELIGIBLE"
 
-    # --------------------------------------------------
-    # Continue only when eligibility is not INELIGIBLE
-    # --------------------------------------------------
+    print("External requirement  : Not specified")
+    print("No explicit minimum experience requirement detected.")
+    return "UNKNOWN"
 
-    clicked = _click_application_continue(page)
 
-    if clicked:
-        print(
-            "External application continuation control clicked."
+def _fill(locator, value) -> bool:
+    if not value:
+        return False
+    try:
+        for i in range(locator.count()):
+            element = locator.nth(i)
+            if not _visible(element):
+                continue
+            current = ""
+            try:
+                current = element.input_value().strip()
+            except Exception:
+                pass
+            if current:
+                return True
+            element.fill(value)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _field_text(element) -> str:
+    """Return field metadata plus associated label text for ATS forms."""
+    parts = [
+        _attr(element, "placeholder"),
+        _attr(element, "aria-label"),
+        _attr(element, "name"),
+        _attr(element, "id"),
+    ]
+
+    # Lever commonly renders the visible field name in a separate <label>.
+    # Include associated labels so fields such as Current location/company are
+    # identified even when the input has no useful placeholder/name.
+    try:
+        label_text = element.evaluate(
+            """el => {
+                const labels = el.labels ? Array.from(el.labels) : [];
+                if (labels.length) return labels.map(x => x.innerText || x.textContent || '').join(' ');
+                const parent = el.closest('label');
+                return parent ? (parent.innerText || parent.textContent || '') : '';
+            }"""
+        ) or ""
+        parts.append(label_text)
+    except Exception:
+        pass
+
+    return " ".join(str(x) for x in parts if x).lower()
+
+
+def _fill_known_fields(
+    page: Page,
+    name: str,
+    email: str,
+    phone: str,
+    current_location: str = CURRENT_LOCATION,
+    current_company: str = CURRENT_COMPANY,
+) -> int:
+    count = 0
+    fields = page.locator("input, textarea")
+    for i in range(fields.count()):
+        element = fields.nth(i)
+        if not _visible(element):
+            continue
+        field_type = _attr(element, "type").lower()
+        if field_type in {"hidden", "file", "radio", "checkbox", "submit", "button", "password"}:
+            continue
+        current = ""
+        try:
+            current = element.input_value().strip()
+        except Exception:
+            pass
+        q = _field_text(element)
+
+        # "Current company" must reflect present employment status, not a
+        # past internship/training entry from the resume or browser autofill.
+        # For this candidate the intended answer is N/A, so overwrite any
+        # prefilled value such as QSpiders.
+        if "current company" in q or ("company" in q and "current" in q):
+            value = current_company or "N/A"
+            try:
+                element.fill(value)
+                count += 1
+            except Exception:
+                pass
+            continue
+
+        # Lever's Current location is a Google/Lever autocomplete field.
+        # The browser must select an autocomplete suggestion; simply setting
+        # input.value is not sufficient because Lever validates the selected
+        # location state, not just the visible text.
+        if "current location" in q or ("location" in q and "current" in q):
+            value = current_location or "Bengaluru"
+            try:
+                element.scroll_into_view_if_needed()
+            except Exception:
+                pass
+
+            selected = False
+
+            try:
+                element.click()
+                element.press("Control+A")
+                element.fill(value)
+
+                # Give the autocomplete provider time to render suggestions.
+                page.wait_for_timeout(1200)
+
+                # Google Places autocomplete, used by many Lever forms.
+                suggestion_selectors = [
+                    ".pac-container .pac-item:visible",
+                    ".pac-container .pac-item",
+                    "[role='listbox'] [role='option']:visible",
+                    "[role='option']:visible",
+                    "ul[role='listbox'] li:visible",
+                ]
+
+                wanted_terms = [
+                    value.lower(),
+                    "bengaluru",
+                    "bangalore",
+                    "karnataka",
+                    "india",
+                ]
+
+                for selector in suggestion_selectors:
+                    options = page.locator(selector)
+                    try:
+                        total = options.count()
+                    except Exception:
+                        total = 0
+
+                    if total == 0:
+                        continue
+
+                    # Prefer a suggestion containing Bengaluru/Bangalore.
+                    chosen = None
+                    for j in range(min(total, 20)):
+                        option = options.nth(j)
+                        try:
+                            if not _visible(option):
+                                continue
+                            txt = (option.inner_text() or "").strip()
+                            low = txt.lower()
+                            if (
+                                "bengaluru" in low
+                                or "bangalore" in low
+                                or value.lower() in low
+                            ):
+                                chosen = option
+                                break
+                        except Exception:
+                            continue
+
+                    if chosen is None:
+                        chosen = options.first
+
+                    try:
+                        chosen.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+
+                    try:
+                        chosen.click()
+                        page.wait_for_timeout(500)
+                        selected = True
+                        break
+                    except Exception:
+                        pass
+
+                # Keyboard fallback for Google/Lever autocomplete.
+                if not selected:
+                    try:
+                        element.press("ArrowDown")
+                        page.wait_for_timeout(200)
+                        element.press("Enter")
+                        page.wait_for_timeout(500)
+                        selected = True
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+            # Final normal fill fallback. This is only used if the widget did
+            # not expose a selectable suggestion.
+            try:
+                actual = element.input_value().strip()
+            except Exception:
+                actual = ""
+
+            if not actual:
+                try:
+                    element.fill(value)
+                    element.press("Tab")
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+            # Verify both the native input and the visible field container.
+            try:
+                final_value = element.input_value().strip()
+            except Exception:
+                final_value = ""
+
+            if final_value:
+                count += 1
+            else:
+                try:
+                    field_text = element.evaluate(
+                        """el => {
+                            const row = el.closest('div.field, div, li, label');
+                            return row ? (row.innerText || row.textContent || '') : '';
+                        }"""
+                    ) or ""
+                except Exception:
+                    field_text = ""
+
+                low = field_text.lower()
+                if (
+                    "bengaluru" in low
+                    or "bangalore" in low
+                    or value.lower() in low
+                ):
+                    count += 1
+
+            continue
+
+        if current:
+            continue
+
+        value = None
+        if "email" in q:
+            value = email
+        elif "phone" in q or "mobile" in q or "telephone" in q:
+            value = phone
+        elif "first name" in q or "firstname" in q:
+            value = name.split()[0] if name else ""
+        elif "last name" in q or "lastname" in q or "surname" in q:
+            value = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
+        elif "current location" in q or "location" in q and "current" in q:
+            value = current_location
+        elif "current company" in q or "company" in q and "current" in q:
+            value = current_company
+        elif re.search(r"(^|\s)name(\s|$)", q) or "full name" in q:
+            value = name
+        if value and _fill(fields.nth(i), value):
+            count += 1
+    return count
+
+
+def _fill_known_profile_links(page: Page, github_url: str = GITHUB_URL) -> int:
+    """Fill the GitHub URL field on ATS forms and verify the value actually stuck."""
+    if not github_url:
+        return 0
+
+    # Lever normally gives the label a `for` attribute pointing directly to
+    # the real input. This is more reliable than guessing from sibling nodes.
+    try:
+        labels = page.locator("label")
+        for i in range(labels.count()):
+            label = labels.nth(i)
+            if not _visible(label):
+                continue
+
+            try:
+                label_text = (label.inner_text() or "").strip().lower()
+            except Exception:
+                label_text = ""
+
+            if "github" not in label_text:
+                continue
+
+            target = None
+
+            try:
+                for_id = (label.get_attribute("for") or "").strip()
+                if for_id:
+                    target = page.locator(
+                        f"#{for_id.replace(':', r'\\:')}"
+                    ).first
+                    if not target.count() or not _visible(target):
+                        target = None
+            except Exception:
+                target = None
+
+            # Fallback: the input is usually inside the same form row.
+            if target is None:
+                try:
+                    row = label.locator("xpath=..")
+                    candidates = row.locator("input, textarea")
+                    for j in range(candidates.count()):
+                        candidate = candidates.nth(j)
+                        if _visible(candidate):
+                            target = candidate
+                            break
+                except Exception:
+                    pass
+
+            # Final fallback: nearest following visible text input.
+            if target is None:
+                try:
+                    candidate = label.locator(
+                        "xpath=following::input[not(@type='hidden') and "
+                        "not(@type='file')][1]"
+                    )
+                    if candidate.count() and _visible(candidate.first):
+                        target = candidate.first
+                except Exception:
+                    pass
+
+            if target is None:
+                continue
+
+            try:
+                current = target.input_value().strip()
+            except Exception:
+                current = ""
+
+            if current == github_url:
+                print(f"Known profile link already filled: GitHub -> {github_url}")
+                return 0
+
+            try:
+                target.scroll_into_view_if_needed()
+            except Exception:
+                pass
+
+            try:
+                target.fill(github_url)
+            except Exception:
+                try:
+                    target.click()
+                    target.press("Control+A")
+                    target.type(github_url)
+                except Exception:
+                    continue
+
+            # Trigger the same events used by normal browser typing and then
+            # verify the actual DOM value.
+            try:
+                target.evaluate(
+                    """(el, value) => {
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', {bubbles:true}));
+                        el.dispatchEvent(new Event('change', {bubbles:true}));
+                        el.dispatchEvent(new Event('blur', {bubbles:true}));
+                    }""",
+                    github_url,
+                )
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            try:
+                verified = target.input_value().strip()
+            except Exception:
+                verified = ""
+
+            if verified == github_url:
+                print(f"Known profile link filled: GitHub -> {github_url}")
+                return 1
+
+            print(
+                "GitHub field was located but value could not be verified "
+                f"(current value: {verified!r})."
+            )
+            return 0
+
+    except Exception:
+        pass
+
+    return 0
+
+def _upload_resume(page: Page, resume_path: str) -> bool:
+    if not resume_path or not os.path.exists(resume_path):
+        return False
+    try:
+        inputs = page.locator("input[type='file']")
+        for i in range(inputs.count()):
+            try:
+                inputs.nth(i).set_input_files(resume_path)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _select_known_dropdowns(page: Page) -> int:
+    """Select known safe dropdown values without guessing unknown questions."""
+    count = 0
+    selects = page.locator("select")
+
+    try:
+        for i in range(selects.count()):
+            element = selects.nth(i)
+            if not _visible(element):
+                continue
+
+            q = _field_text(element)
+
+            # Brillio/Lever demographic survey: the required dropdown is
+            # explicitly "What is your location?" and its country options
+            # include India. This is a known candidate-profile value.
+            if "what is your location" in q:
+                try:
+                    current = element.input_value().strip()
+                except Exception:
+                    current = ""
+
+                if current and current.lower() not in {"select", "select..."}:
+                    continue
+
+                try:
+                    element.select_option(label="India")
+                    print("Selected known dropdown: What is your location? -> India")
+                    count += 1
+                    continue
+                except Exception as e:
+                    print(f"Could not select India for location dropdown: {e}")
+
+    except Exception:
+        pass
+
+    return count
+
+
+def _required_empty_count(page: Page) -> int:
+    """Count visible empty required user-entry fields.
+
+    File inputs are excluded because an uploaded file is not represented by
+    input_value() in the same way as text fields. Resume upload is checked
+    separately by _upload_resume().
+    """
+    count = 0
+    try:
+        required = page.locator(
+            "input[required], textarea[required], select[required], "
+            "[aria-required='true']"
         )
 
-        page.wait_for_timeout(1500)
+        for i in range(required.count()):
+            element = required.nth(i)
+            if not _visible(element):
+                continue
 
-    # --------------------------------------------------
-    # Fill known contact fields
-    # --------------------------------------------------
+            try:
+                tag = element.evaluate("e => e.tagName")
+            except Exception:
+                tag = "UNKNOWN"
 
-    filled = 0
+            field_type = _attr(element, "type").lower()
+            if tag == "INPUT" and field_type == "file":
+                continue
 
-    if _fill_first(
+            try:
+                if tag in {"INPUT", "TEXTAREA", "SELECT"}:
+                    value = element.input_value().strip()
+                else:
+                    value = element.inner_text().strip()
+            except Exception:
+                value = ""
+
+            # Some autocomplete widgets expose their selected display value
+            # through attributes while input_value() is temporarily empty.
+            if not value:
+                try:
+                    value = (element.get_attribute("aria-label") or "").strip()
+                except Exception:
+                    pass
+
+            if not value:
+                # Lever can keep the selected location in an associated
+                # autocomplete/hidden state while the text input itself has
+                # no native value. Inspect nearby DOM text before declaring it
+                # empty.
+                field_meta = _field_text(element)
+                if "current location" in field_meta:
+                    try:
+                        nearby = element.evaluate(
+                            """el => {
+                                const row = el.closest('div.field, div, li, label');
+                                return row ? (row.innerText || row.textContent || '') : '';
+                            }"""
+                        ) or ""
+                    except Exception:
+                        nearby = ""
+
+                    nearby_lower = nearby.strip().lower()
+                    if (
+                        "bengaluru" in nearby_lower
+                        or "bangalore" in nearby_lower
+                        or "karnataka" in nearby_lower
+                        or "bengaluru, ind" in nearby_lower
+                    ):
+                        continue
+
+                count += 1
+
+                try:
+                    label = _field_text(element).strip()
+                except Exception:
+                    label = ""
+
+                print("Required field still empty:")
+                print(f"  Label       : {label or '(not detected)'}")
+                print(f"  Tag         : {tag}")
+                print(f"  Name        : {_attr(element, 'name') or '(none)'}")
+                print(f"  ID          : {_attr(element, 'id') or '(none)'}")
+                print(
+                    f"  Placeholder : "
+                    f"{_attr(element, 'placeholder') or '(none)'}"
+                )
+
+    except Exception:
+        pass
+
+    return count
+
+def prepare_external_application_page(
+    page: Page,
+    resume_path: str = "",
+    name: str = "",
+    email: str = "",
+    phone: str = "",
+    current_location: str = CURRENT_LOCATION,
+    current_company: str = CURRENT_COMPANY,
+):
+    """Fill only known external fields and stop for manual review.
+
+    Unknown fields are deliberately untouched. External ATS submission is not
+    performed here.
+    """
+    body = _text(page)
+    ats = detect_ats(page.url, body)
+    print(f"External ATS detected: {ats}")
+    print(f"External page: {page.url}")
+    print("Preparing external application page...")
+
+    filled = _fill_known_fields(
         page,
-        [
-            'input[name*="name" i]',
-            'input[id*="name" i]',
-            'input[placeholder*="name" i]'
-        ],
-        name
-    ):
-        filled += 1
-
-    if _fill_first(
-        page,
-        [
-            'input[type="email"]',
-            'input[name*="email" i]',
-            'input[id*="email" i]'
-        ],
-        email
-    ):
-        filled += 1
-
-    if _fill_first(
-        page,
-        [
-            'input[type="tel"]',
-            'input[name*="phone" i]',
-            'input[name*="mobile" i]',
-            'input[id*="phone" i]'
-        ],
-        phone
-    ):
-        filled += 1
-
-    # --------------------------------------------------
-    # Resume upload
-    # --------------------------------------------------
-
-    uploaded = _upload_resume(
-        page,
-        resume_path
+        name,
+        email,
+        phone,
+        current_location,
+        current_company,
     )
+    print(f"Known contact fields filled: {filled}")
 
-    print(
-        f"Known contact fields filled: {filled}"
-    )
+    uploaded = _upload_resume(page, resume_path)
+    print(f"Resume uploaded: {'Yes' if uploaded else 'No / not required yet'}")
 
-    print(
-        "Resume uploaded: "
-        f"{'Yes' if uploaded else 'No / not required yet'}"
-    )
+    profile_links_filled = _fill_known_profile_links(page)
+    if profile_links_filled:
+        print(f"Known profile links filled: {profile_links_filled}")
 
-    # --------------------------------------------------
-    # Required fields check
-    # --------------------------------------------------
+    dropdowns_filled = _select_known_dropdowns(page)
+    if dropdowns_filled:
+        print(f"Known dropdowns filled: {dropdowns_filled}")
 
-    visible_required, empty_required = (
-        _required_fields_empty(page)
-    )
-
-    print(
-        f"Visible required fields: "
-        f"{visible_required}"
-    )
-
-    print(
-        f"Required fields still empty: "
-        f"{empty_required}"
-    )
-
-    if empty_required:
-        print(
-            "External application needs "
-            "manual completion/review."
-        )
+    required = _required_empty_count(page)
+    print(f"Visible required fields still empty: {required}")
+    if required:
+        print("Required fields remain empty; manual review is required.")
     else:
-        print(
-            "No visible required fields remain empty."
-        )
+        print("No visible required fields remain empty.")
 
-    # --------------------------------------------------
-    # Never submit externally
-    # --------------------------------------------------
-
-    print(
-        "External application prepared "
-        "for manual review."
-    )
-
-    print(
-        "No external submission was performed."
-    )
-
+    print("External application prepared for manual review.")
+    print("No external submission was performed.")
     return "READY_FOR_REVIEW"
 
 
-def prepare_external_form(page, resume_path, name, email, phone):
-    """Backward-compatible alias for the older helper name."""
-    return prepare_external_application_page(page, resume_path, name, email, phone)
-
-
-def external_apply(url, resume_path, name, email, phone):
-    """
-    Open an external URL in a standalone browser and prepare it for review.
-
-    This legacy entry point is retained for compatibility. It never submits.
-    """
-    from playwright.sync_api import sync_playwright
-
-    print(f"External ATS detected: {detect_ats(url)}")
-    print(f"Opening: {url}")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2500)
-            return prepare_external_application_page(
-                page, resume_path, name, email, phone
-            )
-        finally:
-            # Leave the visible browser usable for manual review until the
-            # automation finishes. The caller owns the final review/closure.
-            pass
-
-
-if __name__ == "__main__":
-    print("external_apply.py loaded successfully.")
-    print("This module does not submit external applications automatically.")
+def external_apply(*args, **kwargs):
+    """Compatibility wrapper: prepare the page but never submit externally."""
+    page = kwargs.get("page") or (args[0] if args else None)
+    if page is None:
+        return "FAILED"
+    remaining = list(args[1:])
+    while len(remaining) < 4:
+        remaining.append("")
+    return prepare_external_application_page(page, *remaining[:4])
