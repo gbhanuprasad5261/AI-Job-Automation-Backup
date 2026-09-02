@@ -1,9 +1,17 @@
+from datetime import datetime
+from urllib.parse import urlparse
 import csv
 import os
 import re
 
 from application_form import inspect_and_prepare_form
 from playwright.sync_api import sync_playwright
+
+try:
+    from external_apply import unwrap_linkedin_external_url
+except ImportError:
+    def unwrap_linkedin_external_url(url):
+        return url
 
 try:
     from external_apply import (
@@ -20,85 +28,48 @@ except ImportError:
 
 
 def get_external_profile():
-    """
-    Load external-application profile information.
+    """Load the same profile used by LinkedIn Easy Apply.
 
-    Supports both the names used by the current config/env setup:
-      FULL_NAME / EMAIL / PHONE
-    and the legacy:
-      JOB_NAME / JOB_EMAIL / JOB_PHONE
-
-    Resume path is optional and is taken from RESUME_PATH when configured.
+    Environment variables take precedence, then config.py, then
+    application_form.py defaults. This keeps external ATS and LinkedIn
+    applications on one candidate profile.
     """
     try:
         import config as _config
     except Exception:
         _config = None
 
-    name = (
-        os.getenv("FULL_NAME")
-        or os.getenv("JOB_NAME")
-        or (
-            getattr(_config, "FULL_NAME", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_NAME", "")
-            if _config is not None
-            else ""
-        )
-        or ""
-    )
+    try:
+        import application_form as _form
+    except Exception:
+        _form = None
 
-    email = (
-        os.getenv("EMAIL")
-        or os.getenv("JOB_EMAIL")
-        or (
-            getattr(_config, "EMAIL", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_EMAIL", "")
-            if _config is not None
-            else ""
-        )
-        or ""
-    )
+    def pick(env_names, config_names, form_names):
+        for key in env_names:
+            value = os.getenv(key)
+            if value:
+                return value
+        if _config is not None:
+            for key in config_names:
+                value = getattr(_config, key, "")
+                if value:
+                    return value
+        if _form is not None:
+            for key in form_names:
+                value = getattr(_form, key, "")
+                if value:
+                    return value
+        return ""
 
-    phone = (
-        os.getenv("PHONE")
-        or os.getenv("JOB_PHONE")
-        or (
-            getattr(_config, "PHONE", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_PHONE", "")
-            if _config is not None
-            else ""
-        )
-        or ""
-    )
+    name = pick(["FULL_NAME", "JOB_NAME", "APPLICANT_NAME"], ["FULL_NAME", "JOB_NAME", "APPLICANT_NAME"], ["APPLICANT_NAME"])
+    email = pick(["EMAIL", "JOB_EMAIL", "APPLICANT_EMAIL"], ["EMAIL", "JOB_EMAIL", "APPLICANT_EMAIL"], ["EMAIL"])
+    phone = pick(["PHONE", "JOB_PHONE", "APPLICANT_PHONE"], ["PHONE", "JOB_PHONE", "APPLICANT_PHONE"], ["PHONE"])
+    resume_path = pick(["RESUME_PATH"], ["RESUME_PATH"], ["RESUME_PATH"])
 
-    resume_path = (
-        os.getenv("RESUME_PATH")
-        or (
-            getattr(_config, "RESUME_PATH", "")
-            if _config is not None
-            else ""
-        )
-        or ""
-    )
+    if not resume_path:
+        resume_path = os.path.abspath(os.path.join("resume", "resume.pdf"))
 
-    return (
-        resume_path,
-        name,
-        email,
-        phone,
-    )
+    return resume_path, name, email, phone
 
 
 # ---------------------------------------
@@ -218,80 +189,59 @@ def get_job_application_status(job, statuses=None):
 # Select Recommended Jobs
 # ---------------------------------------
 
+def _is_fresher_eligible(job):
+    """Return True only when analyzer data confirms a 0-year candidate is eligible."""
+    skip = str(job.get("Experience Skip", "") or "").strip().lower()
+    years_raw = str(job.get("Experience Years", "") or "").strip()
+    required_raw = str(job.get("Experience Required", "") or "").strip().lower()
+
+    if skip in {"yes", "true", "1", "y"}:
+        return False
+
+    try:
+        years = float(re.sub(r"[^0-9.]", "", years_raw) or "0")
+    except (ValueError, TypeError):
+        years = 0
+
+    if years > 0:
+        return False
+
+    # Defensive check for analyzer text even if numeric columns are malformed.
+    if re.search(r"\b[1-9]\d*\+?\s*years?\b", required_raw):
+        return False
+
+    return True
+
+
 def get_recommended_jobs():
-
     jobs = load_csv(ANALYSIS_FILE)
-
     if not jobs:
-
         return []
 
     statuses = get_application_statuses()
-
     recommended = []
 
     for job in jobs:
-
         try:
-
-            score = float(
-                job.get(
-                    "Match Score",
-                    "0"
-                ).replace("%", "")
-            )
-
-        except (ValueError, AttributeError):
-
+            score = float(str(job.get("Match Score", "0")).replace("%", ""))
+        except (ValueError, AttributeError, TypeError):
             score = 0
 
-        easy_apply = (
-            job.get(
-                "Easy Apply",
-                ""
-            )
-            .strip()
-            .lower()
-        )
-
-        title = (
-            job.get(
-                "Title",
-                ""
-            )
-            .strip()
-        )
-
-        status = get_job_application_status(
-            job,
-            statuses
-        )
-
-        # ---------------------------------------
-        # Apply filters
-        # ---------------------------------------
+        status = get_job_application_status(job, statuses)
 
         if score < MIN_MATCH_SCORE:
-
             continue
-
         if status != "NOT APPLIED":
-
+            continue
+        if not _is_fresher_eligible(job):
             continue
 
         recommended.append(job)
 
-    # Highest score first
     recommended.sort(
-        key=lambda x: float(
-            x.get(
-                "Match Score",
-                "0"
-            ).replace("%", "")
-        ),
-        reverse=True
+        key=lambda x: float(str(x.get("Match Score", "0")).replace("%", "") or "0"),
+        reverse=True,
     )
-
     return recommended
 
 
@@ -406,201 +356,121 @@ def convert_to_job_url(link):
 # ---------------------------------------
 
 def find_easy_apply_button(page):
+    """Find an application control for the CURRENT LinkedIn job.
+
+    LinkedIn changes its DOM frequently. Prefer stable job-application
+    selectors first, then inspect the current top-card, and only then use
+    tightly scoped fallbacks. Never use arbitrary sidebar ``Apply`` links.
     """
-    Find the application control for the CURRENT LinkedIn job.
-
-    Priority:
-      1. Explicit Easy Apply control.
-      2. LinkedIn's accessibility label "LinkedIn Apply to this job".
-      3. A generic Apply control only when exactly ONE visible Apply
-         control exists on the page.
-
-    This prevents clicking Apply buttons belonging to recommended jobs.
-    """
-
-    def visible(element):
+    def visible(e):
         try:
-            return element.is_visible()
+            return e.is_visible()
         except Exception:
             return False
 
-    def details(element):
+    def info(e):
         try:
-            text = (element.inner_text() or "").strip()
+            text = (e.inner_text() or "").strip()
         except Exception:
             text = ""
+        return (
+            text,
+            (e.get_attribute("aria-label") or "").strip(),
+            (e.get_attribute("title") or "").strip(),
+            (e.get_attribute("href") or "").strip(),
+        )
 
-        aria = element.get_attribute("aria-label") or ""
-        title = element.get_attribute("title") or ""
-        return text, aria, title
-
-    # -------------------------------------------------------
-    # 1. Explicit Easy Apply controls
-    # -------------------------------------------------------
-    try:
-        elements = page.locator("button, [role='button'], a")
-
-        for i in range(elements.count()):
-            element = elements.nth(i)
-
-            if not visible(element):
-                continue
-
-            text, aria, title = details(element)
-            combined = f"{text} {aria} {title}".lower()
-
-            if "easy apply" in combined:
-                print("Explicit Easy Apply control found.")
-                return element
-
-    except Exception:
-        pass
-
-    # -------------------------------------------------------
-    # 2. Inspect page text for Easy Apply evidence
-    # -------------------------------------------------------
-    try:
-        body = page.locator("body").inner_text()
-    except Exception:
-        body = ""
-
-    body_lower = body.lower()
-
-    external_signals = [
-        "apply on company website",
-        "apply on the company website",
-        "apply externally",
-        "application on company website",
-        "apply via company website",
-    ]
-
-    if any(signal in body_lower for signal in external_signals):
-        print("External application detected.")
-        return None
-
-    easy_apply_signals = [
-        "easy apply button",
-        "submit your application through the easy apply button",
-        "apply through the easy apply button",
-        "easy apply",
-    ]
-
-    has_easy_apply_evidence = any(
-        signal in body_lower
-        for signal in easy_apply_signals
+    # LinkedIn's dedicated application area. These selectors are intentionally
+    # checked globally because the apply control can sit outside the visual
+    # top-card wrapper in the two-pane layout.
+    stable_selectors = (
+        ".jobs-s-apply button",
+        ".jobs-s-apply a",
+        ".jobs-s-apply [role='button']",
+        ".jobs-s-apply [role='link']",
+        "button.jobs-apply-button",
+        "a.jobs-apply-button",
+        "[data-control-name*='jobdetails_topcard_inapply' i]",
+        "[data-control-name*='jobdetails_topcard_apply' i]",
+        "[data-tracking-control-name*='jobdetails_topcard_inapply' i]",
+        "[data-tracking-control-name*='jobdetails_topcard_apply' i]",
+        "button[aria-label*='Easy Apply' i]",
+        "button[aria-label*='Apply to this job' i]",
+        "a[aria-label*='Easy Apply' i]",
+        "a[aria-label*='Apply to this job' i]",
     )
 
-    if not has_easy_apply_evidence:
-        return None
-
-    print("Easy Apply confirmed from job description.")
-
-    # -------------------------------------------------------
-    # 3. Strong LinkedIn accessibility signal
-    # -------------------------------------------------------
-    try:
-        elements = page.locator("button, [role='button'], a")
-
-        for i in range(elements.count()):
-            element = elements.nth(i)
-
-            if not visible(element):
-                continue
-
-            text, aria, title = details(element)
-            combined = f"{text} {aria} {title}".lower()
-
-            if "linkedin apply to this job" in combined:
-                print("LinkedIn Apply control found.")
-                return element
-
-    except Exception:
-        pass
-
-    # LinkedIn can finish rendering the top-card control after the page
-    # initially loads.
-    try:
-        page.wait_for_timeout(1500)
-    except Exception:
-        pass
-
-    try:
-        elements = page.locator("button, [role='button'], a")
-
-        for i in range(elements.count()):
-            element = elements.nth(i)
-
-            if not visible(element):
-                continue
-
-            text, aria, title = details(element)
-            combined = f"{text} {aria} {title}".lower()
-
-            if "linkedin apply to this job" in combined:
-                print("LinkedIn Apply control found after render.")
-                return element
-
-    except Exception:
-        pass
-
-    # -------------------------------------------------------
-    # 4. Generic Apply fallback — ONLY if unique
-    # -------------------------------------------------------
-    apply_candidates = []
-
-    try:
-        elements = page.locator("button, [role='button'], a")
-
-        for i in range(elements.count()):
-            element = elements.nth(i)
-
-            if not visible(element):
-                continue
-
-            text, aria, title = details(element)
-
-            if text.strip().lower() == "apply":
-                apply_candidates.append(element)
-
-    except Exception:
-        pass
-
-    if len(apply_candidates) == 1:
-        candidate = apply_candidates[0]
-
+    for selector in stable_selectors:
         try:
-            ancestors = candidate.locator(
-                "xpath=ancestor::*[position() <= 6]"
-            )
+            loc = page.locator(selector)
+            for i in range(loc.count()):
+                e = loc.nth(i)
+                if not visible(e):
+                    continue
+                text, aria, title, href = info(e)
+                combined = f"{text} {aria} {title}".lower()
+                if "easy apply" in combined or "apply to this job" in combined:
+                    print("LinkedIn application control found in dedicated apply area.")
+                    return e
+                if selector.startswith(".jobs-s-apply") or "jobs-apply-button" in selector:
+                    if text.lower() in {"apply", "easy apply"} or "apply" in combined:
+                        print("LinkedIn application control found in dedicated apply area.")
+                        return e
+        except Exception:
+            continue
 
-            for i in range(ancestors.count()):
-                ancestor = ancestors.nth(i)
-                aria = (
-                    ancestor.get_attribute("aria-label") or ""
-                ).lower()
-                title = (
-                    ancestor.get_attribute("title") or ""
-                ).lower()
+    card = get_current_job_card(page)
+    if card is not None:
+        # Explicit controls inside the current top card.
+        try:
+            els = card.locator("button, a, [role='button'], [role='link']")
+            for i in range(els.count()):
+                e = els.nth(i)
+                if not visible(e):
+                    continue
+                text, aria, title, href = info(e)
+                combined = f"{text} {aria} {title}".lower()
+                if "easy apply" in combined or "apply to this job" in combined:
+                    print("Explicit Easy Apply control found in current job card.")
+                    return e
+        except Exception:
+            pass
 
-                combined = f"{aria} {title}"
-
-                if (
-                    "apply on company website" in combined
-                    or "apply on the company website" in combined
-                    or "apply externally" in combined
-                ):
+        # External company-website controls in the current card.
+        try:
+            els = card.locator("button, a, [role='button'], [role='link']")
+            for i in range(els.count()):
+                e = els.nth(i)
+                if not visible(e):
+                    continue
+                text, aria, title, href = info(e)
+                combined = f"{text} {aria} {title}".lower()
+                if any(x in combined for x in (
+                    "apply on company website",
+                    "apply on the company website",
+                    "apply externally",
+                )):
+                    print("External application control found in current job card.")
                     return None
         except Exception:
             pass
 
-        print("Unique LinkedIn Apply control found.")
-        return candidate
-
-    if len(apply_candidates) > 1:
-        print(
-            f"Found {len(apply_candidates)} generic Apply controls; "
-            "refusing to guess which one belongs to the current job."
-        )
+        # Plain Apply inside the current job card.
+        try:
+            els = card.locator("button, a, [role='button'], [role='link']")
+            matches = []
+            for i in range(els.count()):
+                e = els.nth(i)
+                if not visible(e):
+                    continue
+                text, aria, title, href = info(e)
+                if text.lower() == "apply" or aria.lower() in {"apply", "apply to this job"}:
+                    matches.append(e)
+            if len(matches) == 1:
+                print("Plain Apply control found in current job card.")
+                return matches[0]
+        except Exception:
+            pass
 
     return None
 
@@ -610,25 +480,59 @@ def find_easy_apply_button(page):
 # ---------------------------------------
 
 def is_job_closed(body_text):
+    """Detect only strong closed-job messages from the current job content.
 
-    closed_messages = [
+    LinkedIn pages can contain closed-job wording in recommended/sidebar cards.
+    The caller must first inspect real application controls. This helper is
+    therefore intentionally conservative and is kept as a final fallback.
+    """
+    text = " ".join(str(body_text or "").lower().split())
+    closed_messages = (
+        "this job is no longer accepting applications",
+        "this job is no longer available",
+        "no longer accepting applications",
+        "applications for this job are closed",
+        "job is no longer accepting applications",
+    )
+    return any(message in text for message in closed_messages)
 
-        "No longer accepting applications",
 
-        "This job is no longer accepting applications",
+def get_current_job_card(page):
+    """Return a narrowly scoped LinkedIn current-job header/card.
 
-        "Job is no longer accepting applications"
-    ]
+    Do not fall back to ``main`` because that can include recommended-job
+    cards containing unrelated closed/open application text.
+    """
+    selectors = (
+        "main .jobs-unified-top-card",
+        ".jobs-unified-top-card",
+        "main .job-details-jobs-unified-top-card",
+        ".job-details-jobs-unified-top-card",
+        "main .jobs-details-top-card",
+        ".jobs-details-top-card",
+    )
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            for i in range(loc.count()):
+                item = loc.nth(i)
+                if item.is_visible():
+                    return item
+        except Exception:
+            continue
+    return None
 
-    text = body_text.lower()
 
-    for message in closed_messages:
-
-        if message.lower() in text:
-
-            return True
-
-    return False
+def current_job_is_closed(page):
+    """Confirm closure only from a narrowly scoped current-job card."""
+    try:
+        card = get_current_job_card(page)
+        if card is None:
+            return False
+        text = card.inner_text() or ""
+        return is_job_closed(text)
+    except Exception:
+        return False
 
 
 # ---------------------------------------
@@ -871,6 +775,7 @@ def record_application_status(job, status):
 # ---------------------------------------
 
 def open_easy_apply(job):
+    external_page = None
     """
     Open a LinkedIn job and safely handle either:
       1. LinkedIn Easy Apply, or
@@ -964,21 +869,13 @@ def open_easy_apply(job):
         except Exception:
             body_text = ""
 
-        if is_job_closed(body_text):
-            print()
-            print("=" * 70)
-            print("JOB CLOSED")
-            print("=" * 70)
-            print("This job is no longer accepting applications.")
-            LAST_APPLICATION_RESULT = "CLOSED"
-            return False
-
         print()
         print("Searching for Easy Apply button...")
 
-        easy_apply_control = find_easy_apply_button(
-            page
-        )
+        # Detect application controls before declaring a job closed.
+        # LinkedIn can leave closed-job wording in surrounding/recommended
+        # content even when the current job still exposes an Apply control.
+        easy_apply_control = find_easy_apply_button(page)
 
         # --------------------------------------------------
         # External application detection
@@ -1218,9 +1115,97 @@ def open_easy_apply(job):
             except Exception:
                 pass
 
+        # Final fallback: LinkedIn's current job card may expose a plain
+        # "Apply" button without the accessibility label used by older layouts.
+        # Restrict this search to the current job card so recommendation cards
+        # do not get mistaken for the current job's application control.
+        if not easy_apply_control and not external_url and external_control is None:
+            try:
+                card = get_current_job_card(page)
+                plain_apply = card.get_by_role("button", name=re.compile(r"^\s*apply\s*$", re.I))
+                if plain_apply.count() > 0:
+                    for i in range(plain_apply.count()):
+                        candidate = plain_apply.nth(i)
+                        if candidate.is_visible():
+                            external_control = candidate
+                            print("Plain Apply button found in current job card.")
+                            break
+            except Exception:
+                pass
+
+        # If no application route was found, only then treat a strong LinkedIn
+        # closed message as a confirmed CLOSED result. This avoids letting
+        # unrelated page/sidebar text prematurely terminate an active job.
+        if not easy_apply_control and not external_url and external_control is None:
+            if current_job_is_closed(page):
+                print()
+                print("=" * 70)
+                print("JOB CLOSED")
+                print("=" * 70)
+                print("LinkedIn's current-job card reports that this job is no longer accepting applications.")
+                LAST_APPLICATION_RESULT = "CLOSED"
+                return False
+
         # --------------------------------------------------
         # LinkedIn "Apply on company website" button with no href
         # --------------------------------------------------
+        # If LinkedIn exposed a real external URL, navigate directly to it.
+        # This is more reliable than clicking the child "Apply" span and
+        # accidentally landing on LinkedIn's /safety/go/ page.
+        if external_url and external_apply is not None:
+            resolved_url = unwrap_linkedin_external_url(external_url)
+            if resolved_url and "linkedin.com" not in urlparse(resolved_url).netloc.lower():
+                try:
+                    print()
+                    print("External application URL found directly.")
+                    print(f"Opening: {resolved_url}")
+                    external_page = context.new_page()
+                    external_page.goto(
+                        resolved_url,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    external_page.wait_for_timeout(4000)
+                except Exception as e:
+                    print(f"Direct external navigation failed: {e}")
+                    external_page = None
+
+                if external_page is not None:
+                    print()
+                    print("=" * 70)
+                    print("LINKEDIN OPENED EXTERNAL APPLICATION")
+                    print("=" * 70)
+                    print(f"External URL: {external_page.url}")
+
+                    if check_external_eligibility is not None:
+                        try:
+                            eligibility = check_external_eligibility(external_page)
+                        except Exception as e:
+                            print(f"External eligibility check failed: {e}")
+                            LAST_APPLICATION_RESULT = "UNKNOWN"
+                            return False
+
+                        if eligibility == "INELIGIBLE":
+                            record_application_status(job, "INELIGIBLE")
+                            LAST_APPLICATION_RESULT = "INELIGIBLE"
+                            print("Application skipped - external role requires more experience.")
+                            return False
+
+                    if get_external_profile is not None and prepare_external_application_page is not None:
+                        try:
+                            resume_path, name, email, phone = get_external_profile()
+                            result = prepare_external_application_page(
+                                external_page, resume_path, name, email, phone
+                            )
+                            record_application_status(job, result)
+                            LAST_APPLICATION_RESULT = result
+                            print(f"External application result: {result}")
+                            return False
+                        except Exception as e:
+                            print(f"External application preparation failed: {e}")
+                            LAST_APPLICATION_RESULT = "FAILED"
+                            return False
+
         if (
             not external_url
             and external_control is not None
@@ -1256,6 +1241,30 @@ def open_easy_apply(job):
 
             page.wait_for_timeout(4000)
 
+            # LinkedIn may show an intermediate "Continue applying" step
+            # before opening the company's external application.
+            try:
+                continue_apply = page.get_by_text(
+                    "Continue applying",
+                    exact=True
+                )
+
+                if continue_apply.count() > 0:
+                    for i in range(continue_apply.count()):
+                        candidate_button = continue_apply.nth(i)
+                        try:
+                            if candidate_button.is_visible():
+                                print("LinkedIn confirmation step detected.")
+                                print("Clicking Continue applying...")
+                                candidate_button.click(timeout=10000)
+                                page.wait_for_timeout(5000)
+                                break
+                        except Exception:
+                            continue
+
+            except Exception as e:
+                print(f"Continue applying step not clicked: {e}")
+
             # Prefer a newly opened non-LinkedIn page.
             for candidate in context.pages:
                 try:
@@ -1273,6 +1282,20 @@ def open_easy_apply(job):
                 external_page = page
 
             if external_page is not None:
+                # LinkedIn may land on /safety/go/?url=... instead of the ATS.
+                # Resolve the destination before ATS detection/eligibility checks.
+                resolved_url = unwrap_linkedin_external_url(external_page.url)
+                if resolved_url and resolved_url != external_page.url and "linkedin.com/safety/go" in external_page.url.lower():
+                    try:
+                        print("LinkedIn safety redirect detected.")
+                        print(f"Resolved external URL: {resolved_url}")
+                        external_page.goto(resolved_url, wait_until="domcontentloaded", timeout=60000)
+                        external_page.wait_for_timeout(4000)
+                    except Exception as e:
+                        print(f"Could not resolve LinkedIn external redirect: {e}")
+                        LAST_APPLICATION_RESULT = "FAILED"
+                        return False
+
                 print()
                 print("=" * 70)
                 print("LINKEDIN OPENED EXTERNAL APPLICATION")
@@ -1413,6 +1436,7 @@ def open_easy_apply(job):
             try:
                 external_page = context.new_page()
 
+                external_url = unwrap_linkedin_external_url(external_url)
                 external_page.goto(
                     external_url,
                     wait_until="domcontentloaded",
@@ -1705,6 +1729,31 @@ def open_easy_apply(job):
 
 
 # ---------------------------------------
+# Daily application limit
+# ---------------------------------------
+
+def get_today_applied_count():
+    """Return the number of confirmed APPLIED jobs recorded today."""
+    if not os.path.exists(TRACKER_FILE):
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with open(TRACKER_FILE, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return 0
+
+    count = 0
+    for row in rows:
+        status = (row.get("Status") or row.get("Application Status") or "").strip().upper()
+        applied_date = (row.get("Applied Date") or "").strip()
+        if status == "APPLIED" and applied_date == today:
+            count += 1
+    return count
+
+
+# ---------------------------------------
 # Main
 # ---------------------------------------
 
@@ -1715,16 +1764,27 @@ def main():
     print("AI JOB AUTOMATION - EASY APPLY")
     print("=" * 70)
 
-    # ---------------------------------------
-    # Load eligible jobs
-    # ---------------------------------------
+    daily_limit = max(1, int(os.getenv("DAILY_APPLICATION_LIMIT", "15")))
+    already_applied = get_today_applied_count()
+    remaining_today = max(0, daily_limit - already_applied)
+
+    print()
+    print(f"Daily application limit : {daily_limit}")
+    print(f"Confirmed applications today: {already_applied}")
+    print(f"Remaining applications today: {remaining_today}")
+
+    if remaining_today <= 0:
+        print("Daily application limit reached.")
+        return
 
     jobs = get_recommended_jobs()
 
+    # Final defense: never put a role marked Experience Skip=Yes or requiring
+    # more than 0 years into the application queue, even if CSV data changes.
+    jobs = [job for job in jobs if _is_fresher_eligible(job)]
+
     print()
-    print(
-        f"Eligible jobs: {len(jobs)}"
-    )
+    print(f"Eligible jobs: {len(jobs)}")
 
     display_jobs(jobs)
 
@@ -1732,122 +1792,61 @@ def main():
         return
 
     print()
-
-    # ---------------------------------------
-    # Select starting job
-    # ---------------------------------------
-
     try:
-
-        choice = int(
-            input(
-                f"Select starting job "
-                f"(1-{len(jobs)}): "
-            )
-        )
-
+        choice = int(input(f"Select starting job (1-{len(jobs)}): "))
     except ValueError:
-
-        print(
-            "Invalid selection."
-        )
-
+        print("Invalid selection.")
         return
 
     if choice < 1 or choice > len(jobs):
-
-        print(
-            "Invalid job number."
-        )
-
+        print("Invalid job number.")
         return
 
-    # ---------------------------------------
-    # Try selected and following jobs
-    # ---------------------------------------
+    confirmed_this_run = 0
 
-    for index in range(
-        choice - 1,
-        len(jobs)
-    ):
+    for index in range(choice - 1, len(jobs)):
+        if confirmed_this_run >= remaining_today:
+            break
 
         job = jobs[index]
 
         print()
         print("=" * 70)
-
-        print(
-            f"TRYING JOB "
-            f"{index + 1}/{len(jobs)}"
-        )
-
+        print(f"TRYING JOB {index + 1}/{len(jobs)}")
         print("=" * 70)
-
-        print(
-            f"Title : "
-            f"{job.get('Title', '')}"
-        )
-
-        print(
-            f"Score : "
-            f"{job.get('Match Score', '')}"
-        )
-
-        # ---------------------------------------
-        # Try job
-        # ---------------------------------------
-        # Easy Apply is verified LIVE inside
-        # open_easy_apply(). The CSV value is only
-        # a candidate hint because LinkedIn status
-        # can change after the CSV is generated.
+        print(f"Title : {job.get('Title', '')}")
+        print(f"Score : {job.get('Match Score', '')}")
 
         success = open_easy_apply(job)
 
-        # ---------------------------------------
-        # Active Easy Apply found
-        # ---------------------------------------
-
         if success:
-
+            confirmed_this_run += 1
             print()
             print("=" * 70)
-
-            print(
-                "READY FOR APPLICATION AUTOMATION"
-            )
-
+            print(f"APPLICATION CONFIRMED ({confirmed_this_run}/{remaining_today} this run)")
             print("=" * 70)
+            continue
 
-            return
-
-        # ---------------------------------------
-        # Try next job
-        # ---------------------------------------
+        # Non-success results are already recorded by open_easy_apply when
+        # the result is known (READY_FOR_REVIEW, INELIGIBLE, etc.).
+        result = globals().get("LAST_APPLICATION_RESULT", "UNKNOWN")
+        print(f"Result: {result}")
 
         if index + 1 < len(jobs):
-
-            print()
-            print(
-                "Trying next eligible job..."
-            )
-
-    # ---------------------------------------
-    # No active job found
-    # ---------------------------------------
+            print("Trying next eligible job...")
 
     print()
     print("=" * 70)
-
-    print(
-        "NO ACTIVE EASY APPLY JOB FOUND"
-    )
-
+    print("RUN SUMMARY")
     print("=" * 70)
+    print(f"Confirmed applications this run : {confirmed_this_run}")
+    print(f"Confirmed applications today    : {already_applied + confirmed_this_run}")
+    print(f"Daily limit                     : {daily_limit}")
 
-    print(
-        "All selected/remaining jobs "
-        "were closed or unavailable."
-    )
+    if confirmed_this_run >= remaining_today:
+        print("Daily application limit reached for this run.")
+    else:
+        print("No more eligible jobs were successfully submitted.")
 
 
 # ---------------------------------------
