@@ -1,467 +1,525 @@
 import csv
 import os
-import re
-from collections import Counter
 
 from skill_matcher import match_resume
+from profile import PROFILE
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-try:
-    from config import (
-        MIN_MATCH_SCORE,
-        TARGET_LOCATIONS,
-        EASY_APPLY_FILTER,
-    )
-except ImportError:
-    MIN_MATCH_SCORE = 70
-    TARGET_LOCATIONS = (
-        "bengaluru",
-        "bangalore",
-        "hyderabad",
-        "chennai",
-        "remote",
-    )
-    EASY_APPLY_FILTER = False
-
+# ================================================================
+# CONFIGURATION
+# ================================================================
 
 INPUT_FILE = "data/job_details.csv"
 OUTPUT_FILE = "data/job_analysis.csv"
-TOP_JOBS = 10
 
-# Candidate is a fresher.
-CANDIDATE_EXPERIENCE_YEARS = 0
+MIN_MATCH_SCORE = 70
 
-
-# ---------------------------------------------------------------------------
-# Experience detection
-# ---------------------------------------------------------------------------
-
-# Explicit experience requirements.
-EXPERIENCE_PATTERNS = [
-    # 3+ years experience
-    r"(\d+)\s*\+\s*years?\s+(?:of\s+)?(?:professional\s+)?experience",
-
-    # minimum 3 years experience
-    r"minimum\s+(?:of\s+)?(\d+)\s+years?\s+(?:of\s+)?(?:professional\s+)?experience",
-
-    # at least 3 years experience
-    r"at\s+least\s+(\d+)\s+years?\s+(?:of\s+)?(?:professional\s+)?experience",
-
-    # 3-5 years experience / 3 – 5 years experience
-    r"(\d+)\s*[-–—]\s*(\d+)\s+years?\s+(?:of\s+)?(?:professional\s+)?experience",
-
-    # 3 years of experience
-    r"(\d+)\s+years?\s+(?:of\s+)?(?:professional\s+)?experience",
+TARGET_LOCATIONS = [
+    "bengaluru",
+    "bangalore",
+    "hyderabad",
+    "chennai",
+    "remote",
 ]
 
-
-FRESHER_TERMS = (
-    "fresher",
-    "freshers",
-    "fresh graduate",
-    "fresh graduates",
-    "recent graduate",
-    "recent graduates",
-    "entry level",
-    "entry-level",
-    "graduate role",
-    "graduate position",
-    "no experience required",
-    "no prior experience required",
-    "experience not required",
-    "0 years experience",
-    "0 years of experience",
-)
-
-
-def _normalise_description(text):
-    """Normalise whitespace and dash characters."""
-    text = str(text or "").lower()
-
-    text = (
-        text
-        .replace("–", "-")
-        .replace("—", "-")
+try:
+    CANDIDATE_EXPERIENCE_YEARS = int(
+        PROFILE.get("experience_years", 0)
     )
-
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
+except (TypeError, ValueError):
+    CANDIDATE_EXPERIENCE_YEARS = 0
 
 
-def _is_preferred_experience(text, start, end):
+# ================================================================
+# EXPERIENCE EXTRACTION
+# ================================================================
+
+def extract_experience_years(text):
     """
-    Determine whether an experience statement appears to be preferred
-    rather than mandatory.
+    Extract the minimum required professional experience from a job
+    description.
 
-    Example:
-        '3+ years experience preferred'
-        '3+ years experience is a plus'
+    Rules:
+        - Explicit fresher / entry-level requirements -> 0
+        - 0-1 / 0-2 years -> 0
+        - 1+ years -> 1
+        - 2+ years -> 2
+        - 3+ years -> 3
+        - 1-3 years -> 1
+        - 2 to 5 years -> 2
 
-    These should not automatically exclude a fresher.
+    Important:
+        Words such as "graduate" or "degree" alone do NOT mean
+        the candidate is a fresher.
     """
-
-    context_start = max(0, start - 80)
-    context_end = min(len(text), end + 100)
-
-    context = text[context_start:context_end]
-
-    preferred_terms = (
-        "preferred",
-        "prefer",
-        "nice to have",
-        "nice-to-have",
-        "plus",
-        "bonus",
-        "desired",
-        "ideal",
-        "would be a plus",
-    )
-
-    return any(
-        term in context
-        for term in preferred_terms
-    )
-
-
-def extract_experience_requirement(description):
-    """
-    Extract the clearest minimum experience requirement.
-
-    Returns:
-        required_years:
-            Minimum experience clearly required.
-
-        label:
-            Human-readable experience requirement.
-
-        skip:
-            True when the role clearly requires more experience
-            than the candidate has.
-
-    Examples:
-
-        Fresher / Entry Level
-            -> 0 years
-            -> do not skip
-
-        0-2 years
-            -> minimum 0
-            -> do not skip
-
-        1-3 years
-            -> minimum 1
-            -> skip for fresher
-
-        3+ years
-            -> minimum 3
-            -> skip for fresher
-    """
-
-    text = _normalise_description(description)
 
     if not text:
-        return 0, "Not specified", False
+        return 0
 
-    # -----------------------------------------------------------------------
-    # First look for explicit fresher/entry-level language.
-    # -----------------------------------------------------------------------
+    import re
 
-    has_fresher_language = any(
-        term in text
-        for term in FRESHER_TERMS
-    )
+    text = text.lower()
 
-    # -----------------------------------------------------------------------
-    # Find explicit experience requirements.
-    # -----------------------------------------------------------------------
+    # Normalize common variations
+    text = re.sub(r"\s+", " ", text)
 
-    requirements = []
+    # ------------------------------------------------------------
+    # 1. Look specifically for experience-related sentences
+    # ------------------------------------------------------------
 
-    for pattern in EXPERIENCE_PATTERNS:
+    experience_patterns = [
 
-        for match in re.finditer(pattern, text):
+        # 3+ years experience
+        r"(\d+)\s*\+\s*(?:years?|yrs?)\s*(?:of\s*)?(?:relevant\s*)?(?:professional\s*)?experience",
 
-            groups = match.groups()
+        # 3 or more years experience
+        r"(\d+)\s+or\s+more\s+(?:years?|yrs?)\s*(?:of\s*)?(?:relevant\s*)?(?:professional\s*)?experience",
 
-            try:
-                minimum = int(groups[0])
-            except (ValueError, TypeError, IndexError):
-                continue
+        # 3-5 years experience
+        r"(\d+)\s*[-–]\s*(\d+)\s*(?:years?|yrs?)\s*(?:of\s*)?(?:relevant\s*)?(?:professional\s*)?experience",
 
-            # For ranges such as 1-3 years, the first number is the
-            # minimum required experience.
-            maximum = None
+        # 3 to 5 years experience
+        r"(\d+)\s+to\s+(\d+)\s*(?:years?|yrs?)\s*(?:of\s*)?(?:relevant\s*)?(?:professional\s*)?experience",
 
-            if len(groups) >= 2:
+        # minimum 3 years experience
+        r"minimum\s+(?:of\s+)?(\d+)\s*(?:years?|yrs?)",
+
+        # at least 3 years experience
+        r"at\s+least\s+(\d+)\s*(?:years?|yrs?)",
+
+        # experience: 3 years
+        r"experience\s*[:\-]?\s*(\d+)\s*(?:years?|yrs?)",
+
+        # 3 years of experience
+        r"(\d+)\s*(?:years?|yrs?)\s+of\s+(?:relevant\s+|professional\s+|hands[- ]on\s+)?experience",
+    ]
+
+    detected_years = []
+
+    for pattern in experience_patterns:
+
+        matches = re.findall(
+            pattern,
+            text,
+        )
+
+        for match in matches:
+
+            if isinstance(match, tuple):
+
+                numbers = []
+
+                for value in match:
+                    if value:
+                        try:
+                            numbers.append(
+                                int(value)
+                            )
+                        except ValueError:
+                            pass
+
+                if numbers:
+                    detected_years.append(
+                        min(numbers)
+                    )
+
+            else:
+
                 try:
-                    maximum = int(groups[1])
-                except (ValueError, TypeError):
-                    maximum = None
+                    detected_years.append(
+                        int(match)
+                    )
+                except ValueError:
+                    pass
 
-            # Ignore experience that is explicitly described as preferred,
-            # desired, a bonus, etc.
-            if _is_preferred_experience(
-                text,
-                match.start(),
-                match.end(),
-            ):
-                continue
+    # ------------------------------------------------------------
+    # 2. If an explicit numeric experience requirement exists,
+    #    trust it over generic words such as "graduate".
+    # ------------------------------------------------------------
 
-            requirements.append(
-                {
-                    "minimum": minimum,
-                    "maximum": maximum,
-                    "text": match.group(0),
-                }
-            )
+    if detected_years:
 
-    # -----------------------------------------------------------------------
-    # No explicit requirement found.
-    # -----------------------------------------------------------------------
+        return min(detected_years)
 
-    if not requirements:
+    # ------------------------------------------------------------
+    # 3. Explicit fresher / entry-level language
+    # ------------------------------------------------------------
 
-        if has_fresher_language:
-            return (
-                0,
-                "Fresher / Entry Level",
-                False,
-            )
+    fresher_patterns = [
 
-        return (
-            0,
-            "Not specified",
-            False,
-        )
+        r"\bfresher\b",
 
-    # -----------------------------------------------------------------------
-    # Use the strongest/most demanding explicit minimum requirement.
-    # -----------------------------------------------------------------------
+        r"\bfreshers\b",
 
-    required_years = max(
-        item["minimum"]
-        for item in requirements
-    )
+        r"\bfresh graduate\b",
 
-    # If the posting explicitly welcomes freshers but also contains a
-    # generic experience statement elsewhere, don't automatically reject it.
-    if (
-        has_fresher_language
-        and required_years == 0
-    ):
-        return (
-            0,
-            "Fresher / Entry Level",
-            False,
-        )
+        r"\bfresh graduates\b",
 
-    # -----------------------------------------------------------------------
-    # Determine label.
-    # -----------------------------------------------------------------------
+        r"\bentry[- ]level\b",
 
-    labels = []
+        r"\b0\s*(?:to|-)\s*1\s*(?:years?|yrs?)",
 
-    for item in requirements:
+        r"\b0\s*(?:to|-)\s*2\s*(?:years?|yrs?)",
 
-        minimum = item["minimum"]
-        maximum = item["maximum"]
+        r"\b0\s*\+\s*(?:years?|yrs?)",
 
-        if maximum is not None:
-            labels.append(
-                f"{minimum}-{maximum} years"
-            )
-        else:
-            labels.append(
-                f"{minimum}+ years"
-            )
+        r"\b0\s*(?:years?|yrs?)\s+(?:of\s+)?experience",
+    ]
 
-    # Remove duplicate labels while preserving order.
-    labels = list(dict.fromkeys(labels))
+    for pattern in fresher_patterns:
 
-    experience_label = ", ".join(labels)
+        if re.search(
+            pattern,
+            text,
+        ):
+            return 0
 
-    # -----------------------------------------------------------------------
-    # Fresher eligibility.
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 4. No reliable experience requirement found
+    # ------------------------------------------------------------
 
-    experience_skip = (
-        required_years
-        > CANDIDATE_EXPERIENCE_YEARS
-    )
+    return 0
+# ================================================================
+# EXPERIENCE LABEL
+# ================================================================
 
-    return (
-        required_years,
-        experience_label,
-        experience_skip,
-    )
+def get_experience_label(years, description):
+    """
+    Convert extracted experience years into a readable label.
+
+    Numeric professional experience requirements take priority over
+    generic fresher/graduate wording.
+    """
+
+    if not description:
+        return "Not specified"
+
+    import re
+
+    description_lower = description.lower()
+
+    # ------------------------------------------------------------
+    # 1. Numeric experience requirement has priority
+    # ------------------------------------------------------------
+
+    if years is not None and years > 0:
+        if years == 1:
+            return "1+ years"
+
+        return f"{years}+ years"
+
+    # ------------------------------------------------------------
+    # 2. Explicit fresher / entry-level wording
+    # ------------------------------------------------------------
+
+    fresher_patterns = [
+        r"\bfresher\b",
+        r"\bfreshers\b",
+        r"\bfresh graduate\b",
+        r"\bfresh graduates\b",
+        r"\bentry[- ]level\b",
+        r"\b0\s*(?:to|-)\s*1\s*(?:years?|yrs?)",
+        r"\b0\s*(?:to|-)\s*2\s*(?:years?|yrs?)",
+        r"\b0\s*\+\s*(?:years?|yrs?)",
+        r"\b0\s*(?:years?|yrs?)\s+(?:of\s+)?experience",
+    ]
+
+    for pattern in fresher_patterns:
+        if re.search(pattern, description_lower):
+            return "Fresher / Entry Level"
+
+    # ------------------------------------------------------------
+    # 3. No reliable requirement
+    # ------------------------------------------------------------
+
+    return "Not specified"
+
+# ================================================================
+# LOCATION CHECK
+# ================================================================
+
+def location_matches(location):
+    """
+    Check whether a job is in one of the user's target locations.
+    """
+
+    if not location:
+        return False
+
+    location_lower = location.lower()
+
+    for target in TARGET_LOCATIONS:
+        if target in location_lower:
+            return True
+
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Location
-# ---------------------------------------------------------------------------
+# ================================================================
+# PRIORITY
+# ================================================================
 
-def location_allowed(location):
-    text = (
-        location or ""
-    ).strip().lower()
+def calculate_priority(score):
+    """
+    Determine recommendation priority from match score.
+    """
 
-    return bool(text) and any(
-        target in text
-        for target in TARGET_LOCATIONS
-    )
+    if score >= 85:
+        return "HIGH"
+
+    if score >= MIN_MATCH_SCORE:
+        return "MEDIUM"
+
+    return "LOW"
 
 
-# ---------------------------------------------------------------------------
-# Main analysis
-# ---------------------------------------------------------------------------
+# ================================================================
+# MAIN ANALYZER
+# ================================================================
 
 def analyze_jobs():
 
     if not os.path.exists(INPUT_FILE):
-
-        print("job_details.csv not found.")
+        print(f"{INPUT_FILE} not found.")
         return
 
-    jobs = []
+    os.makedirs("data", exist_ok=True)
+
+    # ------------------------------------------------------------
+    # Load job details
+    # ------------------------------------------------------------
 
     with open(
         INPUT_FILE,
         "r",
         encoding="utf-8",
-        newline="",
-    ) as f:
+    ) as file:
 
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(file)
+        jobs = list(reader)
 
-        for row in reader:
+    if not jobs:
+        print("No jobs found.")
+        return
 
-            description = row.get(
-                "Description",
-                "",
-            )
+    analyzed_jobs = []
 
-            # ---------------------------------------------------------------
-            # Resume skill matching
-            # ---------------------------------------------------------------
+    skipped_score = 0
+    skipped_location = 0
+    skipped_experience = 0
+    skipped_data = 0
+
+    # ============================================================
+    # PROCESS JOBS
+    # ============================================================
+
+    for job in jobs:
+
+        title = job.get(
+            "Title",
+            "",
+        ).strip()
+
+        company = job.get(
+            "Company",
+            "",
+        ).strip()
+
+        location = job.get(
+            "Location",
+            "",
+        ).strip()
+
+        easy_apply = job.get(
+            "Easy Apply",
+            "",
+        ).strip()
+
+        link = job.get(
+            "Link",
+            "",
+        ).strip()
+
+        description = job.get(
+            "Description",
+            "",
+        ).strip()
+
+        # --------------------------------------------------------
+        # DATA QUALITY CHECK
+        # --------------------------------------------------------
+
+        if not description:
+
+            score = 0
+
+            matched = set()
+
+            missing = set()
+
+            data_status = "INSUFFICIENT_DATA"
+
+            application_eligible = "No"
+
+            experience_years = 0
+
+            experience_label = "Not specified"
+
+            experience_skip = False
+
+            priority = "LOW"
+
+            skipped_data += 1
+
+        else:
+
+            data_status = "OK"
+
+            # ----------------------------------------------------
+            # SKILL MATCHING
+            # ----------------------------------------------------
 
             score, matched, missing = match_resume(
                 description
             )
 
-            # ---------------------------------------------------------------
-            # Experience analysis
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------
+            # EXPERIENCE
+            # ----------------------------------------------------
 
-            (
-                experience_years,
-                experience_label,
-                experience_skip,
-            ) = extract_experience_requirement(
+            experience_years = extract_experience_years(
                 description
             )
 
-            # ---------------------------------------------------------------
-            # Priority
-            # ---------------------------------------------------------------
+            experience_label = get_experience_label(
+                experience_years,
+                description,
+            )
 
-            if score >= 80:
-                priority = "HIGH"
+            # ----------------------------------------------------
+            # EXPERIENCE FILTER
+            # ----------------------------------------------------
 
-            elif score >= 70:
-                priority = "MEDIUM"
+            experience_skip = (
+                experience_years
+                > CANDIDATE_EXPERIENCE_YEARS
+            )
 
-            else:
-                priority = "LOW"
+            if experience_skip:
+                skipped_experience += 1
 
-            # ---------------------------------------------------------------
-            # Store analysis
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------
+            # PRIORITY
+            # ----------------------------------------------------
 
-            jobs.append({
+            priority = calculate_priority(score)
 
-                "Title": row.get(
-                    "Title",
-                    "",
-                ),
+            # ----------------------------------------------------
+            # APPLICATION ELIGIBILITY
+            # ----------------------------------------------------
 
-                "Company": row.get(
-                    "Company",
-                    "",
-                ),
+            application_eligible = "Yes"
 
-                "Location": row.get(
-                    "Location",
-                    "",
-                ),
+            if score < MIN_MATCH_SCORE:
+                application_eligible = "No"
 
-                "Easy Apply": row.get(
-                    "Easy Apply",
-                    "",
-                ),
+            if not location_matches(location):
+                application_eligible = "No"
 
-                "Match Score": f"{score}%",
+            if experience_skip:
+                application_eligible = "No"
 
-                "Priority": priority,
+            if score < MIN_MATCH_SCORE:
+                skipped_score += 1
 
-                "Matched Skills": ", ".join(
-                    sorted(matched)
-                ),
+            if not location_matches(location):
+                skipped_location += 1
 
-                "Missing Skills": ", ".join(
-                    sorted(missing)
-                ),
+        # ========================================================
+        # STORE ANALYZED JOB
+        # ========================================================
 
-                "Experience Required": (
-                    experience_label
-                ),
+        analyzed_jobs.append({
 
-                "Experience Years": (
-                    experience_years
-                ),
+            "Title": title,
 
-                "Experience Skip": (
-                    "Yes"
-                    if experience_skip
-                    else "No"
-                ),
+            "Company": company,
 
-                "Link": row.get(
-                    "Link",
-                    "",
-                ),
-            })
+            "Location": location,
 
-    # -----------------------------------------------------------------------
-    # Save analysis CSV
-    # -----------------------------------------------------------------------
+            "Easy Apply": easy_apply,
 
-    output_directory = os.path.dirname(
-        OUTPUT_FILE
-    )
+            "Match Score": (
+                "N/A"
+                if data_status != "OK"
+                else f"{score}%"
+            ),
 
-    if output_directory:
-        os.makedirs(
-            output_directory,
-            exist_ok=True,
-        )
+            "Priority": priority,
 
-    fields = [
+            "Matched Skills": ", ".join(
+                sorted(matched)
+            ),
+
+            "Missing Skills": ", ".join(
+                sorted(missing)
+            ),
+
+            "Experience Required": (
+                experience_label
+            ),
+
+            "Experience Years": (
+                experience_years
+            ),
+
+            "Experience Skip": (
+                "Yes"
+                if experience_skip
+                else "No"
+            ),
+
+            "Data Status": data_status,
+
+            "Application Eligible": (
+                application_eligible
+            ),
+
+            "Link": link,
+        })
+
+    # ============================================================
+    # SAVE ANALYSIS
+    # ============================================================
+
+    fieldnames = [
+
         "Title",
+
         "Company",
+
         "Location",
+
         "Easy Apply",
+
         "Match Score",
+
         "Priority",
+
         "Matched Skills",
+
         "Missing Skills",
+
         "Experience Required",
+
         "Experience Years",
+
         "Experience Skip",
+
+        "Data Status",
+
+        "Application Eligible",
+
         "Link",
     ]
 
@@ -470,125 +528,58 @@ def analyze_jobs():
         "w",
         newline="",
         encoding="utf-8",
-    ) as f:
+    ) as file:
 
         writer = csv.DictWriter(
-            f,
-            fieldnames=fields,
+            file,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_ALL,
         )
 
         writer.writeheader()
-        writer.writerows(jobs)
 
-    # -----------------------------------------------------------------------
-    # Recommendation filtering
-    # -----------------------------------------------------------------------
+        for job in analyzed_jobs:
 
-    recommended = []
+            writer.writerow(job)
 
-    skipped_experience = 0
-    skipped_score = 0
-    skipped_location = 0
-    skipped_easy_apply = 0
+    # ============================================================
+    # TOP RECOMMENDATIONS
+    # ============================================================
 
-    for job in jobs:
+    recommendations = []
+
+    for job in analyzed_jobs:
+
+        if (
+            job["Application Eligible"]
+            != "Yes"
+        ):
+            continue
+
+        score_text = job["Match Score"]
+
+        if not score_text.endswith("%"):
+            continue
 
         try:
             score = int(
-                str(
-                    job.get(
-                        "Match Score",
-                        "0",
-                    )
-                )
-                .replace("%", "")
-                .strip()
+                score_text.replace("%", "")
             )
-
-        except (ValueError, TypeError):
-
-            score = 0
-
-        # ---------------------------------------------------------------
-        # Filter 1: Match score
-        # ---------------------------------------------------------------
-
-        if score < MIN_MATCH_SCORE:
-
-            skipped_score += 1
+        except ValueError:
             continue
 
-        # ---------------------------------------------------------------
-        # Filter 2: Target location
-        # ---------------------------------------------------------------
+        recommendations.append(
+            (score, job)
+        )
 
-        if not location_allowed(
-            job.get("Location", "")
-        ):
-
-            skipped_location += 1
-            continue
-
-        # ---------------------------------------------------------------
-        # Filter 3: Experience
-        # ---------------------------------------------------------------
-
-        if (
-            job.get(
-                "Experience Skip",
-                "No",
-            )
-            .strip()
-            .lower()
-            == "yes"
-        ):
-
-            skipped_experience += 1
-            continue
-
-        # ---------------------------------------------------------------
-        # Filter 4: Easy Apply, if enabled
-        # ---------------------------------------------------------------
-
-        if (
-            EASY_APPLY_FILTER
-            and
-            job.get(
-                "Easy Apply",
-                "",
-            )
-            .strip()
-            .lower()
-            != "yes"
-        ):
-
-            skipped_easy_apply += 1
-            continue
-
-        recommended.append(job)
-
-    # -----------------------------------------------------------------------
-    # Sort highest score first
-    # -----------------------------------------------------------------------
-
-    recommended.sort(
-        key=lambda x: int(
-            str(
-                x.get(
-                    "Match Score",
-                    "0",
-                )
-            )
-            .replace("%", "")
-            .strip()
-            or 0
-        ),
+    recommendations.sort(
+        key=lambda item: item[0],
         reverse=True,
     )
 
-    # -----------------------------------------------------------------------
-    # Console output
-    # -----------------------------------------------------------------------
+    # ============================================================
+    # OUTPUT
+    # ============================================================
 
     print()
     print("=" * 60)
@@ -596,7 +587,7 @@ def analyze_jobs():
     print("=" * 60)
 
     print(
-        f"Jobs analyzed : {len(jobs)}"
+        f"Jobs analyzed : {len(analyzed_jobs)}"
     )
 
     print(
@@ -608,16 +599,25 @@ def analyze_jobs():
     print("TOP JOB RECOMMENDATIONS")
     print("=" * 60)
 
-    if recommended:
+    if not recommendations:
 
-        for i, job in enumerate(
-            recommended[:TOP_JOBS],
-            1,
+        print()
+        print(
+            "No jobs currently meet the requirements."
+        )
+
+    else:
+
+        for index, (score, job) in enumerate(
+            recommendations[:10],
+            start=1,
         ):
 
             print()
+
             print(
-                f"{i}. {job['Title']}"
+                f"{index}. "
+                f"{job['Title']}"
             )
 
             print(
@@ -647,26 +647,21 @@ def analyze_jobs():
 
             print(
                 f"   Easy Apply: "
-                f"{job['Easy Apply'] or 'Unknown'}"
+                f"{job['Easy Apply']}"
             )
+
+            missing = job[
+                "Missing Skills"
+            ]
 
             print(
                 f"   Missing : "
-                f"{job['Missing Skills'] or 'None'}"
+                f"{missing if missing else 'None'}"
             )
 
-    else:
-
-        print()
-        print(
-            f"No jobs currently meet the "
-            f"{MIN_MATCH_SCORE}% score, "
-            f"location, and experience filters."
-        )
-
-    # -----------------------------------------------------------------------
-    # Recommendation summary
-    # -----------------------------------------------------------------------
+    # ============================================================
+    # SUMMARY
+    # ============================================================
 
     print()
     print("=" * 60)
@@ -679,8 +674,7 @@ def analyze_jobs():
     )
 
     print(
-        f"Easy Apply Filter   : "
-        f"{EASY_APPLY_FILTER}"
+        f"Easy Apply Filter   : False"
     )
 
     print(
@@ -690,7 +684,7 @@ def analyze_jobs():
 
     print(
         f"Recommended Jobs     : "
-        f"{len(recommended)}"
+        f"{len(recommendations)}"
     )
 
     print()
@@ -709,80 +703,102 @@ def analyze_jobs():
         f"{skipped_experience}"
     )
 
-    if EASY_APPLY_FILTER:
+    print(
+        f"Skipped by data      : "
+        f"{skipped_data}"
+    )
 
-        print(
-            f"Skipped Easy Apply   : "
-            f"{skipped_easy_apply}"
-        )
+    # ============================================================
+    # SKILL GAP ANALYSIS
+    # ============================================================
 
-    # -----------------------------------------------------------------------
-    # Skill gap analysis
-    # -----------------------------------------------------------------------
+    skill_frequency = {}
 
-    counter = Counter()
+    for job in analyzed_jobs:
 
-    for job in jobs:
+        if job["Data Status"] != "OK":
+            continue
 
-        counter.update(
+        missing_skills = job[
+            "Missing Skills"
+        ]
+
+        if not missing_skills:
+            continue
+
+        skills = [
             skill.strip()
-            for skill in job.get(
-                "Missing Skills",
-                "",
-            ).split(",")
-
+            for skill in missing_skills.split(",")
             if skill.strip()
-        )
+        ]
+
+        for skill in skills:
+
+            skill_frequency[skill] = (
+                skill_frequency.get(
+                    skill,
+                    0,
+                )
+                + 1
+            )
+
+    sorted_skills = sorted(
+        skill_frequency.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
 
     print()
     print("=" * 60)
     print("SKILL GAP ANALYSIS")
     print("=" * 60)
 
-    if counter:
+    if not sorted_skills:
 
         print()
         print(
-            "Skills to improve based on "
-            "collected jobs:\n"
-        )
-
-        for rank, (
-            skill,
-            count,
-        ) in enumerate(
-            counter.most_common(10),
-            1,
-        ):
-
-            print(
-                f"{rank}. "
-                f"{skill} -> "
-                f"{count} job(s)"
-            )
-
-        print()
-        print("Recommended Focus:")
-
-        print(
-            ", ".join(
-                skill
-                for skill, _
-                in counter.most_common(5)
-            )
+            "No significant skill gaps found."
         )
 
     else:
 
         print()
         print(
-            "No missing skills identified."
+            "Skills to improve based on "
+            "collected jobs:"
         )
 
+        for index, (skill, count) in enumerate(
+            sorted_skills[:10],
+            start=1,
+        ):
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+            print(
+                f"{index}. "
+                f"{skill} -> "
+                f"{count} job(s)"
+            )
+
+        focus_skills = [
+            skill
+            for skill, count in sorted_skills[:5]
+        ]
+
+        print()
+        print(
+            "Recommended Focus:"
+        )
+
+        print(
+            ", ".join(focus_skills)
+        )
+
+    print()
+
+
+# ================================================================
+# ENTRY POINT
+# ================================================================
 
 if __name__ == "__main__":
     analyze_jobs()
