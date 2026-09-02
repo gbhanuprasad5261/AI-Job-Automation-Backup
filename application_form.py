@@ -906,8 +906,9 @@ def _choose_safe_radio_answer(question, answers):
 def inspect_radio_buttons(container):
     """Inspect radio groups and safely answer only known questions.
 
-    Returns the number of unresolved radio groups. A non-zero value prevents
-    navigation/submission so the automation never guesses an application answer.
+    Returns the number of unknown radio groups that were skipped. Unknown
+    questions are never guessed and do not block navigation; genuinely
+    required unanswered fields are handled separately by validation.
     """
     print()
     print("Checking radio buttons...")
@@ -981,15 +982,36 @@ def inspect_radio_buttons(container):
                     print("Selected safe answer:", chosen)
                     continue
 
-            # Never accept an unexplained/default checked answer as a safe answer.
-            checked = any(radio.is_checked() for radio in group)
-            if checked:
-                print("WARNING: A radio option is already selected, but the question was not safely recognized.")
-            else:
-                print("WARNING: No radio option selected.")
+            # Unknown radio question:
+            # Do NOT guess an answer. Leave it unchanged and continue.
+            checked = any(
+                radio.is_checked()
+                for radio in group
+            )
 
-            print("This radio question requires manual review.")
+            if checked:
+                print(
+                    "WARNING: Unknown radio question already has "
+                    "a selected option."
+                )
+                print(
+                    "Leaving the existing selection unchanged."
+                )
+            else:
+                print(
+                    "Unknown radio question detected."
+                )
+                print(
+                    "Skipping without selecting an answer."
+                )
+
+            print(
+                "Unknown radio question skipped safely."
+            )
+
+            # Unknown questions must NOT block navigation.
             unresolved += 1
+            continue
 
         except Exception as e:
             print(f"Could not inspect radio group: {e}")
@@ -999,8 +1021,8 @@ def inspect_radio_buttons(container):
     if unresolved == 0:
         print("All radio questions were answered safely.")
     else:
-        print(f"Unresolved radio groups: {unresolved}")
-        print("Automation will stop before continuing.")
+        print(f"Unknown radio groups skipped: {unresolved}")
+        print("Automation will continue without guessing answers.")
 
     return unresolved
 
@@ -1620,9 +1642,13 @@ def prepare_current_page(page: Page):
         )
     )
 
-    # Treat unresolved radio questions as blocking issues.
+    # Unknown radio questions are intentionally skipped.
+    # Only genuinely required fields block navigation.
     if unresolved_radios > 0:
-        unanswered += unresolved_radios
+        print(
+            f"Skipped unknown radio groups: "
+            f"{unresolved_radios}"
+        )
 
     return unanswered
 
@@ -1693,6 +1719,77 @@ def move_to_next_page(page: Page):
     if current:
         print(f"After : {current[0]}/{current[1]}")
     print("Stopping safely instead of clicking navigation repeatedly.")
+    return False
+
+
+def handle_final_submission(page: Page):
+    """Handle the final LinkedIn Easy Apply submission safely.
+
+    Returns True only after a submit click is performed successfully.
+    When AUTO_SUBMIT is disabled, the form is left ready for manual review.
+    """
+
+    container = get_application_container(page)
+    submit_button = find_submit_button(container, page)
+
+    if submit_button is None:
+        print("Final submit button not found.")
+        return False
+
+    if not AUTO_SUBMIT:
+        print()
+        print("AUTO_SUBMIT is disabled.")
+        print("Final application is READY_FOR_REVIEW.")
+        return False
+
+    try:
+        if not submit_button.is_enabled():
+            print("Final submit button is disabled.")
+            return False
+    except Exception:
+        pass
+
+    try:
+        print()
+        print("Submitting LinkedIn Easy Apply application...")
+        submit_button.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        submit_button.click(timeout=10000)
+    except Exception as e:
+        print(f"Final submission click failed: {e}")
+        return False
+
+    page.wait_for_timeout(2500)
+
+    # Confirm a success signal when LinkedIn exposes one. If the modal closes
+    # or the submit control disappears, that is also treated as success.
+    try:
+        body = page.locator("body").inner_text().lower()
+    except Exception:
+        body = ""
+
+    success_signals = (
+        "application submitted",
+        "your application was sent",
+        "application has been submitted",
+        "you applied",
+        "application sent",
+    )
+
+    if any(signal in body for signal in success_signals):
+        print("Application submitted successfully.")
+        return True
+
+    try:
+        remaining = find_submit_button(get_application_container(page), page)
+    except Exception:
+        remaining = None
+
+    if remaining is None:
+        print("Submit control disappeared after click; application appears submitted.")
+        return True
+
+    print("Submission result could not be confirmed.")
     return False
 
 
