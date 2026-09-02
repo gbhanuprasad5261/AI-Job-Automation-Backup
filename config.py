@@ -28,7 +28,7 @@ EASY_APPLY_FILTER = False
 AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "true").strip().lower() == "true"
 
 # Unknown required questions remain a safety stop.
-UNKNOWN_QUESTIONS_POLICY = "STOP"
+UNKNOWN_QUESTIONS_POLICY = os.getenv("UNKNOWN_QUESTIONS_POLICY", "SKIP").strip().upper()
 
 CHROME_CDP_URL = os.getenv(
     "CHROME_CDP_URL",
