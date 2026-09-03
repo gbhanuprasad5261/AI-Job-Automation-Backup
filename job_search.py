@@ -27,9 +27,9 @@ OUTPUT_FILE = "jobs.csv"
 # Build LinkedIn Search URL
 # =======================================
 
-def build_search_url(location=None):
+def build_search_url(location=None, keyword=None):
 
-    keyword = quote(SEARCH_KEYWORD)
+    keyword = quote(keyword or SEARCH_KEYWORD)
 
     url = (
         "https://www.linkedin.com/jobs/search/"
@@ -723,7 +723,6 @@ def location_allowed(location):
 
 def search_jobs():
 
-
     with sync_playwright() as p:
 
         # ---------------------------------------
@@ -745,22 +744,17 @@ def search_jobs():
             print(
                 "Could not connect to Chrome."
             )
-
             print()
             print(
                 "Start Chrome using:"
             )
-
             print(
                 ".\\start_chrome.bat"
             )
-
             print()
-
             print(
                 f"Error: {e}"
             )
-
             return
 
         if not browser.contexts:
@@ -768,7 +762,6 @@ def search_jobs():
             print(
                 "No browser context found."
             )
-
             return
 
         context = (
@@ -789,88 +782,55 @@ def search_jobs():
         )
 
         # ---------------------------------------
-        # Build search URL
+        # LinkedIn multi-keyword search
         # ---------------------------------------
 
-        search_url = (
-            build_search_url()
-        )
+        print()
+        print("=" * 70)
+        print("LINKEDIN JOB SEARCH")
+        print("=" * 70)
 
         print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "LINKEDIN JOB SEARCH"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print()
-        print(
-            f"Searching for: "
-            f"{SEARCH_KEYWORD}"
-        )
-
         print(
             "Easy Apply filter: "
             f"{'ON' if EASY_APPLY_FILTER else 'OFF'}"
         )
 
-        print()
-        print(
-            f"Search URL: "
-            f"{search_url}"
+        all_job_links = []
+        seen_job_ids = set()
+
+        keywords = SEARCH_KEYWORDS or (
+            SEARCH_KEYWORD,
         )
 
-        # ---------------------------------------
-        # Open Search
-        # ---------------------------------------
-
-        try:
-
-            page.goto(
-                search_url,
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-
-            page.wait_for_timeout(
-                5000
-            )
-
-        except Exception as e:
+        for keyword_index, keyword in enumerate(
+            keywords,
+            start=1
+        ):
 
             print()
+            print("=" * 70)
             print(
-                f"Could not open search: {e}"
+                f"SEARCH {keyword_index}/"
+                f"{len(keywords)}"
             )
-
-            return
-
-        print()
-        print(
-            f"Current URL: "
-            f"{page.url}"
-        )
-
-        # ---------------------------------------
-        # Login Check
-        # ---------------------------------------
-
-        if "login" in page.url:
-
+            print("=" * 70)
             print()
             print(
-                "LinkedIn login required."
+                f"Searching for: {keyword}"
             )
 
-            input(
-                "Login manually and press ENTER..."
+            search_url = build_search_url(
+                keyword=keyword
             )
+
+            print(
+                f"Search URL: {search_url}"
+            )
+
+            # ---------------------------------------
+            # Open Search
+            # ---------------------------------------
 
             try:
 
@@ -881,69 +841,162 @@ def search_jobs():
                 )
 
                 page.wait_for_timeout(
-                    4000
+                    5000
                 )
 
             except Exception as e:
 
+                print()
                 print(
-                    f"Could not reopen search: {e}"
+                    f"Could not open search for "
+                    f"'{keyword}': {e}"
                 )
+                continue
 
-                return
-
-        # ---------------------------------------
-        # Save screenshot
-        # ---------------------------------------
-
-        try:
-
-            page.screenshot(
-                path="search_results.png",
-                full_page=True
+            print()
+            print(
+                f"Current URL: {page.url}"
             )
 
-        except Exception:
+            # ---------------------------------------
+            # Login Check
+            # ---------------------------------------
 
-            pass
+            if "login" in page.url:
 
-        # ---------------------------------------
-        # Find job links
-        # ---------------------------------------
+                print()
+                print(
+                    "LinkedIn login required."
+                )
 
-        print()
-        print(
-            "Finding job results..."
-        )
+                input(
+                    "Login manually and press ENTER..."
+                )
 
-        # Scroll to load more jobs.
+                try:
 
-        for _ in range(3):
+                    page.goto(
+                        search_url,
+                        wait_until="domcontentloaded",
+                        timeout=30000
+                    )
+
+                    page.wait_for_timeout(
+                        4000
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"Could not reopen search: {e}"
+                    )
+                    continue
+
+            # ---------------------------------------
+            # Save screenshot
+            # ---------------------------------------
 
             try:
 
-                page.mouse.wheel(
-                    0,
-                    1500
-                )
-
-                page.wait_for_timeout(
-                    1500
+                page.screenshot(
+                    path=(
+                        f"search_results_"
+                        f"{keyword_index}.png"
+                    ),
+                    full_page=True
                 )
 
             except Exception:
 
+                pass
+
+            # ---------------------------------------
+            # Find job links
+            # ---------------------------------------
+
+            print()
+            print(
+                "Finding job results..."
+            )
+
+            for _ in range(3):
+
+                try:
+
+                    page.mouse.wheel(
+                        0,
+                        1500
+                    )
+
+                    page.wait_for_timeout(
+                        1500
+                    )
+
+                except Exception:
+
+                    break
+
+            keyword_job_links = (
+                get_job_links(page)
+            )
+
+            print()
+            print(
+                f"Potential jobs found for "
+                f"'{keyword}': "
+                f"{len(keyword_job_links)}"
+            )
+
+            # ---------------------------------------
+            # Combine results and remove duplicates
+            # ---------------------------------------
+
+            added = 0
+
+            for job_link in keyword_job_links:
+
+                job_id = extract_job_id(
+                    job_link
+                )
+
+                if not job_id:
+                    continue
+
+                if job_id in seen_job_ids:
+                    continue
+
+                seen_job_ids.add(job_id)
+
+                all_job_links.append(
+                    build_job_url(job_id)
+                )
+
+                added += 1
+
+            print(
+                f"New unique jobs added: {added}"
+            )
+            print(
+                f"Total unique jobs: "
+                f"{len(all_job_links)}"
+            )
+
+            if len(all_job_links) >= MAX_JOBS:
                 break
 
-        job_links = (
-            get_job_links(page)
-        )
+        # ---------------------------------------
+        # Final combined job links
+        # ---------------------------------------
+
+        job_links = all_job_links[:MAX_JOBS]
 
         print()
+        print("=" * 70)
         print(
-            f"Potential jobs found: "
+            f"Total unique potential jobs: "
             f"{len(job_links)}"
         )
+        print("=" * 70)
 
         if not job_links:
 
@@ -951,13 +1004,10 @@ def search_jobs():
             print(
                 "No LinkedIn job links found."
             )
-
             print()
             print(
-                "LinkedIn may have changed "
-                "its page structure."
+                "LinkedIn may have changed its page structure."
             )
-
             return
 
         # ---------------------------------------
@@ -1032,7 +1082,6 @@ def search_jobs():
                     print(
                         "Job ID not found."
                     )
-
                     continue
 
                 normalized_link = (
@@ -1081,7 +1130,6 @@ def search_jobs():
                     print(
                         "Skipping."
                     )
-
                     continue
 
                 # ---------------------------------------
@@ -1116,7 +1164,10 @@ def search_jobs():
                 )
 
                 if not location_allowed(location):
-                    print(f"Outside target locations: {location or 'Unknown'}")
+                    print(
+                        f"Outside target locations: "
+                        f"{location or 'Unknown'}"
+                    )
                     print("Skipping.")
                     continue
 
@@ -1171,8 +1222,7 @@ def search_jobs():
                 )
 
                 print(
-                    f"URL: "
-                    f"{normalized_link}"
+                    f"URL: {normalized_link}"
                 )
 
                 # ---------------------------------------
@@ -1192,7 +1242,6 @@ def search_jobs():
                     print(
                         "Skipping."
                     )
-
                     continue
 
                 # ---------------------------------------
@@ -1245,17 +1294,11 @@ def search_jobs():
             writer = csv.DictWriter(
                 file,
                 fieldnames=[
-
                     "Title",
-
                     "Company",
-
                     "Location",
-
                     "Easy Apply",
-
                     "Actively Reviewing",
-
                     "Link"
                 ]
             )
@@ -1271,11 +1314,8 @@ def search_jobs():
         # ---------------------------------------
 
         easy_apply_count = sum(
-
             1
-
             for job in jobs
-
             if job["Easy Apply"] == "Yes"
         )
 
