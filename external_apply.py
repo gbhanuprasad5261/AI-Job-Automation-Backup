@@ -77,6 +77,8 @@ def detect_ats(url: str, body: str = "") -> str:
         return "SMARTRECRUITERS"
     if "cutshort.io" in value:
         return "CUTSHORT"
+    if "docs.google.com/forms" in value or "forms.gle" in value:
+        return "GOOGLE_FORMS"
     return "UNKNOWN"
 
 
@@ -241,145 +243,40 @@ def _fill_known_fields(
                 pass
             continue
 
-        # Lever's Current location is a Google/Lever autocomplete field.
-        # The browser must select an autocomplete suggestion; simply setting
-        # input.value is not sufficient because Lever validates the selected
-        # location state, not just the visible text.
+        # Lever's Current location is an autocomplete input. If the
+        # browser has prefilled or partially populated it, we still enforce
+        # the configured candidate value.
         if "current location" in q or ("location" in q and "current" in q):
-            value = current_location or "Bengaluru"
+            value = current_location
             try:
                 element.scroll_into_view_if_needed()
             except Exception:
                 pass
 
-            selected = False
+            try:
+                element.fill(value)
+            except Exception:
+                try:
+                    element.click()
+                    element.press("Control+A")
+                    element.type(value)
+                except Exception:
+                    continue
 
             try:
-                element.click()
-                element.press("Control+A")
-                element.fill(value)
-
-                # Give the autocomplete provider time to render suggestions.
-                page.wait_for_timeout(1200)
-
-                # Google Places autocomplete, used by many Lever forms.
-                suggestion_selectors = [
-                    ".pac-container .pac-item:visible",
-                    ".pac-container .pac-item",
-                    "[role='listbox'] [role='option']:visible",
-                    "[role='option']:visible",
-                    "ul[role='listbox'] li:visible",
-                ]
-
-                wanted_terms = [
-                    value.lower(),
-                    "bengaluru",
-                    "bangalore",
-                    "karnataka",
-                    "india",
-                ]
-
-                for selector in suggestion_selectors:
-                    options = page.locator(selector)
-                    try:
-                        total = options.count()
-                    except Exception:
-                        total = 0
-
-                    if total == 0:
-                        continue
-
-                    # Prefer a suggestion containing Bengaluru/Bangalore.
-                    chosen = None
-                    for j in range(min(total, 20)):
-                        option = options.nth(j)
-                        try:
-                            if not _visible(option):
-                                continue
-                            txt = (option.inner_text() or "").strip()
-                            low = txt.lower()
-                            if (
-                                "bengaluru" in low
-                                or "bangalore" in low
-                                or value.lower() in low
-                            ):
-                                chosen = option
-                                break
-                        except Exception:
-                            continue
-
-                    if chosen is None:
-                        chosen = options.first
-
-                    try:
-                        chosen.scroll_into_view_if_needed()
-                    except Exception:
-                        pass
-
-                    try:
-                        chosen.click()
-                        page.wait_for_timeout(500)
-                        selected = True
-                        break
-                    except Exception:
-                        pass
-
-                # Keyboard fallback for Google/Lever autocomplete.
-                if not selected:
-                    try:
-                        element.press("ArrowDown")
-                        page.wait_for_timeout(200)
-                        element.press("Enter")
-                        page.wait_for_timeout(500)
-                        selected = True
-                    except Exception:
-                        pass
-
+                element.evaluate(
+                    """(el, value) => {
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', {bubbles:true}));
+                        el.dispatchEvent(new Event('change', {bubbles:true}));
+                        el.dispatchEvent(new Event('blur', {bubbles:true}));
+                    }""",
+                    value,
+                )
             except Exception:
                 pass
 
-            # Final normal fill fallback. This is only used if the widget did
-            # not expose a selectable suggestion.
-            try:
-                actual = element.input_value().strip()
-            except Exception:
-                actual = ""
-
-            if not actual:
-                try:
-                    element.fill(value)
-                    element.press("Tab")
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
-
-            # Verify both the native input and the visible field container.
-            try:
-                final_value = element.input_value().strip()
-            except Exception:
-                final_value = ""
-
-            if final_value:
-                count += 1
-            else:
-                try:
-                    field_text = element.evaluate(
-                        """el => {
-                            const row = el.closest('div.field, div, li, label');
-                            return row ? (row.innerText || row.textContent || '') : '';
-                        }"""
-                    ) or ""
-                except Exception:
-                    field_text = ""
-
-                low = field_text.lower()
-                if (
-                    "bengaluru" in low
-                    or "bangalore" in low
-                    or value.lower() in low
-                ):
-                    count += 1
-
+            count += 1
             continue
 
         if current:
@@ -532,6 +429,188 @@ def _fill_known_profile_links(page: Page, github_url: str = GITHUB_URL) -> int:
 
     return 0
 
+def _google_question_text(element) -> str:
+    """Return the visible Google Forms question text for a field."""
+    try:
+        text = element.evaluate(
+            """el => {
+                const item = el.closest('[role="listitem"]');
+                if (item) return item.innerText || item.textContent || '';
+                const parent = el.parentElement;
+                return parent ? (parent.innerText || parent.textContent || '') : '';
+            }"""
+        ) or ""
+    except Exception:
+        text = ""
+    return " ".join(text.split()).lower()
+
+
+def _fill_google_forms_known_fields(
+    page: Page,
+    name: str,
+    email: str,
+    phone: str,
+    current_location: str = CURRENT_LOCATION,
+    current_company: str = CURRENT_COMPANY,
+) -> int:
+    """Fill only clearly identifiable Google Forms fields.
+
+    This intentionally does not click Google Forms consent/record-email
+    checkboxes and does not guess answers to unknown questions.
+    """
+    count = 0
+    fields = page.locator("input, textarea")
+
+    try:
+        total = fields.count()
+    except Exception:
+        return 0
+
+    for i in range(total):
+        element = fields.nth(i)
+        if not _visible(element):
+            continue
+
+        field_type = _attr(element, "type").lower()
+        if field_type in {
+            "hidden", "file", "radio", "checkbox", "submit",
+            "button", "password"
+        }:
+            continue
+
+        try:
+            current = element.input_value().strip()
+        except Exception:
+            current = ""
+
+        q = _google_question_text(element)
+        if not q:
+            q = _field_text(element)
+
+        value = None
+
+        if "email" in q and field_type == "email":
+            value = email
+        elif "full name" in q or re.search(r"(^|\\s)name(\\s|$)", q):
+            value = name
+        elif "first name" in q or "firstname" in q:
+            value = name.split()[0] if name else ""
+        elif "last name" in q or "lastname" in q or "surname" in q:
+            value = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
+        elif "phone" in q or "mobile" in q or "telephone" in q:
+            value = phone
+        elif "current location" in q:
+            value = current_location
+        elif "current company" in q:
+            value = current_company or "N/A"
+
+        if value is None:
+            continue
+
+        # Do not overwrite a Google-managed email value unnecessarily.
+        if current:
+            continue
+
+        if _fill(page.locator("input, textarea").nth(i), value):
+            print(f"Google Form known field filled: {q[:90]} -> {value}")
+            count += 1
+
+    return count
+
+
+def _google_forms_required_empty_count(page: Page) -> int:
+    """Count required Google Forms questions that are still unanswered.
+
+    Google Forms often uses aria-required on descendants rather than the
+    standard HTML `required` attribute. We inspect the containing question
+    block and report its visible text so manual review is actionable.
+    """
+    count = 0
+    seen_items = set()
+
+    try:
+        required = page.locator("[aria-required='true']")
+        for i in range(required.count()):
+            element = required.nth(i)
+            if not _visible(element):
+                continue
+
+            try:
+                item = element.locator("xpath=ancestor::*[@role='listitem'][1]")
+                if not item.count() or not _visible(item.first):
+                    item = element.locator("xpath=..")
+            except Exception:
+                item = element.locator("xpath=..")
+
+            try:
+                item_key = item.first.get_attribute("data-params") or str(i)
+            except Exception:
+                item_key = str(i)
+
+            if item_key in seen_items:
+                continue
+            seen_items.add(item_key)
+
+            try:
+                field_type = _attr(element, "type").lower()
+                if field_type in {"radio", "checkbox"}:
+                    # Unknown required choices/consent questions are not guessed.
+                    checked = element.is_checked()
+                    if checked:
+                        continue
+                else:
+                    value = element.input_value().strip()
+                    if value:
+                        continue
+            except Exception:
+                value = ""
+
+            try:
+                question = item.first.inner_text().strip()
+            except Exception:
+                question = _google_question_text(element)
+
+            print("Google Form required question still unanswered:")
+            print(f"  Question: {question or '(not detected)'}")
+            count += 1
+    except Exception:
+        pass
+
+    return count
+
+
+def _prepare_google_form(page: Page, name: str, email: str, phone: str,
+                         current_location: str, current_company: str) -> str:
+    """Prepare a Google Form without submitting it."""
+    print("Google Form detected: using safe known-field handling.")
+    filled = _fill_google_forms_known_fields(
+        page,
+        name,
+        email,
+        phone,
+        current_location,
+        current_company,
+    )
+    print(f"Google Form known fields filled: {filled}")
+
+    # Google Forms does not normally expose a resume upload as a standard ATS
+    # file field. Try the normal upload helper without requiring it.
+    uploaded = _upload_resume(page, "")
+    print(f"Resume uploaded: {'Yes' if uploaded else 'No / not required here'}")
+
+    required = _google_forms_required_empty_count(page)
+    print(f"Google Form required questions still unanswered: {required}")
+
+    if required:
+        print("Required Google Form questions remain unanswered; manual review is required.")
+    else:
+        print("No detectable unanswered required Google Form questions on this page.")
+
+    print("Google Form prepared for manual review.")
+    print("No Google Form submission was performed.")
+    return "READY_FOR_REVIEW"
+
+
 def _upload_resume(page: Page, resume_path: str) -> bool:
     if not resume_path or not os.path.exists(resume_path):
         return False
@@ -632,31 +711,6 @@ def _required_empty_count(page: Page) -> int:
                     pass
 
             if not value:
-                # Lever can keep the selected location in an associated
-                # autocomplete/hidden state while the text input itself has
-                # no native value. Inspect nearby DOM text before declaring it
-                # empty.
-                field_meta = _field_text(element)
-                if "current location" in field_meta:
-                    try:
-                        nearby = element.evaluate(
-                            """el => {
-                                const row = el.closest('div.field, div, li, label');
-                                return row ? (row.innerText || row.textContent || '') : '';
-                            }"""
-                        ) or ""
-                    except Exception:
-                        nearby = ""
-
-                    nearby_lower = nearby.strip().lower()
-                    if (
-                        "bengaluru" in nearby_lower
-                        or "bangalore" in nearby_lower
-                        or "karnataka" in nearby_lower
-                        or "bengaluru, ind" in nearby_lower
-                    ):
-                        continue
-
                 count += 1
 
                 try:
@@ -698,6 +752,16 @@ def prepare_external_application_page(
     print(f"External ATS detected: {ats}")
     print(f"External page: {page.url}")
     print("Preparing external application page...")
+
+    if ats == "GOOGLE_FORMS":
+        return _prepare_google_form(
+            page,
+            name,
+            email,
+            phone,
+            current_location,
+            current_company,
+        )
 
     filled = _fill_known_fields(
         page,
