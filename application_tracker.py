@@ -8,7 +8,6 @@ OUTPUT_FILE = "data/application_tracker.csv"
 # Normal application lifecycle statuses.
 STATUSES = [
     "NOT APPLIED",
-    "READY_FOR_REVIEW",
     "LOGIN_REQUIRED",
     "INELIGIBLE",
     "APPLIED",
