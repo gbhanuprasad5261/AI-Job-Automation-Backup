@@ -38,11 +38,10 @@ def extract_company_from_header(page):
     """
     Extract the company belonging to the CURRENT job.
 
-    Important:
-    Do not use a random /company/ link from the entire page because
-    LinkedIn also displays recommended jobs below the current job.
-    First try company links/selectors inside the current job header.
+    Uses current-job header selectors first, then company links,
+    and finally the LinkedIn page title as a reliable fallback.
     """
+
     selectors = [
         "div.job-details-jobs-unified-top-card__company-name a",
         "div.job-details-jobs-unified-top-card__company-name",
@@ -51,28 +50,37 @@ def extract_company_from_header(page):
         "div.jobs-unified-top-card__company-name",
     ]
 
+    # 1. Current-job header selectors
     value = extract_text(page, selectors)
     if value:
         return value
 
-        # Current LinkedIn layout: company is exposed as a /company/ link.
+    # 2. Current LinkedIn layout: company exposed as /company/ link
     try:
         links = page.locator("a[href*='/company/']")
+
         for i in range(links.count()):
             link = links.nth(i)
+
             if not link.is_visible():
                 continue
 
-            text = re.sub(r"\s+", " ", link.inner_text() or "").strip()
+            text = re.sub(
+                r"\s+",
+                " ",
+                link.inner_text() or ""
+            ).strip()
 
             if text and len(text) <= 150:
                 return text
+
     except Exception:
         pass
 
-    # Fallback: locate the h1 and inspect only its nearby ancestor.
+    # 3. Locate company link near the current job title
     try:
         h1 = page.locator("h1").first
+
         if h1.count() > 0:
             ancestor = h1.locator(
                 "xpath=ancestor::*[.//a[contains(@href,'/company/')]][1]"
@@ -85,16 +93,19 @@ def extract_company_from_header(page):
 
                 if company_link.count() > 0:
                     value = company_link.inner_text().strip()
+
                     if value:
                         return value
+
     except Exception:
         pass
 
-    # Last fallback: first company link that is visually close to the h1.
-    # Recommended-job company links are intentionally ignored where possible.
+    # 4. Last DOM-position fallback
     try:
         links = page.locator("a[href*='/company/']")
-        h1_box = page.locator("h1").first.bounding_box()
+        h1 = page.locator("h1").first
+
+        h1_box = h1.bounding_box()
 
         if h1_box:
             candidates = []
@@ -111,14 +122,40 @@ def extract_company_from_header(page):
                 if not box or not text:
                     continue
 
-                # Current-job header company normally appears above/near h1.
                 distance = abs(box["y"] - h1_box["y"])
+
                 if distance <= 350:
                     candidates.append((distance, text))
 
             if candidates:
                 candidates.sort(key=lambda x: x[0])
                 return candidates[0][1]
+
+    except Exception:
+        pass
+
+    # 5. LinkedIn page-title fallback
+    # Example:
+    # "Software Engineer Intern | SentLogic | LinkedIn"
+    try:
+        page_title = page.title().strip()
+
+        if page_title:
+            parts = [
+                re.sub(r"\s+", " ", part).strip()
+                for part in page_title.split("|")
+            ]
+
+            if len(parts) >= 3:
+                company = parts[-2].strip()
+
+                if (
+                    company
+                    and company.lower() != "linkedin"
+                    and len(company) <= 150
+                ):
+                    return company
+
     except Exception:
         pass
 
