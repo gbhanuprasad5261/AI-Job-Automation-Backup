@@ -815,25 +815,23 @@ def _radio_label_text(container, radio):
 
 
 def _radio_question_container_from_text(container, question_patterns):
-    """Find the smallest visible wrapper for one LinkedIn custom radio question.
+    """Find the smallest visible container for a specific radio question.
 
-    LinkedIn renders each option twice in the DOM: a custom [role='radio']
-    control plus a nested native input[type='radio'].  Therefore the combined
-    selector reports 4 controls for a normal 2-option question.  We identify
-    the wrapper using the number of custom role radios (2), not the combined
-    count.
+    LinkedIn can place multiple radio questions inside one shared wrapper.
+    Therefore we start from the actual question text and walk upward until
+    we find the nearest ancestor containing exactly the option controls for
+    that question (normally two).
     """
     try:
+        # Search common text-bearing elements rather than the whole DOM root.
         candidates = container.locator("label, legend, p, span, div")
         for i in range(candidates.count()):
             element = candidates.nth(i)
             if not element.is_visible():
                 continue
-
             text = safe_text(element).strip()
             if not text or len(text) > 300:
                 continue
-
             low = text.lower()
             if not any(pattern in low for pattern in question_patterns):
                 continue
@@ -841,35 +839,24 @@ def _radio_question_container_from_text(container, question_patterns):
                 continue
 
             node = element
-            for _ in range(10):
+            for _ in range(8):
                 try:
-                    custom_radios = node.locator("[role='radio']")
-                    native_radios = node.locator("input[type='radio']")
-
-                    custom_count = custom_radios.count()
-                    native_count = native_radios.count()
-
-                    # Normal LinkedIn custom Yes/No group.
-                    if custom_count == 2:
-                        return node
-
-                    # Fallback for a genuinely native radio group.
-                    if custom_count == 0 and native_count == 2:
+                    count = node.locator("input[type='radio'], [role='radio']").count()
+                    if count == 2:
                         return node
                 except Exception:
                     pass
-
                 parent = node.locator("xpath=parent::*").first
                 if parent.count() == 0:
                     break
                 node = parent
     except Exception:
         pass
-
     return None
 
+
 def _click_radio_answer(question_container, answer_text):
-    """Select one answer and verify LinkedIn actually checked it."""
+    """Select one answer inside a single radio-question container."""
     if question_container is None:
         return False
 
@@ -877,47 +864,28 @@ def _click_radio_answer(question_container, answer_text):
     if not target:
         return False
 
-    # LinkedIn's custom radio is the authoritative control. Each custom
-    # [role='radio'] contains a <p> whose text is the option (Yes/No).
+    # First prefer accessible radio controls.
     try:
-        custom_radios = question_container.locator("[role='radio']")
-        for i in range(custom_radios.count()):
-            radio = custom_radios.nth(i)
-            if not radio.is_visible():
-                continue
-
-            option_text = safe_text(radio).strip()
-            if option_text.lower() != target.lower():
-                continue
-
-            radio.click(force=True)
-            question_container.page.wait_for_timeout(250)
-
-            # Verify aria-checked, not merely that click() returned.
-            checked = safe_attribute(radio, "aria-checked").strip().lower()
-            if checked == "true":
-                return True
-
-            try:
-                if radio.is_checked():
-                    return True
-            except Exception:
-                pass
-
-            # Re-query after LinkedIn rerender.
-            fresh = question_container.locator(
-                f"[role='radio']:has-text('{target}')"
-            )
-            for j in range(fresh.count()):
-                item = fresh.nth(j)
-                if not item.is_visible():
-                    continue
-                if safe_attribute(item, "aria-checked").strip().lower() == "true":
+        radios = question_container.get_by_role(
+            "radio",
+            name=re.compile(rf"^\s*{re.escape(target)}\s*$", re.IGNORECASE),
+        )
+        if radios.count() > 0:
+            radio = radios.first
+            if radio.is_visible():
+                try:
+                    radio.check(force=True)
+                except Exception:
+                    radio.click(force=True)
+                try:
+                    if radio.is_checked():
+                        return True
+                except Exception:
                     return True
     except Exception:
         pass
 
-    # Native radio fallback.
+    # Native radio input + label.
     try:
         labels = question_container.locator("label")
         for i in range(labels.count()):
@@ -926,42 +894,43 @@ def _click_radio_answer(question_container, answer_text):
                 continue
             if safe_text(label).strip().lower() == target.lower():
                 label.click(force=True)
-                question_container.page.wait_for_timeout(200)
                 return True
     except Exception:
         pass
 
-    # Final fallback: exact visible option text, but verify the group changed.
-    try:
-        before = [
-            safe_attribute(custom_radios.nth(i), "aria-checked").strip().lower()
-            for i in range(custom_radios.count())
-        ]
-    except Exception:
-        before = []
-
+    # Custom LinkedIn control: click the exact visible answer text.
     try:
         text_locator = question_container.get_by_text(
             re.compile(rf"^\s*{re.escape(target)}\s*$", re.IGNORECASE)
         )
         for i in range(text_locator.count()):
             item = text_locator.nth(i)
-            if not item.is_visible():
-                continue
-            item.click(force=True)
-            question_container.page.wait_for_timeout(250)
+            if item.is_visible():
+                item.click(force=True)
+                return True
+    except Exception:
+        pass
 
-            fresh_radios = question_container.locator("[role='radio']")
-            for j in range(fresh_radios.count()):
-                fresh = fresh_radios.nth(j)
-                if not fresh.is_visible():
-                    continue
-                if safe_attribute(fresh, "aria-checked").strip().lower() == "true":
-                    return True
+    # Last safe fallback: click a radio whose accessible/visible text is the
+    # requested answer, but only inside this question container.
+    try:
+        radios = question_container.locator("input[type='radio'], [role='radio']")
+        for i in range(radios.count()):
+            radio = radios.nth(i)
+            if not radio.is_visible():
+                continue
+            label = _radio_label_text(question_container, radio).strip()
+            if label.lower() == target.lower():
+                try:
+                    radio.check(force=True)
+                except Exception:
+                    radio.click(force=True)
+                return True
     except Exception:
         pass
 
     return False
+
 
 def _answer_known_radio_questions(container):
     """Answer known LinkedIn radio questions by their actual question text."""
@@ -1086,7 +1055,7 @@ def _choose_safe_radio_answer(question, answers):
 
 
 def inspect_radio_buttons(container):
-    """Answer known radio questions separately; stop on unknown required questions."""
+    """Answer known radio questions; block unknown required radio questions."""
     print()
     print("Checking radio buttons...")
 
@@ -1098,112 +1067,103 @@ def inspect_radio_buttons(container):
 
     answered, failures = _answer_known_radio_questions(container)
 
-    # Re-read the DOM after clicks because LinkedIn can rerender controls.
     radios = container.locator("input[type='radio'], [role='radio']")
-    unchecked = []
-    for i in range(radios.count()):
-        try:
-            radio = radios.nth(i)
-            if radio.is_visible() and not radio.is_checked():
-                unchecked.append(radio)
-        except Exception:
-            continue
-
     print(f"Radio controls found: {radios.count()}")
     if answered:
         print(f"Known radio questions answered: {answered}")
 
-    # Unknown-required detection is intentionally conservative. We look for
-    # visible question text ending in ?* and a nearby two-option radio wrapper.
-    # We do not guess any unknown answer.
     unresolved = failures
+    seen = set()
 
-    # Collect visible text elements that look like required questions.
-    question_elements = container.locator("label, legend, p, span, div")
-    seen_questions = set()
+    # LinkedIn may expose required radio questions without [required] or
+    # aria-required on the actual radio input. Detect the validation message
+    # and/or a trailing '*' on the question text instead.
+    candidates = container.locator("label, legend, p, span, div")
 
-    for i in range(question_elements.count()):
+    for i in range(candidates.count()):
         try:
-            element = question_elements.nth(i)
+            element = candidates.nth(i)
             if not element.is_visible():
                 continue
-            text = safe_text(element).strip()
-            if not text or len(text) > 300 or "?" not in text:
-                continue
-
-            # Required marker can be represented as * in the text or via an
-            # aria-required descendant. Only inspect text that actually looks
-            # like a question, avoiding option labels such as "Yes".
-            if not re.search(r"\?\s*\*\s*$", text):
+            text = re.sub(r"\s+", " ", safe_text(element)).strip()
+            if not text or len(text) > 300:
                 continue
             low = text.lower()
             if low in {"yes", "no", "true", "false"}:
                 continue
 
-            key = re.sub(r"\s+", " ", low)
-            if key in seen_questions:
-                continue
-            seen_questions.add(key)
+            required_marker = bool(re.search(r"\*\s*$", text))
 
-            wrapper = element
-            option_count = 0
-            for _ in range(8):
+            # Validation message can be rendered in a sibling/descendant of
+            # the question wrapper rather than on the radio input itself.
+            validation_marker = "this field is required" in low
+
+            # Start from the question text, or from the validation message,
+            # and find the smallest ancestor containing exactly two custom
+            # radio controls. LinkedIn can duplicate native/custom controls,
+            # so prefer role=radio count when available.
+            if not required_marker and not validation_marker:
+                continue
+
+            node = element
+            wrapper = None
+            for _ in range(10):
                 try:
-                    option_count = wrapper.locator(
-                        "input[type='radio'], [role='radio']"
-                    ).count()
+                    role_count = node.locator("[role='radio']").count()
+                    native_count = node.locator("input[type='radio']").count()
+                    option_count = role_count if role_count == 2 else native_count
+                    if option_count == 2:
+                        wrapper = node
+                        break
                 except Exception:
-                    option_count = 0
-                if option_count == 2:
-                    break
-                parent = wrapper.locator("xpath=parent::*").first
+                    pass
+                parent = node.locator("xpath=parent::*").first
                 if parent.count() == 0:
-                    wrapper = None
                     break
-                wrapper = parent
+                node = parent
 
-            if wrapper is None or option_count != 2:
+            if wrapper is None:
                 continue
 
-            # If one option is already selected, the question is answered.
+            wrapper_text = re.sub(r"\s+", " ", safe_text(wrapper)).strip()
+            question = _radio_question_text(wrapper).strip() or text
+            if not question:
+                question = wrapper_text
+
+            key = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Check whether any radio option is already selected.
             checked = False
-            try:
-                for j in range(wrapper.locator(
-                    "input[type='radio'], [role='radio']"
-                ).count()):
-                    r = wrapper.locator(
-                        "input[type='radio'], [role='radio']"
-                    ).nth(j)
-                    if r.is_checked():
+            controls = wrapper.locator("[role='radio']")
+            if controls.count() != 2:
+                controls = wrapper.locator("input[type='radio']")
+            for j in range(controls.count()):
+                try:
+                    if controls.nth(j).is_checked():
                         checked = True
                         break
-            except Exception:
-                pass
-
+                except Exception:
+                    continue
             if checked:
                 continue
 
-            # Known questions should already have been handled. If not, this
-            # is a required question we cannot safely answer.
-            chosen = _choose_safe_radio_answer(text, ["Yes", "No"])
-            if chosen:
-                if _click_radio_answer(wrapper, chosen):
-                    print(f"Selected safe answer: {text} -> {chosen}")
-                    continue
+            # If the question is known, try the safe profile answer first.
+            chosen = _choose_safe_radio_answer(question, ["Yes", "No"])
+            if chosen and _click_radio_answer(wrapper, chosen):
+                print(f"Selected safe answer: {question} -> {chosen}")
+                continue
 
             print()
             print("UNKNOWN REQUIRED RADIO QUESTION DETECTED.")
-            print("QUESTION:", text)
+            print("QUESTION:", question)
             print("ANSWERS:")
             try:
                 answer_texts = []
-                for j in range(wrapper.locator(
-                    "input[type='radio'], [role='radio']"
-                ).count()):
-                    r = wrapper.locator(
-                        "input[type='radio'], [role='radio']"
-                    ).nth(j)
-                    label = _radio_label_text(container, r).strip()
+                for j in range(controls.count()):
+                    label = _radio_label_text(container, controls.nth(j)).strip()
                     if label and label not in answer_texts:
                         answer_texts.append(label)
                 for answer in answer_texts:
@@ -1223,11 +1183,6 @@ def inspect_radio_buttons(container):
         print(f"Unknown required radio questions blocking navigation: {unresolved}")
 
     return unresolved
-
-
-# ============================================================
-# Handle Checkboxes
-# ============================================================
 
 def inspect_checkboxes(container):
 
