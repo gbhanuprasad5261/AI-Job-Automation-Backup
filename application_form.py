@@ -474,49 +474,43 @@ def fill_phone(container):
     print("Checking phone field...")
 
     if not PHONE:
-
-        print(
-            "PHONE is empty."
-        )
-
-        print(
-            "Set APPLICANT_PHONE before running."
-        )
-
+        print("PHONE is empty.")
+        print("Set APPLICANT_PHONE before running.")
         return False
 
-    # Country code is handled separately because LinkedIn often uses
-    # a custom control rather than a normal <select>.
-    select_india_country_code(container)
-
     selectors = [
-
         "input[type='tel']",
         "input[name*='phone' i]",
         "input[id*='phone' i]",
         "input[autocomplete='tel']",
-
     ]
 
+    phone_locator = None
+
     for selector in selectors:
-
         try:
-
             locator = container.locator(selector)
 
-            if locator.count() == 0:
-                continue
-
-            if fill_if_empty(
-                locator,
-                PHONE
-            ):
-
-                print("Phone filled.")
-                return True
+            if locator.count() > 0:
+                phone_locator = locator
+                break
 
         except Exception:
             pass
+
+    if phone_locator is None:
+        print("No phone field found on this page.")
+        return False
+
+    print("Checking phone country code...")
+    select_india_country_code(container)
+
+    try:
+        if fill_if_empty(phone_locator, PHONE):
+            print("Phone filled.")
+            return True
+    except Exception:
+        pass
 
     return False
 
