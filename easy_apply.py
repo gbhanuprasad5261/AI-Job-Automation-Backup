@@ -1956,9 +1956,25 @@ def open_easy_apply(job):
             LAST_APPLICATION_RESULT = "FAILED"
             return False
 
+        # inspect_and_prepare_form() returns False when the application
+        # reaches manual review because AUTO_SUBMIT is disabled or when
+        # required information needs human review. The current form flow
+        # explicitly reports READY_FOR_REVIEW in that case.
+        #
+        # Record READY_FOR_REVIEW immediately so duplicate protection can
+        # prevent the same job from being opened again on a later run.
         LAST_APPLICATION_RESULT = (
             "READY_FOR_REVIEW"
         )
+
+        record_application_status(
+            job,
+            "READY_FOR_REVIEW"
+        )
+
+        print()
+        print("Application tracker updated: READY_FOR_REVIEW")
+
         return False
 
 
