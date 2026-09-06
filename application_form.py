@@ -984,67 +984,146 @@ def _radio_question_text(group_container):
         return ""
 
 
+
+
+
 def _choose_safe_radio_answer(question, answers):
+    """
+    Return a safe answer only when the question matches a known profile rule.
+
+    Unknown questions return None and are handled by the required-question
+    safety gate. No answer is guessed.
+    """
     q = (question or "").lower()
-    normalized = [(a, (a or "").strip().lower()) for a in answers]
+
+    normalized = [
+        (a, (a or "").strip().lower())
+        for a in answers
+    ]
 
     def find(value):
         value = value.lower()
+
         for label, low in normalized:
             if low == value:
                 return label
+
         for label, low in normalized:
             if value in low:
                 return label
+
         return None
 
     if any(x in q for x in [
-        "authorized to work", "legally authorized", "right to work",
-        "eligible to work", "work authorization"
+        "authorized to work",
+        "legally authorized",
+        "right to work",
+        "eligible to work",
+        "work authorization"
     ]):
         return find(WORK_AUTHORIZED)
-    if any(x in q for x in ["work permit", "valid permit", "permit for india"]):
-        return find(WORK_PERMIT)
+
     if any(x in q for x in [
-        "require sponsorship", "need sponsorship", "future sponsorship",
-        "visa sponsorship", "sponsor now", "sponsor in the future"
+        "work permit",
+        "valid permit",
+        "permit for india"
+    ]):
+        return find(WORK_PERMIT)
+
+    if any(x in q for x in [
+        "require sponsorship",
+        "need sponsorship",
+        "future sponsorship",
+        "visa sponsorship",
+        "sponsor now",
+        "sponsor in the future"
     ]):
         return find(REQUIRES_SPONSORSHIP)
+
     if any(x in q for x in [
-        "willing to relocate", "willingness to relocate",
-        "relocate for the role", "relocation"
+        "willing to relocate",
+        "willingness to relocate",
+        "relocate for the role",
+        "relocation"
     ]):
         return find(WILLING_TO_RELOCATE)
-    if any(x in q for x in ["onsite", "on-site", "on site", "hybrid", "work from office"]):
+
+    if any(x in q for x in [
+        "onsite",
+        "on-site",
+        "on site",
+        "hybrid",
+        "work from office"
+    ]):
         return find(WILLING_ONSITE)
+
     if "internship" in q:
         return find(INTERNSHIP_EXPERIENCE)
+
     if any(x in q for x in [
-        "bachelor's degree", "bachelors degree", "bachelor degree",
+        "bachelor's degree",
+        "bachelors degree",
+        "bachelor degree",
         "completed the following level of education"
     ]):
         return find(BACHELORS_COMPLETED)
+
     if any(x in q for x in [
-        "are you a fresher", "are you fresher", "fresher?",
-        "fresh graduate", "recent graduate"
+        "are you a fresher",
+        "are you fresher",
+        "fresher?",
+        "fresh graduate",
+        "recent graduate"
     ]):
         return find(FRESHER)
-    if "professional experience" in q or "previous professional experience" in q:
+
+    # Known LinkedIn Yes/No question:
+    # "Paste a link to code you have written*"
+    if any(x in q for x in [
+        "paste a link to code",
+        "link to code you have written",
+        "code you have written"
+    ]):
+        return find("Yes")
+
+    if (
+        "professional experience" in q
+        or "previous professional experience" in q
+    ):
         return find("No")
-    if any(x in q for x in ["years of experience", "years experience"]):
+
+    if any(x in q for x in [
+        "years of experience",
+        "years experience"
+    ]):
         for label, low in normalized:
-            if re.search(r"(^|\D)0(\D|$)", low) or "no experience" in low or "fresher" in low:
+            if (
+                re.search(r"(^|\D)0(\D|$)", low)
+                or "no experience" in low
+                or "fresher" in low
+            ):
                 return label
+
             if "less than 1" in low or "0-1" in low:
                 return label
+
     if "shift" in q:
         return find(SHIFT_COMFORT)
+
     if "weekend" in q:
         return find(WEEKEND_COMFORT)
+
     if "disab" in q:
         return find(DISABILITY)
-    if "criminal" in q or "conviction" in q or "offense" in q or "offence" in q:
+
+    if (
+        "criminal" in q
+        or "conviction" in q
+        or "offense" in q
+        or "offence" in q
+    ):
         return find(CRIMINAL_HISTORY)
+
     return None
 
 
