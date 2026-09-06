@@ -412,12 +412,149 @@ def find_easy_apply_button(page):
 
     Priority:
       1. Explicit Easy Apply control.
-      2. LinkedIn's accessibility label "LinkedIn Apply to this job".
-      3. A generic Apply control only when exactly ONE visible Apply
-         control exists on the page.
+      2. Exact LinkedIn accessibility label.
+      3. Unique generic Apply control.
 
-    This prevents clicking Apply buttons belonging to recommended jobs.
+    Never clicks or guesses external application controls.
     """
+
+    # -------------------------------------------------------
+    # 1. Explicit Easy Apply
+    # -------------------------------------------------------
+    try:
+        easy_apply = page.locator(
+            "[aria-label*='Easy Apply' i], "
+            "[title*='Easy Apply' i]"
+        ).filter(has_text="Apply")
+
+        for i in range(easy_apply.count()):
+            candidate = easy_apply.nth(i)
+
+            if candidate.is_visible():
+                print("Explicit Easy Apply control found.")
+                return candidate
+
+    except Exception:
+        pass
+
+    # -------------------------------------------------------
+    # 2. EXACT LinkedIn Apply control
+    # -------------------------------------------------------
+    try:
+        exact_apply = page.locator(
+            "[aria-label='LinkedIn Apply to this job' i]"
+        )
+
+        count = exact_apply.count()
+
+        print(f"LinkedIn exact Apply controls found: {count}")
+
+        for i in range(count):
+            candidate = exact_apply.nth(i)
+
+            try:
+                if candidate.is_visible() and candidate.is_enabled():
+                    print("LinkedIn Apply control found.")
+                    return candidate
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"Exact LinkedIn Apply detection error: {e}")
+
+    # -------------------------------------------------------
+    # 3. Wait briefly for LinkedIn rendering
+    # -------------------------------------------------------
+    try:
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    try:
+        exact_apply = page.locator(
+            "[aria-label='LinkedIn Apply to this job' i]"
+        )
+
+        count = exact_apply.count()
+
+        print(
+            f"LinkedIn exact Apply controls after render: {count}"
+        )
+
+        for i in range(count):
+            candidate = exact_apply.nth(i)
+
+            try:
+                if candidate.is_visible() and candidate.is_enabled():
+                    print("LinkedIn Apply control found after render.")
+                    return candidate
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    # -------------------------------------------------------
+    # 4. Check external application indicators
+    # -------------------------------------------------------
+    try:
+        body_text = page.locator("body").inner_text().lower()
+    except Exception:
+        body_text = ""
+
+    external_signals = [
+        "apply on company website",
+        "apply on the company website",
+        "apply externally",
+        "application on company website",
+        "apply via company website",
+    ]
+
+    if any(signal in body_text for signal in external_signals):
+        print("External application detected.")
+        return None
+
+    # -------------------------------------------------------
+    # 5. Generic Apply fallback — ONLY when unique
+    # -------------------------------------------------------
+    apply_candidates = []
+
+    try:
+        elements = page.locator(
+            "button, [role='button'], a"
+        )
+
+        for i in range(elements.count()):
+            element = elements.nth(i)
+
+            try:
+                if not element.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                text = (element.inner_text() or "").strip().lower()
+            except Exception:
+                text = ""
+
+            if text == "apply":
+                apply_candidates.append(element)
+
+    except Exception:
+        pass
+
+    if len(apply_candidates) == 1:
+        print("Unique LinkedIn Apply control found.")
+        return apply_candidates[0]
+
+    if len(apply_candidates) > 1:
+        print(
+            f"Found {len(apply_candidates)} generic Apply controls; "
+            "refusing to guess."
+        )
+
+    return None
 
     def visible(element):
         try:
@@ -868,6 +1005,104 @@ def record_application_status(job, status):
 
 
 # ---------------------------------------
+# Duplicate Application Protection
+# ---------------------------------------
+
+def _normalize_application_url(value):
+    """Normalize a job URL for duplicate comparison."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+
+    # Ignore query strings/fragments and harmless trailing slashes.
+    text = text.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    return text
+
+
+def _linkedin_job_id(value):
+    """Extract a LinkedIn numeric job id when one is present."""
+    text = str(value or "")
+    match = re.search(r"linkedin\.com/jobs/view/(\d+)", text, re.I)
+    return match.group(1) if match else ""
+
+
+DUPLICATE_PROTECTED_STATUSES = {
+    "APPLIED",
+    "READY_FOR_REVIEW",
+    "INELIGIBLE",
+    "LOGIN_REQUIRED",
+}
+
+
+def get_existing_application_status(job, normalized_link=None):
+    """
+    Return the existing protected application status for a job.
+
+    Matching order:
+      1. LinkedIn numeric job id
+      2. normalized LinkedIn URL
+      3. exact Title + Company when the tracker URL is blank
+
+    Returns an empty string when no existing tracker record is found.
+    """
+    if not os.path.exists(TRACKER_FILE):
+        return ""
+
+    job_link = normalized_link or _normalize_application_url(
+        job.get("Link", "")
+    )
+    job_id = _linkedin_job_id(job_link)
+    job_title = (job.get("Title") or "").strip().casefold()
+    job_company = (job.get("Company") or "").strip().casefold()
+
+    try:
+        with open(
+            TRACKER_FILE,
+            "r",
+            encoding="utf-8",
+            newline=""
+        ) as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        # A tracker read failure must never silently cause an application.
+        print(f"Could not read application tracker for duplicate check: {e}")
+        return ""
+
+    for row in rows:
+        row_status_values = {
+            (row.get("Status") or "").strip().upper(),
+            (row.get("Application Status") or "").strip().upper(),
+        }
+        protected_statuses = row_status_values & DUPLICATE_PROTECTED_STATUSES
+        if not protected_statuses:
+            continue
+
+        row_link = _normalize_application_url(
+            row.get("Link") or row.get("URL") or ""
+        )
+        row_id = _linkedin_job_id(row_link)
+
+        # Strongest match: LinkedIn job id.
+        if job_id and row_id and job_id == row_id:
+            return sorted(protected_statuses)[0]
+
+        # Next: normalized URL.
+        if job_link and row_link and job_link == row_link:
+            return sorted(protected_statuses)[0]
+
+        # Fallback only for tracker rows with no URL.
+        # This handles older READY_FOR_REVIEW records whose Link field is blank.
+        if not row_link and job_title and job_company:
+            row_title = (row.get("Title") or "").strip().casefold()
+            row_company = (row.get("Company") or "").strip().casefold()
+
+            if row_title == job_title and row_company == job_company:
+                return sorted(protected_statuses)[0]
+
+    return ""
+
+
+# ---------------------------------------
 # Open Easy Apply
 # ---------------------------------------
 
@@ -889,6 +1124,28 @@ def open_easy_apply(job):
     if not link:
         print("Job URL not found.")
         LAST_APPLICATION_RESULT = "FAILED"
+        return False
+
+    # ---------------------------------------
+    # Duplicate application safety gate
+    # ---------------------------------------
+    existing_status = get_existing_application_status(
+        job,
+        normalized_link=_normalize_application_url(link),
+    )
+
+    if existing_status:
+        print()
+        print("=" * 70)
+        print("DUPLICATE APPLICATION DETECTED")
+        print("=" * 70)
+        print(f"Title   : {job.get('Title', '')}")
+        print(f"Company : {job.get('Company') or 'Not available'}")
+        print(f"Status  : {existing_status}")
+        print()
+        print("Skipping this job.")
+        print("No browser navigation performed.")
+        LAST_APPLICATION_RESULT = "DUPLICATE"
         return False
 
     print()
@@ -1699,9 +1956,25 @@ def open_easy_apply(job):
             LAST_APPLICATION_RESULT = "FAILED"
             return False
 
+        # inspect_and_prepare_form() returns False when the application
+        # reaches manual review because AUTO_SUBMIT is disabled or when
+        # required information needs human review. The current form flow
+        # explicitly reports READY_FOR_REVIEW in that case.
+        #
+        # Record READY_FOR_REVIEW immediately so duplicate protection can
+        # prevent the same job from being opened again on a later run.
         LAST_APPLICATION_RESULT = (
             "READY_FOR_REVIEW"
         )
+
+        record_application_status(
+            job,
+            "READY_FOR_REVIEW"
+        )
+
+        print()
+        print("Application tracker updated: READY_FOR_REVIEW")
+
         return False
 
 
