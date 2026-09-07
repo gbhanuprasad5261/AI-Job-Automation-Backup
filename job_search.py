@@ -425,157 +425,43 @@ def extract_job_title(page):
 # =======================================
 
 def detect_easy_apply(page):
+    """Detect a real, visible LinkedIn Easy Apply control.
 
+    This intentionally does NOT treat ordinary "Apply" buttons or text in
+    the job description as Easy Apply. LinkedIn can mention Easy Apply in
+    descriptions even when the actual application is external.
     """
-    Detect whether the current LinkedIn job
-    supports LinkedIn Easy Apply.
-
-    LinkedIn may display the visible button
-    simply as "Apply", so button text alone
-    is NOT enough.
-
-    We use:
-
-    1. Explicit "Easy Apply" text
-    2. Job description mentioning
-       "Easy Apply button"
-    3. Reject explicit external application
-    4. Inspect visible controls
-    """
-
-    try:
-
-        body = (
-            page.locator(
-                "body"
-            ).inner_text()
-        )
-
-    except Exception:
-
-        return False
-
-    body_lower = body.lower()
-
-    # ---------------------------------------
-    # External application signals
-    # ---------------------------------------
-
-    external_signals = [
-
-        "apply on company website",
-
-        "apply on the company website",
-
-        "apply externally",
-
-        "application on company website",
-
-        "apply via company website"
-    ]
-
-    for signal in external_signals:
-
-        if signal in body_lower:
-
-            return False
-
-    # ---------------------------------------
-    # Strong Easy Apply signals
-    # ---------------------------------------
-
-    strong_signals = [
-
-        "easy apply button",
-
-        "easy apply",
-
-        "apply through the easy apply button",
-
-        "submit your application through the easy apply button"
-    ]
-
-    for signal in strong_signals:
-
-        if signal in body_lower:
-
-            return True
-
-    # ---------------------------------------
-    # Inspect visible controls
-    # ---------------------------------------
-
     selectors = [
-
-        "button",
-
-        "[role='button']",
-
-        "a"
+        "[aria-label*='LinkedIn Apply to this job' i]",
+        "button[aria-label*='Easy Apply' i]",
+        "[role='button'][aria-label*='Easy Apply' i]",
+        "button[title*='Easy Apply' i]",
+        "[role='button'][title*='Easy Apply' i]",
+        "button:has-text('Easy Apply')",
+        "[role='button']:has-text('Easy Apply')",
     ]
 
     for selector in selectors:
-
         try:
-
-            elements = page.locator(
-                selector
-            )
-
+            elements = page.locator(selector)
             count = elements.count()
-
             for index in range(count):
-
-                try:
-
-                    element = elements.nth(
-                        index
-                    )
-
-                    if not element.is_visible():
-                        continue
-
-                    text = (
-                        element
-                        .inner_text()
-                        .strip()
-                        .lower()
-                    )
-
-                    aria = (
-                        element
-                        .get_attribute(
-                            "aria-label"
-                        )
-                        or ""
-                    ).lower()
-
-                    title = (
-                        element
-                        .get_attribute(
-                            "title"
-                        )
-                        or ""
-                    ).lower()
-
-                    combined = (
-                        text
-                        + " "
-                        + aria
-                        + " "
-                        + title
-                    )
-
-                    if "easy apply" in combined:
-
-                        return True
-
-                except Exception:
-
+                element = elements.nth(index)
+                if not element.is_visible():
                     continue
 
-        except Exception:
+                text = (element.inner_text() or "").strip().lower()
+                aria = (element.get_attribute("aria-label") or "").strip().lower()
+                title = (element.get_attribute("title") or "").strip().lower()
+                combined = f"{text} {aria} {title}"
 
+                # The exact LinkedIn Apply control is a strong positive signal.
+                if "linkedin apply to this job" in aria:
+                    return True
+
+                if "easy apply" in combined:
+                    return True
+        except Exception:
             continue
 
     return False
