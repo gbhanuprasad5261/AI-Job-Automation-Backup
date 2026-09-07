@@ -6,6 +6,21 @@ import re
 from application_form import inspect_and_prepare_form
 from playwright.sync_api import sync_playwright
 
+# ---------------------------------------
+# Configuration
+# ---------------------------------------
+# These constants are required by the tracker, recommendation,
+# duplicate-protection, and browser functions below.
+ANALYSIS_FILE = "data/job_analysis.csv"
+TRACKER_FILE = "data/application_tracker.csv"
+
+MIN_MATCH_SCORE = int(os.getenv("MIN_MATCH_SCORE", "70"))
+
+CHROME_CDP_URL = os.getenv(
+    "CHROME_CDP_URL",
+    "http://127.0.0.1:9222",
+)
+
 try:
     from external_apply import (
         external_apply,
@@ -21,99 +36,72 @@ except ImportError:
 
 
 def get_external_profile():
-    """
-    Load external-application profile information.
+    """Load the same profile used by LinkedIn Easy Apply.
 
-    Supports both the names used by the current config/env setup:
-      FULL_NAME / EMAIL / PHONE
-    and the legacy:
-      JOB_NAME / JOB_EMAIL / JOB_PHONE
-
-    Resume path is optional and is taken from RESUME_PATH when configured.
+    Environment variables take precedence, then config.py, then
+    application_form.py defaults. This keeps external ATS and LinkedIn
+    applications on one candidate profile.
     """
     try:
         import config as _config
     except Exception:
         _config = None
 
-    name = (
-        os.getenv("FULL_NAME")
-        or os.getenv("JOB_NAME")
-        or (
-            getattr(_config, "FULL_NAME", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_NAME", "")
-            if _config is not None
-            else ""
-        )
-        or ""
+    try:
+        import application_form as _form
+    except Exception:
+        _form = None
+
+    def pick(env_names, config_names, form_names):
+        for key in env_names:
+            value = os.getenv(key)
+            if value:
+                return value
+
+        if _config is not None:
+            for key in config_names:
+                value = getattr(_config, key, "")
+                if value:
+                    return value
+
+        if _form is not None:
+            for key in form_names:
+                value = getattr(_form, key, "")
+                if value:
+                    return value
+
+        return ""
+
+    name = pick(
+        ["FULL_NAME", "JOB_NAME", "APPLICANT_NAME"],
+        ["FULL_NAME", "JOB_NAME", "APPLICANT_NAME"],
+        ["APPLICANT_NAME"],
     )
 
-    email = (
-        os.getenv("EMAIL")
-        or os.getenv("JOB_EMAIL")
-        or (
-            getattr(_config, "EMAIL", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_EMAIL", "")
-            if _config is not None
-            else ""
-        )
-        or ""
+    email = pick(
+        ["EMAIL", "JOB_EMAIL", "APPLICANT_EMAIL"],
+        ["EMAIL", "JOB_EMAIL", "APPLICANT_EMAIL"],
+        ["EMAIL"],
     )
 
-    phone = (
-        os.getenv("PHONE")
-        or os.getenv("JOB_PHONE")
-        or (
-            getattr(_config, "PHONE", "")
-            if _config is not None
-            else ""
-        )
-        or (
-            getattr(_config, "JOB_PHONE", "")
-            if _config is not None
-            else ""
-        )
-        or ""
+    phone = pick(
+        ["PHONE", "JOB_PHONE", "APPLICANT_PHONE"],
+        ["PHONE", "JOB_PHONE", "APPLICANT_PHONE"],
+        ["PHONE"],
     )
 
-    resume_path = (
-        os.getenv("RESUME_PATH")
-        or (
-            getattr(_config, "RESUME_PATH", "")
-            if _config is not None
-            else ""
+    resume_path = pick(
+        ["RESUME_PATH"],
+        ["RESUME_PATH"],
+        ["RESUME_PATH"],
+    )
+
+    if not resume_path:
+        resume_path = os.path.abspath(
+            os.path.join("resume", "resume.pdf")
         )
-        or ""
-    )
 
-    return (
-        resume_path,
-        name,
-        email,
-        phone,
-    )
-
-
-# ---------------------------------------
-# Configuration
-# ---------------------------------------
-
-ANALYSIS_FILE = "data/job_analysis.csv"
-TRACKER_FILE = "data/application_tracker.csv"
-
-MIN_MATCH_SCORE = 70
-
-CHROME_CDP_URL = "http://127.0.0.1:9222"
-
-LAST_APPLICATION_RESULT = ""
+    return resume_path, name, email, phone
 
 
 # ---------------------------------------
@@ -145,16 +133,45 @@ def get_application_statuses():
     """
     Return tracker statuses keyed by LinkedIn job ID when possible,
     with a title fallback for legacy rows.
+
+    If Status and Application Status disagree, a protected/terminal
+    status takes precedence so READY_FOR_REVIEW cannot be downgraded
+    to NOT APPLIED.
     """
     tracker = load_csv(TRACKER_FILE)
     statuses = {}
 
+    protected_statuses = {
+        "APPLIED",
+        "READY_FOR_REVIEW",
+        "INELIGIBLE",
+        "LOGIN_REQUIRED",
+    }
+
+    def resolve_status(row):
+        values = []
+
+        for field in ("Status", "Application Status"):
+            value = (
+                row.get(field) or ""
+            ).strip().upper()
+
+            if value:
+                values.append(value)
+
+        # A protected status always wins over NOT APPLIED.
+        for value in values:
+            if value in protected_statuses:
+                return value
+
+        if values:
+            return values[0]
+
+        return "NOT APPLIED"
+
     for row in tracker:
-        status = (
-            row.get("Status")
-            or row.get("Application Status")
-            or "NOT APPLIED"
-        ).strip().upper()
+
+        status = resolve_status(row)
 
         link = (
             row.get("Link")
@@ -168,7 +185,16 @@ def get_application_statuses():
         )
 
         if match:
-            statuses[f"id:{match.group(1)}"] = status
+            key = f"id:{match.group(1)}"
+
+            existing = statuses.get(key)
+
+            if (
+                existing is None
+                or existing == "NOT APPLIED"
+                or status in protected_statuses
+            ):
+                statuses[key] = status
 
         title = (
             row.get("Title")
@@ -176,16 +202,28 @@ def get_application_statuses():
         ).strip().lower()
 
         if title:
-            statuses.setdefault(
-                f"title:{title}",
-                status
-            )
+            key = f"title:{title}"
+
+            existing = statuses.get(key)
+
+            if (
+                existing is None
+                or existing == "NOT APPLIED"
+                or status in protected_statuses
+            ):
+                statuses[key] = status
 
     return statuses
 
 
 def get_job_application_status(job, statuses=None):
-    """Get a job's status using LinkedIn job ID first."""
+    """
+    Get a job's application status.
+
+    Matching order:
+      1. LinkedIn job ID
+      2. Title fallback when the job ID is not present
+    """
     if statuses is None:
         statuses = get_application_statuses()
 
@@ -199,21 +237,25 @@ def get_job_application_status(job, statuses=None):
     )
 
     if match:
-        return statuses.get(
-            f"id:{match.group(1)}",
-            "NOT APPLIED"
+        status = statuses.get(
+            f"id:{match.group(1)}"
         )
+
+        if status:
+            return status
 
     title = (
         job.get("Title")
         or ""
     ).strip().lower()
 
-    return statuses.get(
-        f"title:{title}",
-        "NOT APPLIED"
-    )
+    if title:
+        return statuses.get(
+            f"title:{title}",
+            "NOT APPLIED"
+        )
 
+    return "NOT APPLIED"
 
 # ---------------------------------------
 # Select Recommended Jobs
@@ -959,6 +1001,13 @@ def record_application_status(job, status):
 
             if title_match and company_match:
                 row["Status"] = status
+
+                if "Application Status" in fieldnames:
+                    row["Application Status"] = status
+
+                if status.strip().upper() == "APPLIED" and "Applied Date" in fieldnames:
+                    row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+
                 updated = True
                 break
 
@@ -972,6 +1021,15 @@ def record_application_status(job, status):
             new_row["Company"] = job.get("Company", "")
             new_row["Location"] = job.get("Location", "")
             new_row["Status"] = status
+
+            if "Application Status" in fieldnames:
+                new_row["Application Status"] = status
+
+            if status.strip().upper() == "APPLIED" and "Applied Date" in fieldnames:
+                new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+
+            if "Link" in fieldnames:
+                new_row["Link"] = job.get("Link", "")
 
             if "URL" in fieldnames:
                 new_row["URL"] = job.get("URL", "")
@@ -1241,6 +1299,12 @@ def open_easy_apply(job):
         # --------------------------------------------------
         # External application detection
         # --------------------------------------------------
+        # Always initialize this before the external-control branch.
+        # LinkedIn may open an external ATS in a new tab, or navigate
+        # the current tab.  Without this initialization, the branch
+        # that clicks "Apply on company website" can raise:
+        #     name 'external_page' is not defined
+        external_page = None
         external_url = ""
 
         if find_external_apply_link is not None:
@@ -1357,7 +1421,7 @@ def open_easy_apply(job):
 
             try:
                 elements = page.locator(
-                    "a[href], button, [role='button'], span, p"
+                   "a[href], button, [role='button'], [role='link']"
                 )
 
                 for i in range(elements.count()):
@@ -2023,6 +2087,9 @@ def main():
     print(f"Confirmed applications today: {already_applied}")
     print(f"Remaining applications today: {remaining_today}")
 
+    if daily_limit == 1:
+        print("Testing mode            : ON (stop after first real attempt)")
+
     if remaining_today <= 0:
         print("Daily application limit reached.")
         return
@@ -2077,6 +2144,18 @@ def main():
         # the result is known (READY_FOR_REVIEW, INELIGIBLE, etc.).
         result = globals().get("LAST_APPLICATION_RESULT", "UNKNOWN")
         print(f"Result: {result}")
+
+        # During the current 1-job testing phase, stop after the first
+        # non-duplicate real application attempt.  This prevents a single
+        # test run from opening several external ATS/application pages.
+        #
+        # A DUPLICATE result is different: no browser navigation occurred,
+        # so it is safe to continue looking for another job.
+        if daily_limit == 1 and result != "DUPLICATE":
+            print()
+            print("TEST MODE: first real application attempt completed.")
+            print("Stopping before trying another job.")
+            break
 
         if index + 1 < len(jobs):
             print("Trying next eligible job...")
