@@ -7,6 +7,7 @@ unknown questions must never be guessed.
 
 import os
 import re
+import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.sync_api import Page
@@ -128,31 +129,106 @@ def find_external_apply_link(page: Page) -> str:
 
 
 def check_external_eligibility(page: Page) -> str:
-    """Return INELIGIBLE only for an explicit numeric minimum above candidate experience."""
+    """
+    Return INELIGIBLE only when the page contains an explicit
+    numeric minimum experience requirement above the candidate's
+    experience.
+
+    Supported examples:
+        Minimum 1 year
+        1+ years experience
+        1 year experience required
+        Work Experience: 1 - 2 Years
+        Work Experience 1 to 2 Years
+        Experience: 2-4 years
+
+    Generic mentions of "experience" are not treated as requirements.
+    """
+
     body = _text(page)
     lower = body.lower()
 
-    # Do not interpret generic words such as 'experience' as a requirement.
+    # Candidate is a fresher / 0 years.
+    candidate_years = 0
+
+    # --------------------------------------------------
+    # Explicit minimum/range experience requirements
+    # --------------------------------------------------
+    minimum_years = []
+
     patterns = [
-        r"(?:minimum|required|at least|minimum of)\D{0,60}(\d+)\+?\s*years?",
-        r"(\d+)\+?\s*years?\s*(?:of\s*)?(?:professional\s*)?experience\s*(?:required|minimum|needed)",
+        # Examples:
+        # "minimum 1 year"
+        # "minimum of 2 years"
+        # "at least 1 year"
+        # "required 2 years"
+        r"(?:minimum|required|at\s+least|minimum\s+of)"
+        r"\D{0,60}"
+        r"(\d+)\+?\s*years?",
+
+        # Examples:
+        # "1+ years of experience"
+        # "2 years professional experience required"
+        r"(\d+)\+?\s*years?\s*"
+        r"(?:of\s*)?"
+        r"(?:professional\s*)?"
+        r"experience\s*(?:required|minimum|needed)",
+
+        # Examples:
+        # "Work Experience 1 - 2 Years"
+        # "Work Experience: 1 to 2 Years"
+        # "Experience 2-4 Years"
+        #
+        # IMPORTANT:
+        # For a range, the FIRST number is the minimum.
+        r"(?:work\s+experience|experience)"
+        r"\s*(?::|-)?\s*"
+        r"(\d+)\s*"
+        r"(?:-|–|—|to)\s*"
+        r"(\d+)\s*years?",
+
+        # Examples:
+        # "Work Experience: 1 Years"
+        # "Experience: 2 Years"
+        r"(?:work\s+experience|experience)"
+        r"\s*(?::|-)?\s*"
+        r"(\d+)\+?\s*years?",
     ]
-    years = []
+
     for pattern in patterns:
         for match in re.finditer(pattern, lower):
             try:
-                years.append(int(match.group(1)))
-            except ValueError:
+                # For a range, group 1 is the minimum.
+                minimum = int(match.group(1))
+                minimum_years.append(minimum)
+            except (ValueError, IndexError):
                 pass
 
-    candidate_years = 0
-    if any(year > candidate_years for year in years):
-        required = max(years)
-        print(f"External requirement : {required}+ years")
+    # --------------------------------------------------
+    # Compare against candidate experience
+    # --------------------------------------------------
+    if any(year > candidate_years for year in minimum_years):
+        required = max(minimum_years)
+
+        print(
+            f"External requirement : {required}+ years"
+        )
+        print(
+            f"Candidate experience : {candidate_years} years"
+        )
+        print(
+            "External eligibility  : INELIGIBLE"
+        )
+
         return "INELIGIBLE"
 
-    print("External requirement  : Not specified")
-    print("No explicit minimum experience requirement detected.")
+    print(
+        "External requirement  : Not specified"
+    )
+    print(
+        "No explicit minimum experience requirement detected."
+    )
+
     return "UNKNOWN"
 
 
@@ -733,6 +809,178 @@ def _required_empty_count(page: Page) -> int:
 
     return count
 
+
+def _wait_for_manual_consent(page: Page, detection_timeout_ms=3000, wait_timeout_ms=120000) -> bool:
+    """
+    Detect a visible privacy/consent modal and wait for the human user
+    to complete it.
+
+    IMPORTANT:
+    This function NEVER clicks Agree/Accept/Consent.
+    If no consent modal is detected, it returns immediately so normal
+    ATS pages continue without delay.
+    """
+
+    consent_phrases = (
+        "data privacy agreement",
+        "privacy agreement",
+        "privacy notice",
+        "privacy policy",
+        "terms specified",
+        "terms and conditions",
+        "consent agreement",
+    )
+
+    agree_phrases = (
+        "i agree",
+        "agree",
+        "accept",
+        "consent",
+    )
+
+    def find_consent_dialog():
+        try:
+            dialogs = page.locator(
+                "dialog, [role='dialog'], [aria-modal='true']"
+            )
+
+            for i in range(dialogs.count()):
+                dialog = dialogs.nth(i)
+
+                try:
+                    if not dialog.is_visible():
+                        continue
+
+                    text = (
+                        dialog.inner_text() or ""
+                    ).strip().lower()
+
+                    if not text:
+                        continue
+
+                    has_consent_text = any(
+                        phrase in text
+                        for phrase in consent_phrases
+                    )
+
+                    if not has_consent_text:
+                        continue
+
+                    buttons = dialog.locator(
+                        "button, [role='button'], "
+                        "input[type='button'], input[type='submit']"
+                    )
+
+                    for j in range(buttons.count()):
+                        button = buttons.nth(j)
+
+                        try:
+                            if not button.is_visible():
+                                continue
+
+                            button_text = (
+                                button.inner_text() or ""
+                            ).strip().lower()
+
+                            aria = (
+                                button.get_attribute("aria-label")
+                                or ""
+                            ).strip().lower()
+
+                            title = (
+                                button.get_attribute("title")
+                                or ""
+                            ).strip().lower()
+
+                            combined = (
+                                f"{button_text} {aria} {title}"
+                            )
+
+                            if any(
+                                phrase in combined
+                                for phrase in agree_phrases
+                            ):
+                                return dialog
+
+                        except Exception:
+                            continue
+
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return None
+
+    # Give a dynamically-rendered consent modal a short opportunity
+    # to appear. If none appears, this is a normal ATS page.
+    detection_deadline = (
+        time.time() + detection_timeout_ms / 1000
+    )
+
+    while time.time() < detection_deadline:
+        dialog = find_consent_dialog()
+
+        if dialog is not None:
+            print()
+            print("=" * 70)
+            print("PRIVACY / CONSENT AGREEMENT DETECTED")
+            print("=" * 70)
+            print()
+            print(
+                "A privacy or consent agreement requires human action."
+            )
+            print()
+            print(
+                "Please review the agreement and click the "
+                "appropriate button yourself."
+            )
+            print()
+            print(
+                'Automation will NOT click "I Agree" / "Accept".'
+            )
+            print()
+            print("Waiting for manual consent...")
+
+            wait_deadline = (
+                time.time() + wait_timeout_ms / 1000
+            )
+
+            while time.time() < wait_deadline:
+                if find_consent_dialog() is None:
+                    print()
+                    print("Manual consent completed.")
+                    print(
+                        "Continuing application preparation..."
+                    )
+                    return True
+
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    time.sleep(0.5)
+
+            print()
+            print("=" * 70)
+            print("MANUAL CONSENT TIMEOUT")
+            print("=" * 70)
+            print(
+                "Consent was not completed within the "
+                "allowed waiting period."
+            )
+            print("Stopping safely.")
+            return False
+
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+
+    # No consent modal was detected. Continue normal ATS processing.
+    return True
+
+
 def prepare_external_application_page(
     page: Page,
     resume_path: str = "",
@@ -752,6 +1000,13 @@ def prepare_external_application_page(
     print(f"External ATS detected: {ats}")
     print(f"External page: {page.url}")
     print("Preparing external application page...")
+    consent_completed = _wait_for_manual_consent(page)
+
+    if not consent_completed:
+        print()
+        print("External application requires manual consent.")
+        print("No application submission was performed.")
+        return "READY_FOR_REVIEW"
 
     if ats == "GOOGLE_FORMS":
         return _prepare_google_form(
