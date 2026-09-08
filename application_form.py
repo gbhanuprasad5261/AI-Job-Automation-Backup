@@ -1977,38 +1977,81 @@ def move_to_next_page(page: Page):
         print("No safe LinkedIn application navigation control was detected.")
         return False
 
+    print(f"Navigation control: {_control_text(button)}")
+
+    # ------------------------------------------------------------
+    # Attempt 1: normal Playwright click
+    # ------------------------------------------------------------
     try:
-        print(f"Navigation control: {_control_text(button)}")
         button.scroll_into_view_if_needed()
         page.wait_for_timeout(300)
         button.click(timeout=10000)
-    except Exception as e:
-        print(f"Could not click navigation button: {e}")
-        return False
+        print("Next button clicked normally.")
+    except Exception as normal_error:
+        print(f"Normal Next click failed: {normal_error}")
+        print("Trying safe fallback click...")
 
+        # --------------------------------------------------------
+        # Attempt 2: DOM click fallback
+        #
+        # This is ONLY for application navigation.
+        # It is NOT used for final Submit.
+        # --------------------------------------------------------
+        try:
+            button.evaluate("(element) => element.click()")
+            print("Fallback Next click completed.")
+        except Exception as fallback_error:
+            print(f"Fallback Next click failed: {fallback_error}")
+            return False
+
+    # ------------------------------------------------------------
+    # Verify that the application actually advanced
+    # ------------------------------------------------------------
     for _ in range(30):
         page.wait_for_timeout(500)
+
         after = get_application_step(page)
 
-        if before and after and after[1] == before[1] and after[0] > before[0]:
-            print(f"Moved to next application page: {after[0]}/{after[1]}")
+        # Strong validation: application step increased.
+        if (
+            before
+            and after
+            and after[1] == before[1]
+            and after[0] > before[0]
+        ):
+            print(
+                f"Moved to next application page: "
+                f"{after[0]}/{after[1]}"
+            )
             return True
 
+        # Secondary validation: actual application form changed.
         after_fingerprint = _form_fingerprint(page)
-        if before_fingerprint and after_fingerprint and after_fingerprint != before_fingerprint:
-            # Fingerprint change is accepted only when the application container changed.
+
+        if (
+            before_fingerprint
+            and after_fingerprint
+            and after_fingerprint != before_fingerprint
+        ):
             print("Application form content changed after navigation.")
             return True
 
+    # ------------------------------------------------------------
+    # Navigation did not actually advance
+    # ------------------------------------------------------------
     current = get_application_step(page)
+
     print()
     print("=" * 70)
     print("APPLICATION PAGE DID NOT ADVANCE")
     print("=" * 70)
+
     if before:
         print(f"Before: {before[0]}/{before[1]}")
+
     if current:
         print(f"After : {current[0]}/{current[1]}")
+
     print("Stopping safely instead of clicking navigation repeatedly.")
     return False
 
