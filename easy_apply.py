@@ -745,6 +745,10 @@ def record_application_status(job, status):
             if "URL" in fieldnames:
                 new_row["URL"] = job.get("URL", "")
 
+            if status == "APPLIED" and "Applied Date" in fieldnames:
+                from datetime import datetime
+                new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+
             rows.append(new_row)
 
         with open(
