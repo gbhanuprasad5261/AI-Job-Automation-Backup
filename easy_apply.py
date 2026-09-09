@@ -3,6 +3,11 @@ import os
 import re
 
 from application_form import inspect_and_prepare_form
+from external_app import (
+    find_external_apply_link,
+    check_external_eligibility,
+    prepare_external_application_page,
+)
 from playwright.sync_api import sync_playwright
 
 
@@ -14,7 +19,8 @@ ANALYSIS_FILE = "data/job_analysis.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 
 MIN_MATCH_SCORE = 70
-MAX_APPLICATIONS_PER_RUN = 15
+MAX_APPLICATIONS_PER_RUN = 1
+MAX_CANDIDATE_JOBS_PER_RUN = 10
 
 ALLOWED_LOCATION_KEYWORDS = (
     "bengaluru",
@@ -156,7 +162,9 @@ def get_recommended_jobs():
         reverse=True
     )
 
-    return recommended[:MAX_APPLICATIONS_PER_RUN]
+    # Keep the application limit at 1, but retain several eligible candidates
+    # so closed/unavailable jobs can be skipped without ending the run.
+    return recommended[:MAX_CANDIDATE_JOBS_PER_RUN]
 
 
 
@@ -513,7 +521,19 @@ def is_job_closed(body_text):
 
         "This job is no longer accepting applications",
 
-        "Job is no longer accepting applications"
+        "Job is no longer accepting applications",
+
+        "Not currently accepting applications",
+
+        "This job is not currently accepting applications",
+
+        "No longer accepting applications for this job",
+
+        "applications are no longer being accepted",
+
+        "applications are currently closed",
+
+        "job applications are closed"
     ]
 
     text = body_text.lower()
@@ -997,6 +1017,81 @@ def open_easy_apply(job):
 
         if easy_apply is None:
 
+            # -------------------------------------------------------
+            # External ATS fallback
+            # -------------------------------------------------------
+            # The CSV Easy Apply value is not trusted as proof of the
+            # current application route. We inspect the live LinkedIn
+            # page for a real external application destination.
+            if ALLOW_EXTERNAL_APPLICATIONS:
+                print()
+                print("Searching for external application link...")
+
+                external_link = find_external_apply_link(page)
+
+                if external_link:
+                    print()
+                    print("=" * 70)
+                    print("EXTERNAL APPLICATION FOUND")
+                    print("=" * 70)
+                    print(f"External URL: {external_link}")
+
+                    eligibility = check_external_eligibility(page)
+
+                    if eligibility == "INELIGIBLE":
+                        print()
+                        print("Skipping external application: candidate is ineligible.")
+                        return False
+
+                    try:
+                        page.goto(
+                            external_link,
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        page.wait_for_timeout(3000)
+                    except Exception as e:
+                        print()
+                        print(f"Could not open external application: {e}")
+                        return False
+
+                    print()
+                    print(f"External page title: {page.title()}")
+                    print(f"External current URL: {page.url}")
+
+                    result = prepare_external_application_page(
+                        page=page,
+                        resume_path="resume/resume.pdf",
+                        name="G Bhanu Prasad",
+                        email="gbhanuprasad1236@gmail.com",
+                        phone="9392801041",
+                        current_location="Bengaluru",
+                        current_company="N/A",
+                    )
+
+                    if result == "READY_FOR_REVIEW":
+                        print()
+                        print("=" * 70)
+                        print("EXTERNAL APPLICATION READY FOR REVIEW")
+                        print("=" * 70)
+                        print("No external submission was performed.")
+                        print("Review and submit manually if appropriate.")
+                        confirmation = input(
+                            "Did you submit the application manually? [y/N]: "
+                        ).strip().lower()
+                        if confirmation in {"y", "yes"}:
+                            if record_application_status(job, "APPLIED"):
+                                print("Manual submission confirmed: tracker marked APPLIED.")
+                            else:
+                                print("Manual submission confirmed, but tracker update failed.")
+                        else:
+                            print("Manual submission not confirmed; tracker remains unchanged.")
+                        return True
+
+                    print()
+                    print(f"External application stopped with status: {result}")
+                    return False
+
             print()
             print("=" * 70)
             print("EASY APPLY NOT FOUND")
@@ -1005,7 +1100,7 @@ def open_easy_apply(job):
             print()
             print(
                 "LinkedIn did not expose an "
-                "Easy Apply control."
+                "Easy Apply control or a usable external application link."
             )
 
             print_application_controls(

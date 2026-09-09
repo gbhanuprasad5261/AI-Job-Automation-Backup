@@ -54,6 +54,20 @@ DEGREE = os.getenv("APPLICANT_DEGREE", "B.Tech")
 FIELD_OF_STUDY = os.getenv("APPLICANT_FIELD_OF_STUDY", "Computer Science and Engineering(AI&DS)")
 UNIVERSITY = os.getenv("APPLICANT_UNIVERSITY", "Siddartha Institute of Science and Technology")
 GRADUATION_YEAR = os.getenv("GRADUATION_YEAR", "2025")
+EDUCATION_START_MONTH = os.getenv("EDUCATION_START_MONTH", "June")
+EDUCATION_START_YEAR = os.getenv("EDUCATION_START_YEAR", "2021")
+EDUCATION_END_MONTH = os.getenv("EDUCATION_END_MONTH", "April")
+EDUCATION_END_YEAR = os.getenv("EDUCATION_END_YEAR", "2025")
+
+# SSC / High School education entry. This entry is handled separately so the
+# existing B.Tech and Intermediate entries are never modified by the SSC fix.
+SSC_SCHOOL_NAME = os.getenv("SSC_SCHOOL_NAME", "Zilla Parishad High School")
+SSC_FIELD_OF_STUDY = os.getenv("SSC_FIELD_OF_STUDY", "English")
+SSC_START_MONTH = os.getenv("SSC_START_MONTH", "March")
+SSC_START_YEAR = os.getenv("SSC_START_YEAR", "2018")
+SSC_END_MONTH = os.getenv("SSC_END_MONTH", "March")
+SSC_END_YEAR = os.getenv("SSC_END_YEAR", "2019")
+
 CGPA = os.getenv("CGPA", "7.29")
 CURRENT_CTC = os.getenv("CURRENT_CTC", "0")
 EXPECTED_CTC = os.getenv("EXPECTED_CTC", "500000")
@@ -70,6 +84,10 @@ DISABILITY = os.getenv("DISABILITY", "No")
 CRIMINAL_HISTORY = os.getenv("CRIMINAL_HISTORY", "No")
 FRESHER = os.getenv("FRESHER", "Yes")
 BACHELORS_COMPLETED = os.getenv("BACHELORS_COMPLETED", "Yes")
+LINKEDIN_PROFILE_URL = os.getenv(
+    "LINKEDIN_PROFILE_URL",
+    "https://www.linkedin.com/in/g-bhanu-prasad-66ab1b225"
+)
 
 TECH_EXPERIENCE = {
     "java": "1", "spring boot": "1", "sql": "1", "mysql": "1",
@@ -587,6 +605,431 @@ def upload_resume(container):
 
 
 # ============================================================
+# Fill Education Editor
+# ============================================================
+
+def _visible_text_matches(container, text):
+    """Return visible elements whose rendered text matches exactly."""
+    matches = []
+    try:
+        locator = container.get_by_text(text, exact=True)
+        for i in range(locator.count()):
+            element = locator.nth(i)
+            if element.is_visible():
+                matches.append(element)
+    except Exception:
+        pass
+    return matches
+
+
+def _fill_labeled_input(scope, label_patterns, value):
+    """Fill an input associated with one of the supplied label patterns."""
+    if not value:
+        return False
+
+    try:
+        inputs = scope.locator("input, textarea")
+        for i in range(inputs.count()):
+            element = inputs.nth(i)
+            if not element.is_visible():
+                continue
+
+            metadata = _field_metadata(element)
+            if any(pattern in metadata for pattern in label_patterns):
+                try:
+                    current = element.input_value().strip()
+                except Exception:
+                    current = ""
+                if current == value:
+                    return True
+                element.fill(value)
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _select_custom_education_option(scope, label_patterns, value):
+    """Select a custom education dropdown only after an exact option match."""
+    if not value:
+        return False
+
+    try:
+        combos = scope.locator("[role='combobox'], button")
+        for i in range(combos.count()):
+            combo = combos.nth(i)
+            if not combo.is_visible():
+                continue
+
+            metadata = (
+                _field_metadata(combo)
+                + " "
+                + safe_text(combo).lower()
+            )
+            if not any(pattern in metadata for pattern in label_patterns):
+                continue
+
+            try:
+                current = combo.input_value().strip()
+            except Exception:
+                current = safe_text(combo).strip()
+
+            if current.lower() == value.lower():
+                return True
+
+            try:
+                combo.click(timeout=5000)
+            except Exception:
+                continue
+
+            scope.page.wait_for_timeout(300)
+
+            options = scope.page.locator(
+                "[role='option'], li[role='option'], [role='listbox'] li"
+            )
+            for j in range(options.count()):
+                option = options.nth(j)
+                if not option.is_visible():
+                    continue
+                option_text = re.sub(
+                    r"\s+", " ", safe_text(option)
+                ).strip()
+                if option_text.lower() == value.lower():
+                    try:
+                        option.click(timeout=5000)
+                        return True
+                    except Exception:
+                        try:
+                            option.evaluate("(el) => el.click()")
+                            return True
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    return False
+
+
+def _select_education_date_dropdowns(dialog, values):
+    """Select exactly the four SSC Month/Year controls in editor order.
+
+    LinkedIn renders these as custom buttons whose visible text is simply
+    ``Month`` or ``Year``.  We intentionally collect only buttons with those
+    exact visible labels, in DOM order, so unrelated controls from the B.Tech
+    or Intermediate entries cannot be touched.
+    """
+    if len(values) != 4:
+        return 0
+
+    try:
+        date_controls = []
+        buttons = dialog.locator("button")
+
+        for i in range(buttons.count()):
+            button = buttons.nth(i)
+            if not button.is_visible():
+                continue
+            text = re.sub(r"\s+", " ", safe_text(button)).strip().lower()
+            if text in {"month", "year"}:
+                date_controls.append(button)
+
+        if len(date_controls) < 4:
+            return 0
+
+        selected = 0
+
+        for button, value in zip(date_controls[:4], values):
+            current = re.sub(r"\s+", " ", safe_text(button)).strip().lower()
+            if current == value.lower():
+                selected += 1
+                continue
+
+            try:
+                button.click(timeout=5000)
+            except Exception:
+                continue
+
+            dialog.page.wait_for_timeout(250)
+
+            options = dialog.page.locator(
+                "[role='option']:visible, [role='listbox']:visible li, li[role='option']:visible"
+            )
+            matched = False
+
+            for j in range(options.count()):
+                option = options.nth(j)
+                option_text = re.sub(r"\s+", " ", safe_text(option)).strip()
+                if option_text.lower() != value.lower():
+                    continue
+
+                try:
+                    option.click(timeout=5000)
+                    matched = True
+                    break
+                except Exception:
+                    try:
+                        option.evaluate("(el) => el.click()")
+                        matched = True
+                        break
+                    except Exception:
+                        pass
+
+            if matched:
+                selected += 1
+
+        return selected
+    except Exception:
+        return 0
+
+
+def _fill_ssc_major_field(dialog, value):
+    """Fill only the SSC Major / Field of study input.
+
+    Do not use generic text-question matching here because the education
+    editor contains multiple entries and several blank text inputs.
+    """
+    if not value:
+        return False
+
+    try:
+        # First use Playwright's accessible-label association when available.
+        for pattern in [
+            re.compile(r"major\s*/\s*field of study", re.I),
+            re.compile(r"field of study", re.I),
+        ]:
+            try:
+                field = dialog.get_by_label(pattern).first
+                if field.count() > 0 and field.is_visible():
+                    field.fill(value)
+                    return True
+            except Exception:
+                pass
+
+        # Fallback: inspect visible text inputs and use their nearest label
+        # text. This is limited to the currently matched SSC dialog.
+        inputs = dialog.locator("input:not([type='hidden']):not([type='checkbox']):not([type='radio']), textarea")
+        for i in range(inputs.count()):
+            element = inputs.nth(i)
+            if not element.is_visible():
+                continue
+
+            try:
+                current = element.input_value().strip()
+            except Exception:
+                current = ""
+
+            if current == value:
+                return True
+
+            try:
+                label_text = element.evaluate("""el => {
+                    let node = el;
+                    for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                        const labels = node.querySelectorAll ? node.querySelectorAll('label') : [];
+                        for (const label of labels) {
+                            const t = (label.innerText || '').trim().toLowerCase();
+                            if (t.includes('major / field of study') || t === 'field of study') return t;
+                        }
+                    }
+                    return '';
+                }""")
+            except Exception:
+                label_text = ""
+
+            if "major / field of study" in label_text or label_text == "field of study":
+                element.fill(value)
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def _find_ssc_education_scope(page):
+    """Find the visible SSC education card by its existing school value."""
+    normalized_target = re.sub(
+        r"\s+",
+        " ",
+        SSC_SCHOOL_NAME,
+    ).strip().lower()
+
+    try:
+        fields = page.locator("input, textarea")
+
+        for i in range(fields.count()):
+            field = fields.nth(i)
+            if not field.is_visible():
+                continue
+
+            try:
+                value = field.input_value().strip()
+            except Exception:
+                value = safe_text(field).strip()
+
+            if re.sub(r"\s+", " ", value).strip().lower() != normalized_target:
+                continue
+
+            scope = field
+            for _ in range(12):
+                try:
+                    scope = scope.locator("xpath=..")
+                    if scope.count() == 0:
+                        break
+
+                    scope_text = re.sub(
+                        r"\s+",
+                        " ",
+                        safe_text(scope),
+                    ).strip().lower()
+
+                    if "major / field of study" not in scope_text:
+                        continue
+
+                    buttons = scope.locator("button")
+                    date_count = 0
+
+                    for j in range(buttons.count()):
+                        button = buttons.nth(j)
+                        if not button.is_visible():
+                            continue
+                        label = re.sub(
+                            r"\s+",
+                            " ",
+                            safe_text(button),
+                        ).strip().lower()
+                        if label in {"month", "year"}:
+                            date_count += 1
+
+                    if date_count >= 4:
+                        return scope
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+    return None
+
+
+def fill_education_editor(page: Page):
+    """Fix only the SSC/High School education entry.
+
+    The B.Tech and Intermediate entries are already correct and must not be
+    touched. The SSC entry is identified by its existing school name rather
+    than by its position in the education list.
+    """
+    try:
+        scope = _find_ssc_education_scope(page)
+
+        if scope is None:
+            # Preserve the older dialog-based route as a fallback, but only
+            # when the existing school value exactly matches the SSC school.
+            dialogs = page.get_by_role("dialog")
+
+            for i in range(dialogs.count()):
+                dialog = dialogs.nth(i)
+                if not dialog.is_visible():
+                    continue
+
+                text = safe_text(dialog).lower()
+                if "edit education" not in text:
+                    continue
+
+                school_value = ""
+                inputs = dialog.locator("input, textarea")
+
+                for j in range(inputs.count()):
+                    element = inputs.nth(j)
+                    if not element.is_visible():
+                        continue
+
+                    metadata = _field_metadata(element)
+                    if not any(
+                        pattern in metadata
+                        for pattern in (
+                            "school",
+                            "school name",
+                            "institution",
+                        )
+                    ):
+                        continue
+
+                    try:
+                        school_value = element.input_value().strip()
+                    except Exception:
+                        school_value = safe_text(element).strip()
+
+                    if school_value:
+                        break
+
+                normalized_school = re.sub(
+                    r"\s+",
+                    " ",
+                    school_value,
+                ).strip().lower()
+
+                normalized_ssc = re.sub(
+                    r"\s+",
+                    " ",
+                    SSC_SCHOOL_NAME,
+                ).strip().lower()
+
+                if normalized_school == normalized_ssc:
+                    scope = dialog
+                    break
+
+        if scope is None:
+            return False
+
+        print()
+        print("SSC / High School education entry detected.")
+        print(f"SSC school matched: {SSC_SCHOOL_NAME}")
+        print("B.Tech and Intermediate entries are not modified.")
+
+        # SSC-only fields. School name and degree are deliberately not
+        # changed because they are already correct.
+        major_filled = _fill_ssc_major_field(
+            scope,
+            SSC_FIELD_OF_STUDY,
+        )
+
+        selected_dates = _select_education_date_dropdowns(
+            scope,
+            [
+                SSC_START_MONTH,
+                SSC_START_YEAR,
+                SSC_END_MONTH,
+                SSC_END_YEAR,
+            ],
+        )
+
+        if major_filled:
+            print(f"SSC field of study set: {SSC_FIELD_OF_STUDY}")
+        else:
+            print(
+                "SSC field of study was already populated or could not be filled."
+            )
+
+        print(
+            f"SSC education date dropdowns selected: "
+            f"{selected_dates}/4"
+        )
+        print(
+            f"SSC education dates configured: "
+            f"{SSC_START_MONTH}/{SSC_START_YEAR} - "
+            f"{SSC_END_MONTH}/{SSC_END_YEAR}"
+        )
+
+        return True
+
+    except Exception as e:
+        print(f"SSC education handling error: {e}")
+
+    return False
+
+
+# ============================================================
 # Fill Common Text Fields
 # ============================================================
 
@@ -684,6 +1127,10 @@ def _value_for_text_question(combined):
 
     if "country" in q:
         return COUNTRY
+
+    # LinkedIn profile URL
+    if "linkedin profile" in q or "linkedin url" in q or ("profile" in q and "linkedin" in q):
+        return LINKEDIN_PROFILE_URL
 
     # Technical experience fields.
     aliases = {
@@ -829,6 +1276,91 @@ def audit_configured_text_fields(container):
     return found
 
 
+def _select_location_autocomplete(element, value):
+    """Select a visible LinkedIn location suggestion after filling a location field."""
+    try:
+        page = element.page
+        target = str(value or "").strip().lower()
+        if not target:
+            return False
+
+        # LinkedIn renders the location suggestions asynchronously.
+        page.wait_for_timeout(700)
+
+        selectors = [
+            "[role='option']:visible",
+            "[role='listbox']:visible [role='option']",
+            "[role='listbox']:visible li",
+        ]
+
+        candidates = []
+        seen = set()
+
+        for selector in selectors:
+            try:
+                options = page.locator(selector)
+                for i in range(options.count()):
+                    option = options.nth(i)
+                    if not option.is_visible():
+                        continue
+
+                    text = safe_text(option).strip()
+                    if not text:
+                        continue
+
+                    identity = text.lower()
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+
+                    low = identity
+                    if target == low:
+                        candidates.insert(0, option)
+                    elif target in low:
+                        candidates.append(option)
+            except Exception:
+                continue
+
+        if not candidates:
+            print("No visible location autocomplete suggestion found.")
+            return False
+
+        suggestion = candidates[0]
+        suggestion_text = safe_text(suggestion).strip()
+
+        try:
+            suggestion.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        page.wait_for_timeout(200)
+
+        try:
+            suggestion.click(timeout=5000)
+            page.wait_for_timeout(300)
+            print(f"Selected location suggestion: {suggestion_text}")
+            return True
+        except Exception as click_error:
+            print(f"Location suggestion click failed: {click_error}")
+
+        # Keyboard fallback is used only after a matching visible suggestion
+        # has been confirmed. It is not used when no suggestion is present.
+        try:
+            element.press("ArrowDown")
+            page.wait_for_timeout(100)
+            element.press("Enter")
+            page.wait_for_timeout(300)
+            print(f"Selected location suggestion with keyboard: {suggestion_text}")
+            return True
+        except Exception as keyboard_error:
+            print(f"Location autocomplete keyboard selection failed: {keyboard_error}")
+            return False
+
+    except Exception as e:
+        print(f"Location autocomplete selection skipped: {e}")
+        return False
+
+
 def fill_common_text_fields(container):
     print()
     print("Checking common application fields...")
@@ -862,6 +1394,24 @@ def fill_common_text_fields(container):
                 filled_value = _fill_value_and_validate(element, value, combined)
                 if filled_value is not None:
                     print(f"Filled field: {combined[:100]} -> {filled_value}")
+
+                    # LinkedIn location inputs can leave an autocomplete portal
+                    # open after text entry. Commit a matching suggestion before
+                    # navigation so that the suggestion overlay does not block
+                    # the Next control. Unknown fields are never touched.
+                    location_question = any(
+                        word in combined.lower()
+                        for word in (
+                            "city",
+                            "location",
+                            "current location",
+                            "address",
+                        )
+                    )
+
+                    if location_question:
+                        _select_location_autocomplete(element, filled_value)
+
                     filled_count += 1
                 else:
                     print(
@@ -941,6 +1491,84 @@ def _radio_label_text(container, radio):
     return safe_text(radio)
 
 
+def _click_radio_answer(group, answer):
+    """Click a radio option only when its label exactly/clearly matches."""
+    if group is None or not answer:
+        return False
+
+    target = re.sub(r"\s+", " ", str(answer)).strip().lower()
+
+    try:
+        controls = _radio_controls(group)
+        for i in range(controls.count()):
+            radio = controls.nth(i)
+
+            try:
+                label = _radio_label_text(group, radio)
+            except Exception:
+                label = ""
+
+            label_normalized = re.sub(
+                r"\s+", " ", str(label or "")
+            ).strip().lower()
+
+            if not label_normalized:
+                continue
+
+            if (
+                label_normalized != target
+                and target not in label_normalized
+            ):
+                continue
+
+            try:
+                if radio.is_checked():
+                    return True
+            except Exception:
+                if safe_attribute(radio, "aria-checked").lower() == "true":
+                    return True
+
+            try:
+                radio.scroll_into_view_if_needed()
+            except Exception:
+                pass
+
+            try:
+                radio.click(timeout=5000)
+            except Exception:
+                try:
+                    radio.evaluate("(el) => el.click()")
+                except Exception:
+                    radio_id = safe_attribute(radio, "id")
+                    if radio_id:
+                        try:
+                            label_element = group.locator(
+                                f"label[for='{radio_id}']"
+                            ).first
+                            if label_element.count() > 0:
+                                label_element.click(timeout=5000)
+                            else:
+                                continue
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+            group.page.wait_for_timeout(150)
+
+            try:
+                if radio.is_checked():
+                    return True
+            except Exception:
+                if safe_attribute(radio, "aria-checked").lower() == "true":
+                    return True
+
+    except Exception:
+        pass
+
+    return False
+
+
 def _radio_question_container_from_text(container, question_patterns):
     """Find the exact radio group associated with a known question.
 
@@ -962,6 +1590,87 @@ def _radio_question_container_from_text(container, question_patterns):
             question = _radio_question_text(group).lower()
             if question and any(pattern.lower() in question for pattern in question_patterns):
                 return group
+    except Exception:
+        pass
+
+    return None
+
+
+def _find_preferred_work_location_group(container):
+    """Find the preferred-work-location radio group when ARIA grouping is absent."""
+    try:
+        question_nodes = container.locator(
+            "text=/preferred work location|prefer to work|preferred location/i"
+        )
+
+        for i in range(question_nodes.count()):
+            node = question_nodes.nth(i)
+            if not node.is_visible():
+                continue
+
+            current = node
+            for _ in range(10):
+                try:
+                    current = current.locator("xpath=..")
+                    if current.count() == 0 or not current.is_visible():
+                        break
+
+                    group_text = re.sub(
+                        r"\s+",
+                        " ",
+                        safe_text(current),
+                    ).strip().lower()
+
+                    if not any(
+                        phrase in group_text
+                        for phrase in (
+                            "preferred work location",
+                            "prefer to work",
+                            "preferred location",
+                        )
+                    ):
+                        continue
+
+                    controls = _radio_controls(current)
+                    if controls.count() >= 2:
+                        return current
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+    return None
+
+
+def _choose_preferred_work_location(group):
+    """Choose Bengaluru/Bangalore, then Hyderabad, then Chennai if offered."""
+    if group is None:
+        return None
+
+    priorities = (
+        "bengaluru",
+        "bangalore",
+        "hyderabad",
+        "chennai",
+    )
+
+    try:
+        controls = _radio_controls(group)
+        available = []
+
+        for i in range(controls.count()):
+            radio = controls.nth(i)
+            if not radio.is_visible():
+                continue
+
+            label = _radio_label_text(group, radio).strip()
+            if label:
+                available.append(label)
+
+        for keyword in priorities:
+            for label in available:
+                if keyword in label.lower():
+                    return label
     except Exception:
         pass
 
@@ -998,6 +1707,46 @@ def _answer_known_radio_questions(container):
         else:
             print(f"Could not select safe answer: {display_name} -> {answer}")
             failures += 1
+
+    # Preferred work location:
+    # Priority is Bengaluru/Bangalore first, Hyderabad second, Chennai third.
+    # If none of these three locations is offered, do not guess another
+    # location. This question is handled only when its own question text can
+    # be identified, so unrelated radio groups are never affected.
+    preferred_location_group = _radio_question_container_from_text(
+        container,
+        ["preferred work location", "prefer to work", "preferred location"],
+    )
+
+    if preferred_location_group is None:
+        preferred_location_group = _find_preferred_work_location_group(
+            container
+        )
+
+    if preferred_location_group is not None:
+        preferred_answer = _choose_preferred_work_location(
+            preferred_location_group
+        )
+
+        if preferred_answer and _click_radio_answer(
+            preferred_location_group,
+            preferred_answer,
+        ):
+            print(
+                f"Selected preferred work location: {preferred_answer}"
+            )
+            answered += 1
+        elif preferred_answer:
+            print(
+                f"Could not select preferred work location: "
+                f"{preferred_answer}"
+            )
+            failures += 1
+        else:
+            print(
+                "No Bengaluru/Bangalore, Hyderabad, or Chennai option "
+                "was offered; preferred location left unchanged."
+            )
 
     return answered, failures
 
@@ -1450,6 +2199,42 @@ def inspect_selects(container):
                 "option"
             )
 
+            option_texts = []
+            for j in range(options.count()):
+                option_texts.append(safe_text(options.nth(j)).strip())
+
+            # Safe known experience values for this fresher profile.
+            # Only act when the dropdown explicitly exposes the matching
+            # zero-year/zero-month option; unknown dropdowns are untouched.
+            normalized_options = {text.lower() for text in option_texts}
+            if "0 year" in normalized_options:
+                try:
+                    zero_year = options.nth(
+                        option_texts.index("0 year")
+                    )
+                    value = safe_attribute(zero_year, "value")
+                    if value:
+                        select.select_option(value=value)
+                    else:
+                        select.select_option(label="0 year")
+                    print("Selected experience: 0 year")
+                except Exception as e:
+                    print(f"Could not select 0 year: {e}")
+
+            elif "0 month" in normalized_options:
+                try:
+                    zero_month = options.nth(
+                        option_texts.index("0 month")
+                    )
+                    value = safe_attribute(zero_month, "value")
+                    if value:
+                        select.select_option(value=value)
+                    else:
+                        select.select_option(label="0 month")
+                    print("Selected experience: 0 month")
+                except Exception as e:
+                    print(f"Could not select 0 month: {e}")
+
             for j in range(
                 min(options.count(), 15)
             ):
@@ -1875,6 +2660,12 @@ def prepare_current_page(page: Page):
     )
 
     # --------------------------------------------------------
+    # Education editor
+    # --------------------------------------------------------
+
+    fill_education_editor(page)
+
+    # --------------------------------------------------------
     # Contact information
     # --------------------------------------------------------
 
@@ -1949,14 +2740,55 @@ def prepare_current_page(page: Page):
 # ============================================================
 
 def _form_fingerprint(page):
-    """Capture stable application-form text to verify a real page transition."""
+    """Capture stable form content without treating UI/portal changes as navigation."""
     try:
         container = get_application_container(page)
-        text = container.inner_text()
-        # Remove dynamic character counters such as 1/20 and whitespace noise.
+
+        # Prefer the visible question/field content inside the application form.
+        elements = container.locator(
+            "input, textarea, select, [role='combobox'], "
+            "[role='radio'], [role='checkbox'], label"
+        )
+
+        parts = []
+
+        for i in range(elements.count()):
+            try:
+                element = elements.nth(i)
+
+                if not element.is_visible():
+                    continue
+
+                tag = element.evaluate("(el) => el.tagName").lower()
+
+                if tag in {"input", "textarea", "select"}:
+                    value = element.input_value(timeout=1000)
+                    aria = element.get_attribute("aria-label") or ""
+                    name = element.get_attribute("name") or ""
+                    parts.append(f"{tag}|{aria}|{name}|{value}")
+
+                else:
+                    text = element.inner_text(timeout=1000).strip()
+                    aria = element.get_attribute("aria-label") or ""
+                    if text or aria:
+                        parts.append(f"{tag}|{aria}|{text}")
+
+            except Exception:
+                continue
+
+        # If no form controls were found, return empty rather than
+        # treating arbitrary container/UI changes as a page transition.
+        if not parts:
+            return ""
+
+        text = " || ".join(parts)
+
+        # Remove dynamic counters and normalize whitespace.
         text = re.sub(r"\b\d+\s*/\s*\d+\b", "", text)
         text = re.sub(r"\s+", " ", text).strip().lower()
+
         return text
+
     except Exception:
         return ""
 
@@ -1965,7 +2797,12 @@ def move_to_next_page(page: Page):
     """Click application navigation once and verify a real transition."""
     container = get_application_container(page)
     before = get_application_step(page)
-    before_fingerprint = _form_fingerprint(page)
+
+    # Only use fingerprint fallback when LinkedIn does not expose
+    # a usable application page indicator.
+    before_fingerprint = ""
+    if not before:
+        before_fingerprint = _form_fingerprint(page)
 
     button = find_next_button(container, page)
 
@@ -1979,53 +2816,53 @@ def move_to_next_page(page: Page):
 
     print(f"Navigation control: {_control_text(button)}")
 
-    # ------------------------------------------------------------
     # Attempt 1: normal Playwright click
-    # ------------------------------------------------------------
     try:
         button.scroll_into_view_if_needed()
         page.wait_for_timeout(300)
         button.click(timeout=10000)
         print("Next button clicked normally.")
+
     except Exception as normal_error:
         print(f"Normal Next click failed: {normal_error}")
         print("Trying safe fallback click...")
 
-        # --------------------------------------------------------
-        # Attempt 2: DOM click fallback
-        #
-        # This is ONLY for application navigation.
-        # It is NOT used for final Submit.
-        # --------------------------------------------------------
+        # Attempt 2: DOM click fallback.
+        # This is only for Next/navigation, never final Submit.
         try:
             button.evaluate("(element) => element.click()")
             print("Fallback Next click completed.")
+
         except Exception as fallback_error:
             print(f"Fallback Next click failed: {fallback_error}")
             return False
 
     # ------------------------------------------------------------
-    # Verify that the application actually advanced
+    # Verify actual transition
     # ------------------------------------------------------------
     for _ in range(30):
         page.wait_for_timeout(500)
 
         after = get_application_step(page)
 
-        # Strong validation: application step increased.
-        if (
-            before
-            and after
-            and after[1] == before[1]
-            and after[0] > before[0]
-        ):
-            print(
-                f"Moved to next application page: "
-                f"{after[0]}/{after[1]}"
-            )
-            return True
+        # If LinkedIn exposes the page indicator, require an actual
+        # increase in the application page number.
+        if before:
+            if (
+                after
+                and after[1] == before[1]
+                and after[0] > before[0]
+            ):
+                print(
+                    f"Moved to next application page: "
+                    f"{after[0]}/{after[1]}"
+                )
+                return True
 
-        # Secondary validation: actual application form changed.
+            continue
+
+        # Only use fingerprint comparison when there was no usable
+        # page indicator before navigation.
         after_fingerprint = _form_fingerprint(page)
 
         if (
