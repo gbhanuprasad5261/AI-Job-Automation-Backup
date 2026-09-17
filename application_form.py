@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from playwright.sync_api import Page
 
 
@@ -174,103 +175,149 @@ def fill_if_empty(locator, value):
 # Detect Application Modal
 # ============================================================
 
-def get_application_container(page: Page):
-
-    # LinkedIn normally uses a dialog/modal for Easy Apply.
-
+def _container_has_application_signals(container):
+    """Return True only for a visible modal/container that can safely be treated
+    as the Easy Apply UI. Never use the LinkedIn page shell as a fallback.
+    """
     try:
+        if not container.is_visible():
+            return False
 
-        dialogs = page.get_by_role("dialog")
+        attrs = " ".join(
+            safe_attribute(container, a)
+            for a in ("class", "id", "aria-label", "data-test-modal")
+        ).lower()
 
-        if dialogs.count() > 0:
+        # LinkedIn's known Easy Apply containers are sufficient proof.
+        if any(
+            marker in attrs
+            for marker in (
+                "jobs-easy-apply-modal",
+                "jobs-easy-apply-content",
+                "jobs-easy-apply",
+            )
+        ):
+            return True
 
-            for i in range(dialogs.count()):
+        text = re.sub(r"\s+", " ", safe_text(container)).strip().lower()
 
-                dialog = dialogs.nth(i)
+        # aria-modal / dialog candidates are accepted only when they actually
+        # look like an application UI, never merely because they exist.
+        controls = container.locator(
+            "button, [role='button'], input, textarea, select, "
+            "[role='radio'], [role='checkbox']"
+        )
+        control_count = controls.count()
 
-                if dialog.is_visible():
-                    return dialog
-
-    except Exception:
-        pass
-
-    # Fallback to page itself
-
-    return page
-
-
-# ============================================================
-# Print Application Status
-# ============================================================
-
-def print_application_status(page: Page):
-
-    try:
-
-        body = page.locator("body").inner_text()
-
-        match = re.search(
-            r"(\d+)\s*/\s*(\d+)",
-            body
+        application_terms = (
+            "contact info",
+            "resume",
+            "application questions",
+            "work experience",
+            "education",
+            "phone number",
+            "cover letter",
+            "submit application",
+            "review your application",
+            "review application",
+            "additional questions",
+            "screening questions",
         )
 
-        if match:
+        if any(term in text for term in application_terms):
+            return True
 
-            current = match.group(1)
-            total = match.group(2)
+        if "artdeco-modal" in attrs and control_count > 0:
+            return True
 
-            print(
-                f"Application page: {current}/{total}"
-            )
+        # Some LinkedIn builds expose only aria-modal/role=dialog with little
+        # or no identifying text. Require actual interactive controls plus a
+        # modal-like application action/heading before accepting it.
+        if (
+            ("aria-modal" in attrs or "dialog" in attrs)
+            and control_count > 0
+            and re.search(r"\b(next|continue|review|submit|back)\b", text, re.I)
+        ):
+            return True
 
-            return
+        return False
 
     except Exception:
-        pass
+        return False
 
+
+def get_application_container(page: Page, wait_seconds=10):
+    """Find the live Easy Apply modal without ever falling back to page.
+
+    Selector order is intentionally strict: known Easy Apply containers first,
+    then generic modal/dialog containers that contain application controls.
+    """
+    selectors = (
+        ".jobs-easy-apply-modal",
+        ".jobs-easy-apply-content",
+        "[class*='jobs-easy-apply']",
+        "[id*='jobs-easy-apply' i]",
+        ".artdeco-modal",
+        "[data-test-modal='true']",
+        "[aria-modal='true']",
+        "[role='dialog']",
+    )
+
+    deadline = time.time() + max(0, wait_seconds)
+
+    while True:
+        for selector in selectors:
+            try:
+                candidates = page.locator(selector)
+                count = candidates.count()
+
+                for i in range(count):
+                    candidate = candidates.nth(i)
+                    if _container_has_application_signals(candidate):
+                        return candidate
+            except Exception:
+                continue
+
+        if time.time() >= deadline:
+            break
+
+        page.wait_for_timeout(250)
+
+    print()
+    print("=" * 70)
+    print("EASY APPLY CONTAINER NOT FOUND")
+    print("=" * 70)
+    print("The real LinkedIn Easy Apply modal was not detected.")
+    print("The LinkedIn page shell will NOT be processed.")
+    return None
+
+def print_application_status(page: Page):
+    try:
+        container=get_application_container(page,wait_seconds=0)
+        if container is None: print("Application page: unknown"); return
+        body=safe_text(container)
+        for pattern in (r"Application\s+page\s*:?[ \t]*(\d+)\s*/\s*(\d+)",r"Page\s+(\d+)\s+of\s+(\d+)",r"Step\s+(\d+)\s+of\s+(\d+)",r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)"):
+            m=re.search(pattern,body,re.I)
+            if m and _valid_application_step(int(m.group(1)),int(m.group(2))):
+                print(f"Application page: {int(m.group(1))}/{int(m.group(2))}"); return
+    except Exception: pass
     print("Application page: unknown")
 
 def get_application_step(page: Page):
-    """
-    Return the current LinkedIn Easy Apply step as:
-        (current_page, total_pages)
-
-    Example:
-        1/4 -> (1, 4)
-        2/4 -> (2, 4)
-    """
-
     try:
-        body = page.locator("body").inner_text()
-
-        # Prefer the application page indicator.
-        patterns = [
-            r"Application page\s*:?\s*(\d+)\s*/\s*(\d+)",
-            r"(\d+)\s*/\s*(\d+)"
-        ]
-
-        for pattern in patterns:
-            match = re.search(
-                pattern,
-                body,
-                re.IGNORECASE
-            )
-
-            if match:
-                return (
-                    int(match.group(1)),
-                    int(match.group(2))
-                )
-
-    except Exception:
-        pass
-
+        container=get_application_container(page,wait_seconds=0)
+        if container is None: return None
+        body=safe_text(container)
+        for pattern in (r"Application\s+page\s*:?[ \t]*(\d+)\s*/\s*(\d+)",r"Page\s+(\d+)\s+of\s+(\d+)",r"Step\s+(\d+)\s+of\s+(\d+)"):
+            m=re.search(pattern,body,re.I)
+            if m:
+                cur,total=int(m.group(1)),int(m.group(2))
+                if _valid_application_step(cur,total): return cur,total
+        for m in re.finditer(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)",body):
+            cur,total=int(m.group(1)),int(m.group(2))
+            if _valid_application_step(cur,total): return cur,total
+    except Exception: pass
     return None
-
-
-# ============================================================
-# Fill Name
-# ============================================================
 
 def fill_name(container):
 
@@ -2203,10 +2250,86 @@ def inspect_selects(container):
             for j in range(options.count()):
                 option_texts.append(safe_text(options.nth(j)).strip())
 
+            # Safe application-language handling. LinkedIn may render a
+            # native language dropdown without a useful name/id. We identify
+            # it only when the option set clearly consists of languages (for
+            # example English plus several other human-language names).
+            # English is the language used for this application workflow.
+            normalized_options = {
+                re.sub(r"\s+", " ", text).strip().lower()
+                for text in option_texts
+            }
+            language_markers = {
+                "english (english)",
+                "deutsch (german)",
+                "español (spanish)",
+                "français (french)",
+                "hindi (hindi)",
+                "italiano (italian)",
+                "bahasa indonesia (indonesian)",
+                "বাংলা (bangla)",
+                "العربية (arabic)",
+            }
+            language_option_count = len(
+                normalized_options.intersection(language_markers)
+            )
+            is_language_dropdown = (
+                "english (english)" in normalized_options
+                and language_option_count >= 3
+            )
+
+            if is_language_dropdown:
+                try:
+                    current = (
+                        select.input_value()
+                        or ""
+                    ).strip()
+                except Exception:
+                    current = ""
+
+                if not current:
+                    english_option = None
+                    for j in range(options.count()):
+                        option = options.nth(j)
+                        label = re.sub(
+                            r"\s+", " ", safe_text(option)
+                        ).strip().lower()
+                        if label == "english (english)":
+                            english_option = option
+                            break
+
+                    if english_option is not None:
+                        try:
+                            english_value = safe_attribute(
+                                english_option, "value"
+                            )
+                            if english_value:
+                                select.select_option(value=english_value)
+                            else:
+                                select.select_option(
+                                    label=safe_text(english_option).strip()
+                                )
+
+                            verified = (
+                                select.input_value()
+                                or ""
+                            ).strip()
+                            if verified:
+                                print(
+                                    "Selected application language: English"
+                                )
+                            else:
+                                print(
+                                    "Application language selection could not be verified."
+                                )
+                        except Exception as e:
+                            print(
+                                f"Could not select application language English: {e}"
+                            )
+
             # Safe known experience values for this fresher profile.
             # Only act when the dropdown explicitly exposes the matching
             # zero-year/zero-month option; unknown dropdowns are untouched.
-            normalized_options = {text.lower() for text in option_texts}
             if "0 year" in normalized_options:
                 try:
                     zero_year = options.nth(
@@ -2567,42 +2690,12 @@ def _find_button_in_scope(scope, purpose="next"):
 
 
 def find_next_button(container, page=None):
-    """Find LinkedIn's application navigation button in the modal or page."""
-    button = _find_button_in_scope(container, "next")
-    if button is not None:
-        return button
-
-    if page is not None and container is not page:
-        button = _find_button_in_scope(page, "next")
-        if button is not None:
-            print("Navigation button found in full page scope.")
-            return button
-
-    return None
-
-
-# ============================================================
-# Find Submit Button
-# ============================================================
+    if container is None or container is page: return None
+    return _find_button_in_scope(container,"next")
 
 def find_submit_button(container, page=None):
-    """Find the final submit control in the application scope."""
-    button = _find_button_in_scope(container, "submit")
-    if button is not None:
-        return button
-
-    if page is not None and container is not page:
-        button = _find_button_in_scope(page, "submit")
-        if button is not None:
-            print("Submit button found in full page scope.")
-            return button
-
-    return None
-
-
-# ============================================================
-# Detect Closed Job
-# ============================================================
+    if container is None or container is page: return None
+    return _find_button_in_scope(container,"submit")
 
 def job_is_closed(page):
 
@@ -2639,105 +2732,17 @@ def job_is_closed(page):
 # ============================================================
 
 def prepare_current_page(page: Page):
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "PREPARING APPLICATION PAGE"
-    )
-
-    print(
-        "=" * 70
-    )
-
+    print(); print("="*70); print("PREPARING APPLICATION PAGE"); print("="*70)
+    container=get_application_container(page)
+    if container is None:
+        print("APPLICATION FORM NOT DETECTED.")
+        print("Stopping before inspecting or clicking page controls.")
+        return -1
     print_application_status(page)
-
-    container = get_application_container(
-        page
-    )
-
-    # --------------------------------------------------------
-    # Education editor
-    # --------------------------------------------------------
-
-    fill_education_editor(page)
-
-    # --------------------------------------------------------
-    # Contact information
-    # --------------------------------------------------------
-
-    fill_name(
-        container
-    )
-
-    fill_email(
-        container
-    )
-
-    fill_phone(
-        container
-    )
-
-    # --------------------------------------------------------
-    # Resume
-    # --------------------------------------------------------
-
-    upload_resume(
-        container
-    )
-
-    # --------------------------------------------------------
-    # Common fields
-    # --------------------------------------------------------
-
-    fill_common_text_fields(
-        container
-    )
-
-    # --------------------------------------------------------
-    # Other controls
-    # --------------------------------------------------------
-
-    unresolved_radios = inspect_radio_buttons(
-        container
-    )
-
-    inspect_checkboxes(
-        container
-    )
-
-    inspect_selects(
-        container
-    )
-
-    # --------------------------------------------------------
-    # Required fields
-    # --------------------------------------------------------
-
-    unanswered = (
-        inspect_required_fields(
-            container
-        )
-    )
-
-    # Unknown optional radio questions are skipped. Unknown required radio
-    # questions return a blocking count and therefore stop navigation.
-    if unresolved_radios > 0:
-        print(
-            f"Unknown required radio questions blocking navigation: "
-            f"{unresolved_radios}"
-        )
-
-    # Radio questions are part of the required-field safety gate.
-    return unanswered + unresolved_radios
-
-
-# ============================================================
-# Move To Next Page
-# ============================================================
+    fill_education_editor(page); fill_name(container); fill_email(container); fill_phone(container); upload_resume(container); fill_common_text_fields(container)
+    unresolved_radios=inspect_radio_buttons(container); inspect_checkboxes(container); inspect_selects(container); unanswered=inspect_required_fields(container)
+    if unresolved_radios>0: print(f"Unknown required radio questions blocking navigation: {unresolved_radios}")
+    return unanswered+unresolved_radios
 
 def _form_fingerprint(page):
     """Capture stable form content without treating UI/portal changes as navigation."""
@@ -2991,6 +2996,12 @@ def inspect_and_prepare_form(
         # If required fields remain unanswered
         # ----------------------------------------------------
 
+        if unanswered < 0:
+            print()
+            print("Easy Apply container is unavailable.")
+            print("Stopping safely before any navigation or submission.")
+            return False
+
         if unanswered > 0:
 
             print()
@@ -3012,14 +3023,12 @@ def inspect_and_prepare_form(
         # Check if Submit is already available
         # ----------------------------------------------------
 
-        container = get_application_container(
-            page
-        )
+        container = get_application_container(page)
+        if container is None:
+            print("Easy Apply container is no longer available.")
+            return False
 
-        submit_button = find_submit_button(
-            container,
-            page
-        )
+        submit_button = find_submit_button(container)
 
         if submit_button is not None:
 
@@ -3036,10 +3045,7 @@ def inspect_and_prepare_form(
         # Move to next page
         # ----------------------------------------------------
 
-        navigation_button = find_next_button(
-            container,
-            page
-        )
+        navigation_button = find_next_button(container)
 
         if navigation_button is not None and re.search(
             r"\breview\b",
