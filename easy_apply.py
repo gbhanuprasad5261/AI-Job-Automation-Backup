@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 
 ANALYSIS_FILE = "data/job_analysis.csv"
 TRACKER_FILE = "data/application_tracker.csv"
+APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
 MIN_MATCH_SCORE = 70
 MAX_APPLICATIONS_PER_RUN = 1
@@ -114,6 +115,128 @@ def load_csv(file_path):
 
 
 # ---------------------------------------
+# General Application History
+# ---------------------------------------
+
+def _load_application_history():
+    """Load one persistent history of confirmed submitted applications."""
+    if not os.path.exists(APPLICATION_HISTORY_FILE):
+        return []
+
+    try:
+        with open(
+            APPLICATION_HISTORY_FILE,
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def _history_status_for_job(job):
+    """Return APPLIED when this exact job is already in submission history."""
+    job_url = _normalize_url(
+        convert_to_job_url(job.get("Link", "") or job.get("URL", ""))
+    )
+    title = _normalize_text(job.get("Title", ""))
+    company = _normalize_text(job.get("Company", ""))
+
+    for row in _load_application_history():
+        status = (row.get("Status") or "").strip().upper()
+        if status != "APPLIED":
+            continue
+
+        row_url = _normalize_url(
+            convert_to_job_url(row.get("URL") or row.get("Link") or "")
+        )
+
+        if job_url and row_url and job_url == row_url:
+            return "APPLIED"
+
+        row_title = _normalize_text(row.get("Title", ""))
+        row_company = _normalize_text(row.get("Company", ""))
+
+        if title and company and row_title == title and row_company == company:
+            return "APPLIED"
+
+    return "NOT APPLIED"
+
+
+def _record_application_history(job, status):
+    """Persist confirmed application status in one shared history CSV."""
+    if status != "APPLIED":
+        return True
+
+    os.makedirs(
+        os.path.dirname(APPLICATION_HISTORY_FILE) or ".",
+        exist_ok=True,
+    )
+
+    fields = [
+        "Title",
+        "Company",
+        "Location",
+        "URL",
+        "Status",
+        "Applied Date",
+    ]
+
+    rows = _load_application_history()
+
+    job_url = _normalize_url(
+        convert_to_job_url(job.get("Link", "") or job.get("URL", ""))
+    )
+    title = _normalize_text(job.get("Title", ""))
+    company = _normalize_text(job.get("Company", ""))
+
+    # Never create duplicate history records.
+    for row in rows:
+        row_url = _normalize_url(
+            convert_to_job_url(row.get("URL") or row.get("Link") or "")
+        )
+        row_title = _normalize_text(row.get("Title", ""))
+        row_company = _normalize_text(row.get("Company", ""))
+
+        if (
+            (job_url and row_url and job_url == row_url)
+            or (title and company and row_title == title and row_company == company)
+        ):
+            row["Status"] = "APPLIED"
+            row["Applied Date"] = row.get("Applied Date") or datetime.now().strftime("%Y-%m-%d")
+            return _write_application_history(rows, fields)
+
+    rows.append({
+        "Title": job.get("Title", ""),
+        "Company": job.get("Company", ""),
+        "Location": job.get("Location", ""),
+        "URL": job.get("URL", "") or job.get("Link", ""),
+        "Status": "APPLIED",
+        "Applied Date": datetime.now().strftime("%Y-%m-%d"),
+    })
+
+    return _write_application_history(rows, fields)
+
+
+def _write_application_history(rows, fields):
+    try:
+        with open(
+            APPLICATION_HISTORY_FILE,
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        return True
+    except Exception as exc:
+        print(f"Could not update application history: {exc}")
+        return False
+
+
+# ---------------------------------------
 # Get Application Status
 # ---------------------------------------
 
@@ -143,6 +266,9 @@ def get_application_statuses():
     return statuses
 
 def get_application_status(job):
+    if _history_status_for_job(job) == "APPLIED":
+        return "APPLIED"
+
     tracker = load_csv(TRACKER_FILE)
     job_url = _normalize_url(convert_to_job_url(job.get("Link", "")))
     title = _normalize_text(job.get("Title", "")); company = _normalize_text(job.get("Company", ""))
@@ -637,123 +763,113 @@ def record_application_status(job, status):
     """
     Update the tracker for the job after a confirmed application result.
 
-    The function adapts to the existing CSV headers instead of assuming
-    a fixed tracker schema.
-    """
+    Matching order:
+      1. Exact LinkedIn job URL
+      2. Exact Title + Company
 
+    A confirmed APPLIED result is also written to the general application
+    history so future runs skip the job even if tracker rows are regenerated.
+    """
     try:
         if not os.path.exists(TRACKER_FILE):
-            print(
-                f"Tracker file not found: {TRACKER_FILE}"
-            )
-            return False
+            print(f"Tracker file not found: {TRACKER_FILE}")
+            tracker_updated = False
+        else:
+            with open(
+                TRACKER_FILE,
+                "r",
+                encoding="utf-8",
+                newline=""
+            ) as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+                rows = list(reader)
 
-        with open(
-            TRACKER_FILE,
-            "r",
-            encoding="utf-8",
-            newline=""
-        ) as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames or []
-            rows = list(reader)
+            if "Status" not in fieldnames:
+                fieldnames.append("Status")
 
-        if "Status" not in fieldnames:
-            fieldnames.append("Status")
-
-        title = (
-            job.get("Title", "")
-            .strip()
-            .lower()
-        )
-
-        company = (
-            job.get("Company", "")
-            .strip()
-            .lower()
-        )
-
-        updated = False
-
-        for row in rows:
-            row_title = (
-                row.get("Title", "")
-                .strip()
-                .lower()
+            title = _normalize_text(job.get("Title", ""))
+            company = _normalize_text(job.get("Company", ""))
+            job_url = _normalize_url(
+                convert_to_job_url(job.get("Link", "") or job.get("URL", ""))
             )
 
-            row_company = (
-                row.get("Company", "")
-                .strip()
-                .lower()
-            )
+            updated = False
 
-            title_match = title and row_title == title
-            company_match = (
-                not company
-                or not row_company
-                or row_company == company
-            )
+            # Exact URL first.
+            if job_url:
+                for row in rows:
+                    row_url = _normalize_url(
+                        row.get("URL") or row.get("Link") or ""
+                    )
+                    if row_url == job_url:
+                        row["Status"] = status
+                        if "Application Status" in fieldnames:
+                            row["Application Status"] = status
+                        if status == "APPLIED" and "Applied Date" in fieldnames:
+                            row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+                        updated = True
+                        break
 
-            if title_match and company_match:
-                row["Status"] = status
+            # Exact Title + Company fallback.
+            if not updated and title and company:
+                for row in rows:
+                    if (
+                        _normalize_text(row.get("Title", "")) == title
+                        and _normalize_text(row.get("Company", "")) == company
+                    ):
+                        row["Status"] = status
+                        if "Application Status" in fieldnames:
+                            row["Application Status"] = status
+                        if status == "APPLIED" and "Applied Date" in fieldnames:
+                            row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+                        updated = True
+                        break
+
+            if not updated:
+                new_row = {field: "" for field in fieldnames}
+                new_row["Title"] = job.get("Title", "")
+                new_row["Company"] = job.get("Company", "")
+                new_row["Location"] = job.get("Location", "")
+                new_row["Status"] = status
 
                 if "Application Status" in fieldnames:
-                    row["Application Status"] = status
+                    new_row["Application Status"] = status
+
+                if "URL" in fieldnames:
+                    new_row["URL"] = job.get("URL", "") or job.get("Link", "")
 
                 if status == "APPLIED" and "Applied Date" in fieldnames:
-                    from datetime import datetime
-                    row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+                    new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
 
-                updated = True
-                break
+                rows.append(new_row)
 
-        if not updated:
-            new_row = {
-                field: ""
-                for field in fieldnames
-            }
+            with open(
+                TRACKER_FILE,
+                "w",
+                encoding="utf-8",
+                newline=""
+            ) as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=fieldnames
+                )
+                writer.writeheader()
+                writer.writerows(rows)
 
-            new_row["Title"] = job.get("Title", "")
-            new_row["Company"] = job.get("Company", "")
-            new_row["Location"] = job.get("Location", "")
-            new_row["Status"] = status
+            tracker_updated = True
+            print(f"Application tracker updated: {status}")
 
-            if "Application Status" in fieldnames:
-                new_row["Application Status"] = status
+        if status == "APPLIED":
+            history_updated = _record_application_history(job, "APPLIED")
+            if not history_updated:
+                print("Warning: tracker updated but application history update failed.")
+                return False
 
-            if "URL" in fieldnames:
-                new_row["URL"] = job.get("URL", "")
-
-            if status == "APPLIED" and "Applied Date" in fieldnames:
-                from datetime import datetime
-                new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
-
-            rows.append(new_row)
-
-        with open(
-            TRACKER_FILE,
-            "w",
-            encoding="utf-8",
-            newline=""
-        ) as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=fieldnames
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-
-        print()
-        print(
-            f"Application tracker updated: {status}"
-        )
-        return True
+        return tracker_updated if status != "APPLIED" else (tracker_updated or history_updated)
 
     except Exception as e:
-        print(
-            f"Could not update application tracker: {e}"
-        )
+        print(f"Could not update application tracker: {e}")
         return False
 
 
