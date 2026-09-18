@@ -106,7 +106,7 @@ TECH_EXPERIENCE = {
 #
 # Keep this FALSE during testing.
 
-AUTO_SUBMIT = False  # SAFETY: final Submit is always manual.
+AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "false").strip().lower() == "true"
 
 
 # ============================================================
@@ -2898,21 +2898,123 @@ def move_to_next_page(page: Page):
     return False
 
 
-def handle_final_submission(page: Page):
-    """Never submit employment applications automatically.
+def _final_submission_confirmed(page: Page) -> bool:
+    """Verify that LinkedIn shows a post-submission state after clicking Submit."""
+    confirmation_patterns = (
+        "application submitted",
+        "application has been submitted",
+        "your application was sent",
+        "application was sent",
+        "you've applied",
+        "you have applied",
+        "applied successfully",
+        "application sent",
+    )
 
-    The form may be fully prepared, but final submission always requires
-    explicit human action.
+    deadline = time.time() + 15
+
+    while time.time() < deadline:
+        try:
+            body = re.sub(r"\s+", " ", page.locator("body").inner_text()).strip().lower()
+            if any(pattern in body for pattern in confirmation_patterns):
+                return True
+        except Exception:
+            pass
+
+        try:
+            container = get_application_container(page, wait_seconds=0)
+            if container is None:
+                # The Easy Apply modal disappearing is useful supporting evidence,
+                # but it is not enough by itself to claim submission success.
+                try:
+                    body = re.sub(r"\s+", " ", page.locator("body").inner_text()).strip().lower()
+                    if any(pattern in body for pattern in confirmation_patterns):
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
+
+    return False
+
+
+def handle_final_submission(page: Page):
+    """Submit the Easy Apply application only when AUTO_SUBMIT is enabled.
+
+    The caller reaches this function only after the current application page has
+    passed the required-field and unknown-question safety checks. The final
+    Submit control is clicked only when it is explicitly identified as the
+    application submission button, and success is returned only after a
+    post-click confirmation is detected.
     """
     print()
     print("=" * 70)
-    print("FINAL APPLICATION REVIEW REQUIRED")
+    print("FINAL APPLICATION PAGE DETECTED")
     print("=" * 70)
-    print("All detected required fields are filled.")
-    print("AUTO_SUBMIT is disabled for safety.")
-    print("No Submit button was clicked by automation.")
-    print("Please review the application in the browser and submit manually if appropriate.")
-    return False
+
+    if not AUTO_SUBMIT:
+        print("AUTO_SUBMIT is disabled.")
+        print("No Submit button was clicked by automation.")
+        print("Please review the application and submit manually if appropriate.")
+        return "READY_FOR_REVIEW"
+
+    container = get_application_container(page, wait_seconds=2)
+    if container is None:
+        print("Easy Apply container is unavailable before final submission.")
+        return "FAILED"
+
+    submit_button = find_submit_button(container, page)
+    if submit_button is None:
+        print("Final Submit button was not safely detected.")
+        print("Stopping before submission.")
+        return "FAILED"
+
+    button_text = _control_text(submit_button)
+    normalized_button_text = re.sub(r"\s+", " ", button_text).strip().lower()
+
+    # Never click a generic button merely because it is near the end of the form.
+    # Require explicit submit semantics.
+    if not re.search(r"\bsubmit(?: application)?\b", normalized_button_text):
+        print(f"Detected control is not an explicit Submit button: {button_text!r}")
+        print("Stopping before submission.")
+        return "FAILED"
+
+    try:
+        if not submit_button.is_visible() or not submit_button.is_enabled():
+            print("Final Submit button is not visible/enabled.")
+            return "FAILED"
+    except Exception as exc:
+        print(f"Could not verify Submit button state: {exc}")
+        return "FAILED"
+
+    print(f"Final submission control: {button_text}")
+    print("AUTO_SUBMIT is enabled. Submitting application...")
+
+    try:
+        submit_button.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        submit_button.click(timeout=10000)
+    except Exception as normal_error:
+        print(f"Normal Submit click failed: {normal_error}")
+        print("Trying DOM click fallback for the explicitly identified Submit control...")
+        try:
+            submit_button.evaluate("(element) => element.click()")
+        except Exception as fallback_error:
+            print(f"Submit fallback failed: {fallback_error}")
+            return "FAILED"
+
+    if _final_submission_confirmed(page):
+        print("Application submission confirmed by LinkedIn.")
+        return "SUBMITTED"
+
+    print("Submit was clicked, but LinkedIn submission could not be verified.")
+    print("The application will NOT be marked as APPLIED automatically.")
+    return "FAILED"
 
 
 
