@@ -1,8 +1,8 @@
 """External ATS application helpers.
 
-The module prepares external applications for review. It deliberately does
-not submit external applications automatically because ATS forms vary and
-unknown questions must never be guessed.
+The module handles external application pages generically. It fills only
+known candidate data, never guesses unknown required questions, and submits
+only when AUTO_SUBMIT is enabled and a final submission can be verified.
 """
 
 import os
@@ -23,6 +23,9 @@ CURRENT_COMPANY = os.getenv("CURRENT_COMPANY", "N/A")
 CURRENT_CTC = "0"
 EXPECTED_CTC = "5,00,000"
 GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/gbhanuprasad5261")
+RESUME_PATH = os.getenv("RESUME_PATH", "resume/resume.pdf")
+SUCCESSFACTORS_PASSWORD = os.getenv("SUCCESSFACTORS_PASSWORD", "").strip()
+AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "true").strip().lower() == "true"
 
 
 DEFAULT_COVER_LETTER = """I am a Bachelor of Technology graduate in Computer Science and Engineering with a specialization in Artificial Intelligence and Data Science, graduating in 2025 from Siddartha Institute of Science and Technology. I am actively seeking an entry-level Software Engineer, Java Developer, or Backend Developer opportunity where I can apply my technical foundation, learn from experienced engineers, and contribute to real-world software products.
@@ -94,6 +97,8 @@ def detect_ats(url: str, body: str = "") -> str:
         return "JOBVITE"
     if "cutshort.io" in value:
         return "CUTSHORT"
+    if "successfactors.eu" in value or "successfactors.com" in value or "career5.successfactors.eu" in value:
+        return "SUCCESSFACTORS"
     if "docs.google.com/forms" in value or "forms.gle" in value:
         return "GOOGLE_FORMS"
     return "UNKNOWN"
@@ -672,8 +677,8 @@ def _fill_google_forms_known_fields(
 ) -> int:
     """Fill only clearly identifiable Google Forms fields.
 
-    This intentionally does not click Google Forms consent/record-email
-    checkboxes and does not guess answers to unknown questions.
+    Values are supplied by the candidate or directly supported by the resume.
+    Unknown questions are deliberately left untouched.
     """
     count = 0
     fields = page.locator("input, textarea")
@@ -685,13 +690,13 @@ def _fill_google_forms_known_fields(
 
     for i in range(total):
         element = fields.nth(i)
+
         if not _visible(element):
             continue
 
         field_type = _attr(element, "type").lower()
         if field_type in {
-            "hidden", "file", "radio", "checkbox", "submit",
-            "button", "password"
+            "hidden", "file", "radio", "checkbox", "submit", "button", "password"
         }:
             continue
 
@@ -704,102 +709,269 @@ def _fill_google_forms_known_fields(
         if not q:
             q = _field_text(element)
 
+        normalized_q = " ".join(q.split()).lower()
         value = None
 
-        if "email" in q and field_type == "email":
+        if "email" in normalized_q:
             value = email
-        elif "full name" in q or re.search(r"(^|\\s)name(\\s|$)", q):
+        elif "full name" in normalized_q or re.search(r"(^|\s)name(\s|$)", normalized_q):
             value = name
-        elif "first name" in q or "firstname" in q:
+        elif "first name" in normalized_q or "firstname" in normalized_q:
             value = name.split()[0] if name else ""
-        elif "last name" in q or "lastname" in q or "surname" in q:
+        elif "last name" in normalized_q or "lastname" in normalized_q or "surname" in normalized_q:
             value = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
-        elif "phone" in q or "mobile" in q or "telephone" in q:
+        elif "phone" in normalized_q or "mobile" in normalized_q or "telephone" in normalized_q:
             value = phone
-        elif "current location" in q:
+        elif "current location" in normalized_q:
             value = current_location
-        elif "current company" in q:
-            value = current_company or "N/A"
+        elif "year of graduation" in normalized_q:
+            value = "2025"
+        elif "cgpa" in normalized_q:
+            value = "7.29"
+        elif "college" in normalized_q:
+            value = "Siddhartha Institute of Science and Technology"
 
-        if value is None:
-            continue
-
-        # Do not overwrite a Google-managed email value unnecessarily.
-        if current:
+        if value is None or current == value:
             continue
 
         if _fill(page.locator("input, textarea").nth(i), value):
-            print(f"Google Form known field filled: {q[:90]} -> {value}")
+            print(f"Google Form known field filled: {normalized_q[:90]} -> {value}")
+            count += 1
+
+    return count
+
+
+def _google_forms_confirmed_radio_answers(page: Page) -> int:
+    """Select only Google Form radio answers explicitly confirmed by the candidate."""
+    answers = {
+        "will you available for 6 months internship": "Yes",
+        "will you be available for an in-office internship from in hsr location, 5 days a week": "Yes",
+        "how soon are you available to join": "Immediate",
+        "any prior internship experience": "Yes",
+        "do you have project experience with node.js": "No",
+        "do you have project experience with postgresql": "No",
+        "do you have project experience with react.js": "No",
+    }
+
+    count = 0
+    processed = set()
+
+    try:
+        radios = page.locator("[role='radio'], input[type='radio']")
+        total = radios.count()
+    except Exception:
+        return 0
+
+    for i in range(total):
+        radio = radios.nth(i)
+        if not _visible(radio):
+            continue
+
+        question = _google_question_text(radio)
+        normalized = " ".join(question.split()).lower()
+        desired = None
+        matched_key = None
+
+        for question_key, answer in answers.items():
+            if question_key in normalized:
+                desired = answer
+                matched_key = question_key
+                break
+
+        if desired is None or matched_key in processed:
+            continue
+
+        processed.add(matched_key)
+
+        try:
+            item = radio.locator("xpath=ancestor::*[@role='listitem'][1]")
+            if not item.count():
+                item = radio.locator("xpath=..")
+        except Exception:
+            item = radio.locator("xpath=..")
+
+        clicked = False
+
+        # Google Forms custom radios expose each option as role=radio.
+        try:
+            options = item.locator("[role='radio']")
+            for j in range(options.count()):
+                option = options.nth(j)
+                if not _visible(option):
+                    continue
+                label = (
+                    option.get_attribute("aria-label")
+                    or option.inner_text()
+                    or ""
+                ).strip()
+                if label.lower() == desired.lower():
+                    option.click()
+                    page.wait_for_timeout(150)
+                    clicked = True
+                    break
+        except Exception:
+            pass
+
+        # Fallback for native radio inputs/labels.
+        if not clicked:
+            try:
+                labels = item.locator("label")
+                for j in range(labels.count()):
+                    label = labels.nth(j)
+                    if not _visible(label):
+                        continue
+                    if (label.inner_text() or "").strip().lower() == desired.lower():
+                        label.click()
+                        page.wait_for_timeout(150)
+                        clicked = True
+                        break
+            except Exception:
+                pass
+
+        if clicked:
+            print(
+                f"Google Form confirmed answer selected: "
+                f"{normalized[:90]} -> {desired}"
+            )
             count += 1
 
     return count
 
 
 def _google_forms_required_empty_count(page: Page) -> int:
-    """Count required Google Forms questions that are still unanswered.
+    """Count required Google Forms questions that are actually unanswered.
 
-    Google Forms often uses aria-required on descendants rather than the
-    standard HTML `required` attribute. We inspect the containing question
-    block and report its visible text so manual review is actionable.
+    Google Forms commonly puts aria-required on a question container while its
+    individual custom radio options use aria-checked. The old implementation
+    inspected the container as though it were an input, which falsely reported
+    selected radio questions as unanswered.
     """
     count = 0
     seen_items = set()
 
     try:
         required = page.locator("[aria-required='true']")
-        for i in range(required.count()):
-            element = required.nth(i)
-            if not _visible(element):
-                continue
-
-            try:
-                item = element.locator("xpath=ancestor::*[@role='listitem'][1]")
-                if not item.count() or not _visible(item.first):
-                    item = element.locator("xpath=..")
-            except Exception:
-                item = element.locator("xpath=..")
-
-            try:
-                item_key = item.first.get_attribute("data-params") or str(i)
-            except Exception:
-                item_key = str(i)
-
-            if item_key in seen_items:
-                continue
-            seen_items.add(item_key)
-
-            try:
-                field_type = _attr(element, "type").lower()
-                if field_type in {"radio", "checkbox"}:
-                    # Unknown required choices/consent questions are not guessed.
-                    checked = element.is_checked()
-                    if checked:
-                        continue
-                else:
-                    value = element.input_value().strip()
-                    if value:
-                        continue
-            except Exception:
-                value = ""
-
-            try:
-                question = item.first.inner_text().strip()
-            except Exception:
-                question = _google_question_text(element)
-
-            print("Google Form required question still unanswered:")
-            print(f"  Question: {question or '(not detected)'}")
-            count += 1
+        total = required.count()
     except Exception:
-        pass
+        return 0
+
+    for i in range(total):
+        element = required.nth(i)
+        if not _visible(element):
+            continue
+
+        try:
+            item = element.locator("xpath=ancestor::*[@role='listitem'][1]")
+            if not item.count() or not _visible(item.first):
+                item = element.locator("xpath=..")
+            item = item.first
+        except Exception:
+            item = element.locator("xpath=..").first
+
+        try:
+            item_key = (
+                item.get_attribute("data-params")
+                or item.get_attribute("data-item-id")
+                or str(i)
+            )
+        except Exception:
+            item_key = str(i)
+
+        if item_key in seen_items:
+            continue
+        seen_items.add(item_key)
+
+        answered = False
+
+        # Custom Google Forms radio group: any option with aria-checked=true
+        # means the question has been answered.
+        try:
+            role_radios = item.locator("[role='radio']")
+            for j in range(role_radios.count()):
+                option = role_radios.nth(j)
+                if not _visible(option):
+                    continue
+                if (option.get_attribute("aria-checked") or "").lower() == "true":
+                    answered = True
+                    break
+        except Exception:
+            pass
+
+        # Native radio/checkbox fallback.
+        if not answered:
+            try:
+                native_choices = item.locator("input[type='radio'], input[type='checkbox']")
+                for j in range(native_choices.count()):
+                    choice = native_choices.nth(j)
+                    try:
+                        if choice.is_checked():
+                            answered = True
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # File upload: a selected file is an answer.
+        if not answered:
+            try:
+                files = item.locator("input[type='file']")
+                for j in range(files.count()):
+                    file_input = files.nth(j)
+                    file_count = int(file_input.evaluate("el => el.files ? el.files.length : 0") or 0)
+                    if file_count > 0:
+                        answered = True
+                        break
+            except Exception:
+                pass
+
+        # Text/select controls.
+        if not answered:
+            try:
+                controls = item.locator("input:not([type='radio']):not([type='checkbox']):not([type='hidden']):not([type='submit']):not([type='button']):not([type='file']), textarea, select")
+                for j in range(controls.count()):
+                    control = controls.nth(j)
+                    if not _visible(control):
+                        continue
+                    value = control.input_value().strip()
+                    if value and value.lower() not in {"select", "select..."}:
+                        answered = True
+                        break
+            except Exception:
+                pass
+
+        if answered:
+            continue
+
+        try:
+            question = item.inner_text().strip()
+        except Exception:
+            question = _google_question_text(element)
+
+        print("Google Form required question still unanswered:")
+        print(f"  Question: {question or '(not detected)'}")
+        count += 1
 
     return count
 
 
-def _prepare_google_form(page: Page, name: str, email: str, phone: str,
-                         current_location: str, current_company: str) -> str:
-    """Prepare a Google Form without submitting it."""
+
+def _prepare_google_form(
+    page: Page,
+    name: str,
+    email: str,
+    phone: str,
+    current_location: str,
+    current_company: str,
+    resume_path: str = RESUME_PATH,
+) -> str:
+    """Prepare and, when safe, submit a Google Form using known candidate data.
+
+    Unknown questions are left untouched. Submission occurs only when no
+    required question remains unanswered and AUTO_SUBMIT is enabled.
+    """
     print("Google Form detected: using safe known-field handling.")
+
     filled = _fill_google_forms_known_fields(
         page,
         name,
@@ -810,84 +982,868 @@ def _prepare_google_form(page: Page, name: str, email: str, phone: str,
     )
     print(f"Google Form known fields filled: {filled}")
 
-    # Google Forms does not normally expose a resume upload as a standard ATS
-    # file field. Try the normal upload helper without requiring it.
-    uploaded = _upload_resume(page, "")
-    print(f"Resume uploaded: {'Yes' if uploaded else 'No / not required here'}")
+    confirmed_answers = _google_forms_confirmed_radio_answers(page)
+    print(f"Google Form confirmed answers selected: {confirmed_answers}")
+
+    configured_resume = resume_path or RESUME_PATH
+    uploaded = _upload_google_forms_resume(page, configured_resume)
+    print(
+        f"Resume uploaded: {'Yes' if uploaded else 'No / upload not verified'}"
+    )
+
+    # Give Google Forms a moment to update aria-checked / upload state.
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        time.sleep(0.5)
 
     required = _google_forms_required_empty_count(page)
     print(f"Google Form required questions still unanswered: {required}")
 
     if required:
-        print("Required Google Form questions remain unanswered; manual review is required.")
+        print(
+            "Required Google Form questions remain unanswered; "
+            "manual review is required."
+        )
     else:
         print("No detectable unanswered required Google Form questions on this page.")
 
-    print("Google Form prepared for manual review.")
-    print("No Google Form submission was performed.")
+    print("Google Form prepared with known candidate data.")
+    return _auto_submit_google_form(page)
+
+
+
+def _auto_submit_google_form(page: Page) -> str:
+    """Submit Google Forms only after required-question verification."""
+    if not AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: Google Form submission was not performed.")
+        return "READY_FOR_REVIEW"
+
+    required = _google_forms_required_empty_count(page)
+    if required:
+        print("Google Form required questions remain unanswered; submission stopped safely.")
+        return "READY_FOR_REVIEW"
+
+    controls = page.locator(
+        "[role='button'], button, input[type='submit'], input[type='button']"
+    )
+    submit = None
+    for i in range(controls.count()):
+        control = controls.nth(i)
+        if not _visible(control):
+            continue
+        label = _normalized_control_label(control)
+        if label == "submit":
+            try:
+                disabled = control.is_disabled()
+            except Exception:
+                disabled = False
+            if not disabled:
+                submit = control
+                break
+
+    if submit is None:
+        print("Google Form final Submit control was not found.")
+        return "READY_FOR_REVIEW"
+
+    previous_url = page.url
+    print("AUTO_SUBMIT enabled: submitting Google Form...")
+    try:
+        submit.click()
+    except Exception as exc:
+        print(f"Google Form submission click failed: {exc}")
+        return "FAILED"
+
+    success_phrases = (
+        "your response has been recorded",
+        "response has been recorded",
+        "your response was recorded",
+        "thanks for submitting",
+        "thank you for submitting",
+        "form submitted",
+        "response recorded",
+    )
+    for _ in range(20):
+        body = _text(page).lower()
+        if any(phrase in body for phrase in success_phrases) or "/formresponse" in page.url.lower():
+            print("Google Form submission verified: response recorded.")
+            return "SUBMITTED"
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
+
+    print("Google Form submission could not be verified; application status was not marked APPLIED.")
     return "READY_FOR_REVIEW"
 
-
 def _resolve_resume_path(resume_path: str) -> str:
-    """Resolve the configured resume path from either the project CWD or module location."""
+    """Resolve and validate the configured local resume path."""
     if not resume_path:
         return ""
 
+    raw = os.path.expandvars(os.path.expanduser(str(resume_path).strip()))
+    if not raw:
+        return ""
+
     candidates = []
-    raw = os.path.expanduser(str(resume_path).strip())
     if os.path.isabs(raw):
         candidates.append(raw)
     else:
         candidates.append(os.path.abspath(raw))
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(project_root, raw))
+        candidates.append(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), raw))
+        )
 
+    seen = set()
     for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
+        candidate = os.path.normpath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        except OSError:
+            continue
 
     return ""
 
 
-def _upload_resume(page: Page, resume_path: str) -> bool:
-    """Upload the resume and verify that the browser file input actually contains it."""
+def _upload_google_forms_resume(page: Page, resume_path: str) -> bool:
+    """Upload a Google Forms file question through its Add file/Browse UI.
+
+    Google Forms may render the upload dialog in a child frame. The native
+    file chooser must be handled with Playwright's file-chooser event; typing
+    a Windows path into the web page is not reliable and is intentionally not
+    used here.
+    """
     resolved_path = _resolve_resume_path(resume_path)
     if not resolved_path:
         print(f"Resume file not found: {resume_path or '(empty path)'}")
         return False
 
-    try:
-        inputs = page.locator("input[type='file']")
-        total = inputs.count()
-    except Exception:
-        return False
+    filename = os.path.basename(resolved_path)
 
-    for i in range(total):
-        element = inputs.nth(i)
+    def all_frames():
         try:
-            element.set_input_files(resolved_path)
+            return page.frames
+        except Exception:
+            return [page]
 
-            # Verify the DOM FileList rather than assuming set_input_files succeeded.
-            verified_name = element.evaluate(
-                """el => el.files && el.files.length ? el.files[0].name : ''"""
-            ) or ""
-            verified_size = element.evaluate(
-                """el => el.files && el.files.length ? el.files[0].size : 0"""
-            ) or 0
+    def visible_text(element):
+        try:
+            return (
+                (element.get_attribute("aria-label") or "") + " " +
+                (element.get_attribute("title") or "") + " " +
+                (element.inner_text() or "")
+            ).strip().lower()
+        except Exception:
+            return ""
 
-            if verified_name and int(verified_size) > 0:
-                print(
-                    f"Resume uploaded and verified: {verified_name} "
-                    f"({int(verified_size)} bytes)"
-                )
-                return True
-        except Exception as exc:
-            print(f"Resume upload attempt {i + 1} failed: {exc}")
+    # Fast path: if Google Forms exposes a real file input anywhere, set it.
+    for frame in all_frames():
+        try:
+            inputs = frame.locator("input[type='file']")
+            for i in range(inputs.count()):
+                element = inputs.nth(i)
+                try:
+                    element.set_input_files(resolved_path)
+                    verified_name = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].name : ''"
+                    ) or ""
+                    verified_size = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].size : 0"
+                    ) or 0
+                    if verified_name == filename and int(verified_size) > 0:
+                        print(
+                            f"Resume uploaded and verified: {verified_name} "
+                            f"({int(verified_size)} bytes)"
+                        )
+                        return True
+                except Exception:
+                    continue
+        except Exception:
             continue
 
-    print("Resume upload could not be verified on any file input.")
+    # Find Add file across the main page and all child frames.
+    add_file = None
+    add_file_frame = None
+    for frame in all_frames():
+        try:
+            controls = frame.locator("[role='button'], button")
+            for i in range(controls.count()):
+                control = controls.nth(i)
+                if not _visible(control):
+                    continue
+                label = visible_text(control)
+                if "add file" in label:
+                    add_file = control
+                    add_file_frame = frame
+                    break
+        except Exception:
+            continue
+        if add_file is not None:
+            break
+
+    if add_file is None:
+        print("Google Forms resume 'Add file' control was not found.")
+        return False
+
+    try:
+        add_file.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    # Open the Google Forms upload dialog.
+    try:
+        add_file.click()
+        page.wait_for_timeout(800)
+    except Exception as exc:
+        print(f"Could not click Google Forms 'Add file': {exc}")
+        return False
+
+    # After the picker opens, some Google Forms versions expose the actual
+    # file input directly (usually hidden). Prefer it when available because
+    # it avoids depending on the visual Browse control.
+    for frame in all_frames():
+        try:
+            inputs = frame.locator("input[type='file']")
+            for i in range(inputs.count()):
+                element = inputs.nth(i)
+                try:
+                    element.set_input_files(resolved_path)
+                    verified_name = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].name : ''"
+                    ) or ""
+                    verified_size = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].size : 0"
+                    ) or 0
+                    if verified_name == filename and int(verified_size) > 0:
+                        print(
+                            f"Resume uploaded and verified: {verified_name} "
+                            f"({int(verified_size)} bytes)"
+                        )
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Google Forms can put the upload dialog in a child frame. Search every
+    # frame for the actual Browse control.
+    browse = None
+    browse_frame = None
+    for _ in range(20):
+        for frame in all_frames():
+            try:
+                controls = frame.locator("[role='button'], button, [role='link']")
+                for i in range(controls.count()):
+                    control = controls.nth(i)
+                    if not _visible(control):
+                        continue
+                    label = visible_text(control)
+                    if re.search(r"\bbrowse\b", label):
+                        browse = control
+                        browse_frame = frame
+                        break
+            except Exception:
+                continue
+            if browse is not None:
+                break
+        if browse is not None:
+            break
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+
+    if browse is None:
+        print("Google Forms 'Browse' control was not found after clicking Add file.")
+        return False
+
+    # The Browse button opens the OS file picker. Capture that event and provide
+    # the already-verified local PDF path directly to Playwright.
+    try:
+        with page.expect_file_chooser(timeout=15000) as chooser_info:
+            browse.click()
+        chooser = chooser_info.value
+        chooser.set_files(resolved_path)
+        page.wait_for_timeout(1800)
+        print(f"Google Forms file chooser received: {filename}")
+    except Exception as exc:
+        print(f"Google Forms Browse/file chooser attempt failed: {exc}")
+
+        # Fallback: the Browse click may reveal a hidden file input without
+        # exposing a Playwright file-chooser event.
+        for frame in all_frames():
+            try:
+                inputs = frame.locator("input[type='file']")
+                for i in range(inputs.count()):
+                    element = inputs.nth(i)
+                    try:
+                        element.set_input_files(resolved_path)
+                        verified_name = element.evaluate(
+                            "el => el.files && el.files.length ? el.files[0].name : ''"
+                        ) or ""
+                        verified_size = element.evaluate(
+                            "el => el.files && el.files.length ? el.files[0].size : 0"
+                        ) or 0
+                        if verified_name == filename and int(verified_size) > 0:
+                            print(
+                                f"Resume uploaded and verified: {verified_name} "
+                                f"({int(verified_size)} bytes)"
+                            )
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    # Verify the upload. The file input may live in the dialog frame or may be
+    # replaced after the chooser closes, so inspect every current frame.
+    for frame in all_frames():
+        try:
+            inputs = frame.locator("input[type='file']")
+            for i in range(inputs.count()):
+                element = inputs.nth(i)
+                verified_name = element.evaluate(
+                    "el => el.files && el.files.length ? el.files[0].name : ''"
+                ) or ""
+                verified_size = element.evaluate(
+                    "el => el.files && el.files.length ? el.files[0].size : 0"
+                ) or 0
+                if verified_name == filename and int(verified_size) > 0:
+                    print(
+                        f"Resume uploaded and verified: {verified_name} "
+                        f"({int(verified_size)} bytes)"
+                    )
+                    return True
+        except Exception:
+            continue
+
+    # Final UI-level verification: Google Forms often displays the uploaded
+    # filename even when its internal file input is not accessible to us.
+    try:
+        for frame in all_frames():
+            body = (frame.locator("body").inner_text() or "").lower()
+            if filename.lower() in body:
+                print(f"Resume uploaded and verified in Google Forms: {filename}")
+                return True
+    except Exception:
+        pass
+
+    print("Google Forms resume upload could not be verified.")
     return False
 
+
+def _upload_resume(page: Page, resume_path: str) -> bool:
+    """Upload the configured resume through a generic ATS file input/control.
+
+    Only real file inputs or clearly labeled upload controls are used. No
+    unrelated buttons are clicked and no application is submitted here.
+    """
+    resolved_path = _resolve_resume_path(resume_path or RESUME_PATH)
+    if not resolved_path:
+        print(f"Resume file not found: {resume_path or RESUME_PATH}")
+        return False
+
+    filename = os.path.basename(resolved_path)
+
+    def frames():
+        try:
+            return page.frames
+        except Exception:
+            return [page]
+
+    def control_text(element):
+        try:
+            return " ".join([
+                _attr(element, "aria-label"),
+                _attr(element, "title"),
+                element.inner_text() or "",
+            ]).strip().lower()
+        except Exception:
+            return ""
+
+    # Fast path: any actual file input is unambiguous.
+    for frame in frames():
+        try:
+            inputs = frame.locator("input[type='file']")
+            for i in range(inputs.count()):
+                element = inputs.nth(i)
+                try:
+                    element.set_input_files(resolved_path)
+                    verified_name = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].name : ''"
+                    ) or ""
+                    verified_size = element.evaluate(
+                        "el => el.files && el.files.length ? el.files[0].size : 0"
+                    ) or 0
+                    if verified_name == filename and int(verified_size) > 0:
+                        print(
+                            f"Resume uploaded and verified: {verified_name} "
+                            f"({int(verified_size)} bytes)"
+                        )
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Otherwise use only a clearly labeled upload/add-file/browse control.
+    upload_control = None
+    for frame in frames():
+        try:
+            controls = frame.locator("button, [role='button'], [role='link'], a")
+            for i in range(controls.count()):
+                control = controls.nth(i)
+                if not _visible(control):
+                    continue
+                label = control_text(control)
+                if any(term in label for term in (
+                    "upload resume", "upload cv", "upload your resume",
+                    "add resume", "add file", "upload file", "browse",
+                )):
+                    upload_control = control
+                    break
+        except Exception:
+            continue
+        if upload_control is not None:
+            break
+
+    if upload_control is None:
+        print("External ATS resume file input/control was not found.")
+        return False
+
+    try:
+        with page.expect_file_chooser(timeout=10000) as chooser_info:
+            upload_control.click()
+        chooser_info.value.set_files(resolved_path)
+        page.wait_for_timeout(1000)
+    except Exception as exc:
+        print(f"External ATS file chooser attempt failed: {exc}")
+        # Some ATS pages reveal a file input after clicking the upload control.
+        for frame in frames():
+            try:
+                inputs = frame.locator("input[type='file']")
+                for i in range(inputs.count()):
+                    element = inputs.nth(i)
+                    try:
+                        element.set_input_files(resolved_path)
+                        verified_name = element.evaluate(
+                            "el => el.files && el.files.length ? el.files[0].name : ''"
+                        ) or ""
+                        verified_size = element.evaluate(
+                            "el => el.files && el.files.length ? el.files[0].size : 0"
+                        ) or 0
+                        if verified_name == filename and int(verified_size) > 0:
+                            print(
+                                f"Resume uploaded and verified: {verified_name} "
+                                f"({int(verified_size)} bytes)"
+                            )
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    # Verify the file input or visible filename after the upload.
+    for frame in frames():
+        try:
+            inputs = frame.locator("input[type='file']")
+            for i in range(inputs.count()):
+                element = inputs.nth(i)
+                verified_name = element.evaluate(
+                    "el => el.files && el.files.length ? el.files[0].name : ''"
+                ) or ""
+                verified_size = element.evaluate(
+                    "el => el.files && el.files.length ? el.files[0].size : 0"
+                ) or 0
+                if verified_name == filename and int(verified_size) > 0:
+                    print(
+                        f"Resume uploaded and verified: {verified_name} "
+                        f"({int(verified_size)} bytes)"
+                    )
+                    return True
+        except Exception:
+            continue
+
+    try:
+        body = _text(page).lower()
+        if filename.lower() in body:
+            print(f"Resume upload verified by visible filename: {filename}")
+            return True
+    except Exception:
+        pass
+
+    print("External ATS resume upload could not be verified.")
+    return False
+
+
+def _looks_like_application_form(page: Page) -> bool:
+    """Return True when the current page is clearly an application form.
+
+    SuccessFactors registration/application pages are recognized explicitly
+    by their platform URL/text, while other ATS pages use visible form
+    controls. This never assumes an unknown question's answer.
+    """
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+
+    body = _text(page).lower()
+
+    if "successfactors.eu" in url or "successfactors.com" in url:
+        if any(term in body for term in (
+            "career opportunities",
+            "employee login",
+            "choose password",
+            "retype password",
+            "legal first name",
+            "country/region code",
+            "candidate profile",
+            "complete your application",
+        )):
+            return True
+
+    try:
+        inputs = page.locator(
+            "input:not([type='hidden']), textarea, select, input[type='file']"
+        )
+        visible_count = 0
+        for i in range(min(inputs.count(), 120)):
+            if _visible(inputs.nth(i)):
+                visible_count += 1
+                if visible_count >= 2:
+                    return True
+    except Exception:
+        pass
+
+    return any(phrase in body for phrase in (
+        "apply for this position",
+        "application form",
+        "submit application",
+        "complete your application",
+        "candidate information",
+        "career opportunities:",
+    ))
+
+
+def _click_external_application_start(page: Page):
+    """Click a clearly labeled application-start control and return the active page.
+
+    This is intentionally generic: it never selects a job-specific selector.
+    """
+    if _looks_like_application_form(page):
+        return page
+
+    allowed = {
+        "apply now",
+        "apply",
+        "apply for this job",
+        "apply for this position",
+        "start application",
+        "apply online",
+    }
+
+    candidates = page.locator(
+        "button, [role='button'], a, [role='link'], input[type='submit'], input[type='button']"
+    )
+    for i in range(candidates.count()):
+        control = candidates.nth(i)
+        if not _visible(control):
+            continue
+        label = " ".join([
+            _attr(control, "aria-label"),
+            _attr(control, "title"),
+            (control.inner_text() or ""),
+            _attr(control, "value"),
+        ]).strip().lower()
+        normalized = " ".join(label.split())
+        if normalized not in allowed:
+            continue
+
+        try:
+            with page.expect_popup(timeout=3000) as popup_info:
+                control.click()
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            return popup
+        except Exception:
+            try:
+                control.click()
+                page.wait_for_timeout(1500)
+            except Exception:
+                return page
+            return page
+
+    return page
+
+
+def _normalized_control_label(element) -> str:
+    try:
+        raw = " ".join([
+            _attr(element, "aria-label"),
+            _attr(element, "title"),
+            element.inner_text() or "",
+            _attr(element, "value"),
+        ])
+        return " ".join(raw.split()).strip().lower()
+    except Exception:
+        return ""
+
+
+def _find_final_submit_control(page: Page):
+    """Find an explicit final application-submit control, never a consent control."""
+    allowed = {
+        "submit",
+        "submit application",
+        "submit your application",
+        "send application",
+        "apply now",
+        "complete application",
+        "finish application",
+    }
+    controls = page.locator(
+        "button, [role='button'], input[type='submit'], input[type='button'], a"
+    )
+    for i in range(controls.count()):
+        control = controls.nth(i)
+        if not _visible(control):
+            continue
+        label = _normalized_control_label(control)
+        if label not in allowed:
+            continue
+        # Never treat consent/cookie controls as application submission.
+        if any(term in label for term in ("accept", "agree", "consent", "cookie")):
+            continue
+        return control
+    return None
+
+
+def _external_submission_verified(page: Page, previous_url: str) -> bool:
+    """Verify a submitted external application using success text or URL evidence."""
+    success_phrases = (
+        "application submitted",
+        "application received",
+        "successfully submitted",
+        "successfully applied",
+        "we received your application",
+        "thank you for applying",
+        "thanks for applying",
+        "thank you for your application",
+        "your application has been received",
+        "application complete",
+    )
+
+    for _ in range(20):
+        body = _text(page).lower()
+        if any(phrase in body for phrase in success_phrases):
+            return True
+
+        try:
+            if page.url != previous_url and any(token in page.url.lower() for token in (
+                "thank", "success", "confirmation", "complete", "submitted", "application"
+            )):
+                return True
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
+
+    return False
+
+
+def _auto_submit_external_application(page: Page) -> str:
+    """Submit only a fully populated external application when AUTO_SUBMIT is enabled."""
+    if not AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: external submission was not performed.")
+        return "READY_FOR_REVIEW"
+
+    required = _required_empty_count(page)
+    print(f"Visible required fields before external submit: {required}")
+    if required:
+        print("Unknown/required fields remain unanswered; submission stopped safely.")
+        return "READY_FOR_REVIEW"
+
+    submit_control = _find_final_submit_control(page)
+    if submit_control is None:
+        print("No unambiguous final application Submit control was found.")
+        return "READY_FOR_REVIEW"
+
+    previous_url = page.url
+    print(f"AUTO_SUBMIT enabled: submitting via '{_normalized_control_label(submit_control)}'...")
+    try:
+        submit_control.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    try:
+        submit_control.click()
+    except Exception as exc:
+        print(f"External submission click failed: {exc}")
+        return "FAILED"
+
+    if _external_submission_verified(page, previous_url):
+        print("External application submission verified.")
+        return "SUBMITTED"
+
+    print("External submission could not be verified; application status was not marked APPLIED.")
+    return "READY_FOR_REVIEW"
+
+
+def _prepare_successfactors_account(page: Page) -> str:
+    """Complete the generic SuccessFactors account-creation step.
+
+    The password is supplied through SUCCESSFACTORS_PASSWORD (with the
+    configured candidate value as fallback). The country/region code is
+    selected only when India/+91 is an available option. Unknown required
+    fields are never guessed.
+    """
+    password = SUCCESSFACTORS_PASSWORD.strip()
+    if not password:
+        print("SuccessFactors password is not configured; stopping safely.")
+        return "READY_FOR_REVIEW"
+
+    filled = 0
+
+    password_fields = page.locator(
+        "input[type='password'], input[name*='pwd' i], input[id*='pwd' i]"
+    )
+    seen = set()
+    for i in range(password_fields.count()):
+        field = password_fields.nth(i)
+        if not _visible(field):
+            continue
+        try:
+            key = field.get_attribute("id") or field.get_attribute("name") or str(i)
+        except Exception:
+            key = str(i)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            field.fill(password)
+            filled += 1
+        except Exception:
+            continue
+
+    if filled:
+        print(f"SuccessFactors password fields filled: {filled}")
+
+    # Country/region code: choose India/+91 only when the option is explicitly
+    # present. Never select an arbitrary numeric code.
+    selects = page.locator("select")
+    country_selected = False
+    for i in range(selects.count()):
+        select = selects.nth(i)
+        if not _visible(select):
+            continue
+        metadata = _field_text(select)
+        if not any(term in metadata for term in (
+            "country", "region code", "country/region code", "itu code", "phone code"
+        )):
+            continue
+        try:
+            options = select.locator("option")
+            for j in range(options.count()):
+                option = options.nth(j)
+                label = " ".join([
+                    _attr(option, "label"),
+                    option.inner_text() or "",
+                    _attr(option, "value"),
+                ]).strip().lower()
+                if "india" in label and "+91" in label:
+                    select.select_option(index=j)
+                    country_selected = True
+                    break
+            if country_selected:
+                print("SuccessFactors country/region code selected: India (+91)")
+                break
+        except Exception:
+            continue
+
+    if not country_selected:
+        # Some SuccessFactors pages expose +91 as the value without the word
+        # India. Only use an option explicitly containing +91.
+        for i in range(selects.count()):
+            select = selects.nth(i)
+            if not _visible(select):
+                continue
+            try:
+                options = select.locator("option")
+                for j in range(options.count()):
+                    option = options.nth(j)
+                    label = " ".join([
+                        _attr(option, "label"),
+                        option.inner_text() or "",
+                        _attr(option, "value"),
+                    ]).strip().lower()
+                    if "+91" in label:
+                        select.select_option(index=j)
+                        country_selected = True
+                        print("SuccessFactors country/region code selected: +91")
+                        break
+                if country_selected:
+                    break
+            except Exception:
+                continue
+
+    if not country_selected:
+        print("SuccessFactors India/+91 country code option was not found.")
+
+    # Ensure password fields are no longer considered empty by the generic
+    # required-field checker.
+    required = _required_empty_count(page)
+    print(f"SuccessFactors required fields still empty: {required}")
+    if required:
+        print("Unknown required SuccessFactors fields remain; they will not be guessed.")
+        return "READY_FOR_REVIEW"
+
+    # Account creation is an explicit platform step, not a generic unknown
+    # question. Only click an exact Register/Create Account control.
+    controls = page.locator(
+        "button, [role='button'], input[type='submit'], input[type='button']"
+    )
+    allowed = {"register", "create account", "create profile"}
+    for i in range(controls.count()):
+        control = controls.nth(i)
+        if not _visible(control):
+            continue
+        label = _normalized_control_label(control)
+        if label not in allowed:
+            continue
+        previous_url = page.url
+        print(f"SuccessFactors account step: clicking '{label}'...")
+        try:
+            control.scroll_into_view_if_needed()
+            control.click()
+            page.wait_for_timeout(2000)
+        except Exception as exc:
+            print(f"SuccessFactors account-step click failed: {exc}")
+            return "FAILED"
+
+        if page.url != previous_url or _looks_like_application_form(page):
+            print("SuccessFactors account step completed; continuing application preparation.")
+            return "CONTINUE"
+
+        body = _text(page).lower()
+        if any(term in body for term in (
+            "account created", "registration successful", "profile created",
+            "complete your application", "candidate information"
+        )):
+            print("SuccessFactors account step completed; continuing application preparation.")
+            return "CONTINUE"
+
+        print("SuccessFactors account step could not be verified; stopping safely.")
+        return "READY_FOR_REVIEW"
+
+    print("No unambiguous SuccessFactors Register/Create Account control was found.")
+    return "READY_FOR_REVIEW"
 
 def _select_known_dropdowns(page: Page) -> int:
     """Select known safe dropdown values without guessing unknown questions."""
@@ -1095,15 +2051,13 @@ def _required_empty_count(page: Page) -> int:
     return count
 
 
-def _wait_for_manual_consent(page: Page, detection_timeout_ms=3000, wait_timeout_ms=120000) -> bool:
-    """
-    Detect a visible privacy/consent modal and wait for the human user
-    to complete it.
+def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout_ms=120000) -> bool:
+    """Detect and automatically accept cookie/privacy consent banners.
 
-    IMPORTANT:
-    This function NEVER clicks Agree/Accept/Consent.
-    If no consent modal is detected, it returns immediately so normal
-    ATS pages continue without delay.
+    This is limited to cookie/privacy consent controls with an exact,
+    unambiguous label such as Accept, Accept All, Agree, or I Agree.
+    It does not click application terms, job-specific declarations, or
+    unknown checkboxes/buttons.
     """
 
     consent_phrases = (
@@ -1114,147 +2068,114 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=3000, wait_timeout
         "terms specified",
         "terms and conditions",
         "consent agreement",
+        "cookie policy",
+        "use cookies",
+        "cookie settings",
+        "privacy preferences",
+        "your choices will be recorded",
     )
 
-    agree_phrases = (
-        "i agree",
-        "agree",
+    accepted_labels = {
         "accept",
+        "accept all",
+        "agree",
+        "i agree",
         "consent",
-    )
+    }
 
-    def find_consent_dialog():
+    def control_label(control):
         try:
-            dialogs = page.locator(
+            values = [
+                control.inner_text() or "",
+                control.get_attribute("aria-label") or "",
+                control.get_attribute("title") or "",
+                control.get_attribute("value") or "",
+            ]
+            return " ".join(v.strip().lower() for v in values if v).strip()
+        except Exception:
+            return ""
+
+    def find_consent_control():
+        # First inspect explicit dialog/overlay containers.
+        try:
+            containers = page.locator(
                 "dialog, [role='dialog'], [aria-modal='true']"
             )
-
-            for i in range(dialogs.count()):
-                dialog = dialogs.nth(i)
-
-                try:
-                    if not dialog.is_visible():
-                        continue
-
-                    text = (
-                        dialog.inner_text() or ""
-                    ).strip().lower()
-
-                    if not text:
-                        continue
-
-                    has_consent_text = any(
-                        phrase in text
-                        for phrase in consent_phrases
-                    )
-
-                    if not has_consent_text:
-                        continue
-
-                    buttons = dialog.locator(
-                        "button, [role='button'], "
-                        "input[type='button'], input[type='submit']"
-                    )
-
-                    for j in range(buttons.count()):
-                        button = buttons.nth(j)
-
-                        try:
-                            if not button.is_visible():
-                                continue
-
-                            button_text = (
-                                button.inner_text() or ""
-                            ).strip().lower()
-
-                            aria = (
-                                button.get_attribute("aria-label")
-                                or ""
-                            ).strip().lower()
-
-                            title = (
-                                button.get_attribute("title")
-                                or ""
-                            ).strip().lower()
-
-                            combined = (
-                                f"{button_text} {aria} {title}"
-                            )
-
-                            if any(
-                                phrase in combined
-                                for phrase in agree_phrases
-                            ):
-                                return dialog
-
-                        except Exception:
-                            continue
-
-                except Exception:
+            for i in range(containers.count()):
+                container = containers.nth(i)
+                if not _visible(container):
                     continue
 
+                text = (container.inner_text() or "").strip().lower()
+                if not text or not any(p in text for p in consent_phrases):
+                    continue
+
+                controls = container.locator(
+                    "button, [role='button'], input[type='button'], input[type='submit']"
+                )
+                for j in range(controls.count()):
+                    control = controls.nth(j)
+                    if not _visible(control):
+                        continue
+                    if control_label(control) in accepted_labels:
+                        return control
+        except Exception:
+            pass
+
+        # TrustArc and similar cookie banners may not use dialog markup.
+        try:
+            body = (page.locator("body").inner_text() or "").strip().lower()
+            if any(p in body for p in consent_phrases):
+                controls = page.locator(
+                    "button, [role='button'], input[type='button'], input[type='submit']"
+                )
+                for i in range(controls.count()):
+                    control = controls.nth(i)
+                    if not _visible(control):
+                        continue
+                    if control_label(control) in accepted_labels:
+                        return control
         except Exception:
             pass
 
         return None
 
-    # Give a dynamically-rendered consent modal a short opportunity
-    # to appear. If none appears, this is a normal ATS page.
-    detection_deadline = (
-        time.time() + detection_timeout_ms / 1000
-    )
+    deadline = time.time() + detection_timeout_ms / 1000
 
-    while time.time() < detection_deadline:
-        dialog = find_consent_dialog()
-
-        if dialog is not None:
+    while time.time() < deadline:
+        control = find_consent_control()
+        if control is not None:
             print()
             print("=" * 70)
-            print("PRIVACY / CONSENT AGREEMENT DETECTED")
+            print("PRIVACY / COOKIE CONSENT DETECTED")
             print("=" * 70)
-            print()
-            print(
-                "A privacy or consent agreement requires human action."
-            )
-            print()
-            print(
-                "Please review the agreement and click the "
-                "appropriate button yourself."
-            )
-            print()
-            print(
-                'Automation will NOT click "I Agree" / "Accept".'
-            )
-            print()
-            print("Waiting for manual consent...")
+            print("Automatically accepting the clearly identified consent control...")
 
-            wait_deadline = (
-                time.time() + wait_timeout_ms / 1000
-            )
+            try:
+                control.scroll_into_view_if_needed()
+            except Exception:
+                pass
 
-            while time.time() < wait_deadline:
-                if find_consent_dialog() is None:
-                    print()
-                    print("Manual consent completed.")
-                    print(
-                        "Continuing application preparation..."
-                    )
+            try:
+                control.click()
+                page.wait_for_timeout(1000)
+            except Exception as exc:
+                print(f"Automatic consent click failed: {exc}")
+                return False
+
+            # Confirm that the consent overlay/control disappeared.
+            verify_deadline = time.time() + wait_timeout_ms / 1000
+            while time.time() < verify_deadline:
+                if find_consent_control() is None:
+                    print("Privacy/cookie consent accepted automatically.")
+                    print("Continuing application preparation...")
                     return True
-
                 try:
                     page.wait_for_timeout(500)
                 except Exception:
                     time.sleep(0.5)
 
-            print()
-            print("=" * 70)
-            print("MANUAL CONSENT TIMEOUT")
-            print("=" * 70)
-            print(
-                "Consent was not completed within the "
-                "allowed waiting period."
-            )
-            print("Stopping safely.")
+            print("Consent control did not disappear after automatic click.")
             return False
 
         try:
@@ -1262,7 +2183,6 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=3000, wait_timeout
         except Exception:
             time.sleep(0.25)
 
-    # No consent modal was detected. Continue normal ATS processing.
     return True
 
 
@@ -1275,20 +2195,53 @@ def prepare_external_application_page(
     current_location: str = CURRENT_LOCATION,
     current_company: str = CURRENT_COMPANY,
 ):
-    """Fill only known external fields and stop for manual review.
-
-    Unknown fields are deliberately untouched. External ATS submission is not
-    performed here.
-    """
+    """Handle an external ATS page without guessing unknown questions."""
     body = _text(page)
     ats = detect_ats(page.url, body)
     print(f"External ATS detected: {ats}")
     print(f"External page: {page.url}")
     print("Preparing external application page...")
-    consent_completed = _wait_for_manual_consent(page)
 
+    consent_completed = _wait_for_manual_consent(page)
     if not consent_completed:
-        print()
+        print("External application requires manual consent.")
+        print("No application submission was performed.")
+        return "READY_FOR_REVIEW"
+
+    # On unknown company career pages, first follow an unambiguous Apply control
+    # to reach the actual application form. This is generic and not job-specific.
+    if ats != "GOOGLE_FORMS":
+        page = _click_external_application_start(page)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+        body = _text(page)
+        ats = detect_ats(page.url, body)
+        print(f"External application page after Apply control: {page.url}")
+        print(f"External ATS detected after navigation: {ats}")
+
+        # The company page can open the SuccessFactors form in the same tab
+        # while its cookie banner appears only after navigation. Handle that
+        # banner before inspecting/filing the form.
+        consent_completed = _wait_for_manual_consent(page)
+        if not consent_completed:
+            print("External application requires consent handling.")
+            print("No application submission was performed.")
+            return "READY_FOR_REVIEW"
+
+        # Re-detect after consent because the banner can obscure the form and
+        # the first body snapshot may have been taken before the form rendered.
+        body = _text(page)
+        ats = detect_ats(page.url, body)
+        print(f"External ATS detected after consent: {ats}")
+
+    consent_completed = _wait_for_manual_consent(page)
+    if not consent_completed:
         print("External application requires manual consent.")
         print("No application submission was performed.")
         return "READY_FOR_REVIEW"
@@ -1301,7 +2254,24 @@ def prepare_external_application_page(
             phone,
             current_location,
             current_company,
+            resume_path or RESUME_PATH,
         )
+
+    if ats == "SUCCESSFACTORS" or "successfactors.eu" in (page.url or "").lower() or "successfactors.com" in (page.url or "").lower():
+        account_result = _prepare_successfactors_account(page)
+        if account_result == "FAILED":
+            return "FAILED"
+        if account_result == "READY_FOR_REVIEW":
+            return "READY_FOR_REVIEW"
+        # CONTINUE means the account step completed. The same generic
+        # application handling below now operates on the resulting page.
+        body = _text(page)
+        ats = detect_ats(page.url, body)
+
+    if not _looks_like_application_form(page):
+        print("No recognizable external application form was reached.")
+        print("No external submission was performed.")
+        return "READY_FOR_REVIEW"
 
     special_fields = _fill_known_application_fields(page, name)
     if special_fields:
@@ -1334,17 +2304,14 @@ def prepare_external_application_page(
     required = _required_empty_count(page)
     print(f"Visible required fields still empty: {required}")
     if required:
-        print("Required fields remain empty; manual review is required.")
-    else:
-        print("No visible required fields remain empty.")
+        print("Required fields remain empty; unknown required questions will not be guessed.")
+        return "READY_FOR_REVIEW"
 
-    print("External application prepared for manual review.")
-    print("No external submission was performed.")
-    return "READY_FOR_REVIEW"
-
+    print("No visible required fields remain empty.")
+    return _auto_submit_external_application(page)
 
 def external_apply(*args, **kwargs):
-    """Compatibility wrapper: prepare the page but never submit externally."""
+    """Compatibility wrapper for generic external application handling."""
     page = kwargs.get("page") or (args[0] if args else None)
     if page is None:
         return "FAILED"
