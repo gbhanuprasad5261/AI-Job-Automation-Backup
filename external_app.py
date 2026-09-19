@@ -1481,12 +1481,8 @@ def _upload_resume(page: Page, resume_path: str) -> bool:
 
 
 def _looks_like_application_form(page: Page) -> bool:
-    """Return True when the current page is clearly an application form.
+    """Return True only when an actual application interface is visible."""
 
-    SuccessFactors registration/application pages are recognized explicitly
-    by their platform URL/text, while other ATS pages use visible form
-    controls. This never assumes an unknown question's answer.
-    """
     try:
         url = (page.url or "").lower()
     except Exception:
@@ -1494,22 +1490,53 @@ def _looks_like_application_form(page: Page) -> bool:
 
     body = _text(page).lower()
 
-    if "successfactors.eu" in url or "successfactors.com" in url:
+    # Known ATS/platform indicators.
+    if any(domain in url for domain in (
+        "successfactors.eu",
+        "successfactors.com",
+        "greenhouse.io",
+        "lever.co",
+        "myworkdayjobs.com",
+        "ashbyhq.com",
+        "smartrecruiters.com",
+        "jobvite.com",
+    )):
         if any(term in body for term in (
-            "career opportunities",
-            "employee login",
-            "choose password",
-            "retype password",
-            "legal first name",
-            "country/region code",
-            "candidate profile",
+            "apply for this position",
+            "application form",
             "complete your application",
+            "candidate information",
+            "personal information",
+            "upload resume",
+            "upload cv",
+            "submit application",
+            "contact information",
         )):
             return True
 
+    strong_phrases = (
+        "application form",
+        "apply for this position",
+        "apply for this job",
+        "complete your application",
+        "candidate information",
+        "candidate details",
+        "personal information",
+        "contact information",
+        "upload resume",
+        "upload your resume",
+        "upload cv",
+        "submit application",
+        "employment application",
+    )
+
+    if any(phrase in body for phrase in strong_phrases):
+        return True
+
     try:
         inputs = page.locator(
-            "input:not([type='hidden']), textarea, select, input[type='file']"
+            "input:not([type='hidden']):not([type='submit']), "
+            "textarea, select, input[type='file']"
         )
         visible_count = 0
         for i in range(min(inputs.count(), 120)):
@@ -1520,64 +1547,194 @@ def _looks_like_application_form(page: Page) -> bool:
     except Exception:
         pass
 
-    return any(phrase in body for phrase in (
-        "apply for this position",
-        "application form",
-        "submit application",
-        "complete your application",
-        "candidate information",
-        "career opportunities:",
-    ))
+    if _iframe_contains_application_form(page):
+        return True
+
+    return False
+
+
+def _iframe_contains_application_form(page: Page) -> bool:
+    """Detect an application form rendered inside a visible iframe."""
+    try:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+
+            try:
+                body_text = (
+                    frame.locator("body").inner_text(timeout=1500) or ""
+                ).lower()
+            except Exception:
+                body_text = ""
+
+            if any(term in body_text for term in (
+                "application form",
+                "apply for this position",
+                "complete your application",
+                "submit application",
+                "candidate information",
+                "personal information",
+                "upload resume",
+                "upload cv",
+            )):
+                return True
+
+            try:
+                controls = frame.locator(
+                    "input:not([type='hidden']), "
+                    "textarea, select, input[type='file']"
+                )
+                visible = 0
+                for i in range(min(controls.count(), 30)):
+                    if controls.nth(i).is_visible():
+                        visible += 1
+                        if visible >= 2:
+                            return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def _all_application_pages(page: Page):
+    """Return the current page plus any recently opened pages/tabs."""
+    pages = []
+
+    try:
+        context = page.context
+        for candidate in context.pages:
+            try:
+                if not candidate.is_closed():
+                    pages.append(candidate)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if page not in pages:
+        pages.insert(0, page)
+
+    return pages
+
+
+def _wait_for_external_application(page: Page, timeout_ms: int = 12000):
+    """Wait for delayed/JavaScript-rendered application flows."""
+    deadline = time.time() + (timeout_ms / 1000)
+
+    while time.time() < deadline:
+        pages = _all_application_pages(page)
+
+        for candidate in pages:
+            try:
+                if _looks_like_application_form(candidate):
+                    return candidate
+            except Exception:
+                continue
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
+
+    return page
 
 
 def _click_external_application_start(page: Page):
-    """Click a clearly labeled application-start control and return the active page.
+    """
+    Find and click a clearly identifiable application-start control.
 
-    This is intentionally generic: it never selects a job-specific selector.
+    Handles same-tab navigation, popup/new-tab application flows,
+    delayed JavaScript navigation, and broader company-site Apply labels.
     """
     if _looks_like_application_form(page):
         return page
 
-    allowed = {
+    allowed_terms = (
         "apply now",
         "apply",
         "apply for this job",
         "apply for this position",
-        "start application",
         "apply online",
-    }
+        "start application",
+        "begin application",
+        "submit application",
+        "continue application",
+        "apply to this job",
+    )
 
     candidates = page.locator(
-        "button, [role='button'], a, [role='link'], input[type='submit'], input[type='button']"
+        "button, [role='button'], a, [role='link'], "
+        "input[type='submit'], input[type='button']"
     )
-    for i in range(candidates.count()):
+
+    try:
+        total = candidates.count()
+    except Exception:
+        total = 0
+
+    for i in range(total):
         control = candidates.nth(i)
+
         if not _visible(control):
             continue
+
         label = " ".join([
             _attr(control, "aria-label"),
             _attr(control, "title"),
             (control.inner_text() or ""),
             _attr(control, "value"),
-        ]).strip().lower()
-        normalized = " ".join(label.split())
-        if normalized not in allowed:
+        ])
+        normalized = " ".join(label.lower().split())
+
+        if not any(
+            term == normalized or term in normalized
+            for term in allowed_terms
+        ):
+            continue
+
+        print(f"Application-start control found: {normalized[:120]}")
+
+        before_pages = set(_all_application_pages(page))
+
+        try:
+            control.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        try:
+            control.click(timeout=5000)
+        except Exception as exc:
+            print(f"Application control click failed: {exc}")
             continue
 
         try:
-            with page.expect_popup(timeout=3000) as popup_info:
-                control.click()
-            popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=15000)
-            return popup
+            page.wait_for_timeout(1000)
         except Exception:
-            try:
-                control.click()
-                page.wait_for_timeout(1500)
-            except Exception:
-                return page
-            return page
+            pass
 
+        active_page = _wait_for_external_application(
+            page,
+            timeout_ms=12000,
+        )
+
+        after_pages = _all_application_pages(page)
+
+        for candidate_page in after_pages:
+            if candidate_page in before_pages:
+                continue
+
+            try:
+                if _looks_like_application_form(candidate_page):
+                    print("Application form detected in newly opened page.")
+                    return candidate_page
+            except Exception:
+                continue
+
+        return active_page
+
+    print("No recognizable external application-start control found.")
     return page
 
 
@@ -2217,9 +2374,15 @@ def prepare_external_application_page(
         except Exception:
             pass
         try:
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(1500)
         except Exception:
             pass
+
+        page = _wait_for_external_application(
+            page,
+            timeout_ms=12000,
+        )
+
         body = _text(page)
         ats = detect_ats(page.url, body)
         print(f"External application page after Apply control: {page.url}")
