@@ -1599,7 +1599,7 @@ def _iframe_contains_application_form(page: Page) -> bool:
 
 
 def _all_application_pages(page: Page):
-    """Return the current page plus any recently opened pages/tabs."""
+    """Return open pages in the current browser context."""
     pages = []
 
     try:
@@ -1619,14 +1619,31 @@ def _all_application_pages(page: Page):
     return pages
 
 
-def _wait_for_external_application(page: Page, timeout_ms: int = 12000):
-    """Wait for delayed/JavaScript-rendered application flows."""
+def _wait_for_external_application(
+    page: Page,
+    timeout_ms: int = 12000,
+    baseline_pages=None,
+):
+    """Wait for an application form without adopting stale pages from earlier jobs."""
+    baseline_pages = set(baseline_pages or ())
     deadline = time.time() + (timeout_ms / 1000)
 
     while time.time() < deadline:
-        pages = _all_application_pages(page)
+        candidates = [page]
 
-        for candidate in pages:
+        try:
+            for candidate in page.context.pages:
+                if candidate is page or candidate in baseline_pages:
+                    continue
+                try:
+                    if not candidate.is_closed():
+                        candidates.append(candidate)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        for candidate in candidates:
             try:
                 if _looks_like_application_form(candidate):
                     return candidate
@@ -1717,20 +1734,16 @@ def _click_external_application_start(page: Page):
         active_page = _wait_for_external_application(
             page,
             timeout_ms=12000,
+            baseline_pages=before_pages,
         )
 
-        after_pages = _all_application_pages(page)
-
-        for candidate_page in after_pages:
-            if candidate_page in before_pages:
-                continue
-
+        if active_page is not page:
             try:
-                if _looks_like_application_form(candidate_page):
+                if _looks_like_application_form(active_page):
                     print("Application form detected in newly opened page.")
-                    return candidate_page
+                    return active_page
             except Exception:
-                continue
+                pass
 
         return active_page
 
@@ -1780,7 +1793,7 @@ def _find_final_submit_control(page: Page):
 
 
 def _external_submission_verified(page: Page, previous_url: str) -> bool:
-    """Verify a submitted external application using success text or URL evidence."""
+    """Verify a submitted external application using explicit confirmation evidence."""
     success_phrases = (
         "application submitted",
         "application received",
@@ -1792,18 +1805,41 @@ def _external_submission_verified(page: Page, previous_url: str) -> bool:
         "thank you for your application",
         "your application has been received",
         "application complete",
+        # Microsoft Forms confirmation wording.
+        "your response has been recorded",
+        "response has been recorded",
+        "your response was recorded",
+        "thanks for submitting",
+        "thank you for submitting",
+        "response recorded",
+        "form submitted",
     )
 
-    for _ in range(20):
+    previous_url = (previous_url or "").lower()
+
+    for _ in range(24):
         body = _text(page).lower()
         if any(phrase in body for phrase in success_phrases):
             return True
 
         try:
-            if page.url != previous_url and any(token in page.url.lower() for token in (
-                "thank", "success", "confirmation", "complete", "submitted", "application"
-            )):
-                return True
+            current_url = (page.url or "").lower()
+            if current_url != previous_url:
+                # Only accept URL evidence when the destination itself is a
+                # conventional confirmation/success page. A generic URL
+                # change is not enough to mark an application as submitted.
+                if any(token in current_url for token in (
+                    "thank", "success", "confirmation", "complete", "submitted",
+                    "formresponse", "responsepage",
+                )):
+                    # Microsoft Forms can keep responsepage.aspx while changing
+                    # its body to the recorded-response confirmation. The body
+                    # check above remains the primary proof.
+                    if any(token in current_url for token in (
+                        "thank", "success", "confirmation", "complete", "submitted",
+                        "formresponse",
+                    )):
+                        return True
         except Exception:
             pass
 
@@ -1862,15 +1898,39 @@ def _prepare_successfactors_account(page: Page) -> str:
     fields are never guessed.
     """
     password = SUCCESSFACTORS_PASSWORD.strip()
-    if not password:
-        print("SuccessFactors password is not configured; stopping safely.")
-        return "READY_FOR_REVIEW"
 
-    filled = 0
-
+    # A SuccessFactors application page can contain an "Employee Login"
+    # header while the actual candidate application is available without
+    # a password. Only require the configured password when a visible
+    # password field is actually present.
     password_fields = page.locator(
         "input[type='password'], input[name*='pwd' i], input[id*='pwd' i]"
     )
+
+    visible_password_fields = []
+    try:
+        for i in range(password_fields.count()):
+            field = password_fields.nth(i)
+            if _visible(field):
+                visible_password_fields.append(field)
+    except Exception:
+        visible_password_fields = []
+
+    if not visible_password_fields:
+        print(
+            "No visible SuccessFactors password field found; "
+            "continuing with candidate application flow."
+        )
+        return "CONTINUE"
+
+    if not password:
+        print(
+            "SuccessFactors password field is visible, but "
+            "SUCCESSFACTORS_PASSWORD is not configured; stopping safely."
+        )
+        return "READY_FOR_REVIEW"
+
+    filled = 0
     seen = set()
     for i in range(password_fields.count()):
         field = password_fields.nth(i)
@@ -2208,37 +2268,49 @@ def _required_empty_count(page: Page) -> int:
     return count
 
 
-def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout_ms=120000) -> bool:
-    """Detect and automatically accept cookie/privacy consent banners.
+def _wait_for_manual_consent(page: Page, detection_timeout_ms=8000, wait_timeout_ms=10000) -> bool:
+    """Automatically accept clearly identified cookie/privacy banners.
 
-    This is limited to cookie/privacy consent controls with an exact,
-    unambiguous label such as Accept, Accept All, Agree, or I Agree.
-    It does not click application terms, job-specific declarations, or
-    unknown checkboxes/buttons.
+    This helper is intentionally conservative about WHAT it clicks:
+      * It only considers visible cookie/privacy consent containers or
+        controls whose surrounding text clearly indicates cookie/privacy
+        consent.
+      * It prefers labels such as Accept All Cookies / Accept All / Accept.
+      * It never clicks Reject, Save Preferences, application terms,
+        declarations, or arbitrary buttons.
+
+    It is safe to call after every page navigation.
     """
 
     consent_phrases = (
-        "data privacy agreement",
-        "privacy agreement",
-        "privacy notice",
-        "privacy policy",
-        "terms specified",
-        "terms and conditions",
-        "consent agreement",
+        "we use cookies",
+        "we use cookies to",
+        "cookie preferences",
+        "cookie preference",
+        "cookie consent",
         "cookie policy",
+        "cookies necessary",
+        "cookies are used",
+        "accept cookies",
         "use cookies",
-        "cookie settings",
+        "your cookie choices",
         "privacy preferences",
+        "privacy preference",
+        "privacy notice",
+        "privacy agreement",
+        "data privacy",
+        "consent agreement",
         "your choices will be recorded",
     )
 
-    accepted_labels = {
-        "accept",
-        "accept all",
-        "agree",
-        "i agree",
-        "consent",
-    }
+    reject_words = (
+        "reject",
+        "decline",
+        "deny",
+        "do not accept",
+        "necessary only",
+        "only necessary",
+    )
 
     def control_label(control):
         try:
@@ -2247,51 +2319,121 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout
                 control.get_attribute("aria-label") or "",
                 control.get_attribute("title") or "",
                 control.get_attribute("value") or "",
+                control.get_attribute("data-testid") or "",
             ]
-            return " ".join(v.strip().lower() for v in values if v).strip()
+            label = " ".join(v.strip().lower() for v in values if v)
+            label = re.sub(r"\s+", " ", label).strip()
+            return label
         except Exception:
             return ""
 
+    def is_accept_label(label):
+        if not label or any(word in label for word in reject_words):
+            return False
+
+        # Covers:
+        # Accept
+        # Accept All
+        # Accept All Cookies
+        # Accept Cookies
+        # Allow All
+        # Allow All Cookies
+        # I Agree / Agree
+        return bool(
+            re.search(
+                r"\b("
+                r"accept(?:\s+all)?(?:\s+(?:cookies?|tracking|optional))?"
+                r"|allow(?:\s+all)?(?:\s+(?:cookies?|tracking|optional))?"
+                r"|agree"
+                r"|i\s+agree"
+                r"|consent"
+                r")\b",
+                label,
+                re.I,
+            )
+        )
+
+    def has_cookie_context(text):
+        text = (text or "").lower()
+        return any(phrase in text for phrase in consent_phrases)
+
     def find_consent_control():
-        # First inspect explicit dialog/overlay containers.
+        # 1. Strongest signal: visible cookie/privacy overlays/dialogs.
         try:
             containers = page.locator(
-                "dialog, [role='dialog'], [aria-modal='true']"
+                "dialog, [role='dialog'], [aria-modal='true'], "
+                "[id*='cookie' i], [class*='cookie' i], "
+                "[id*='consent' i], [class*='consent' i], "
+                "[id*='privacy' i], [class*='privacy' i]"
             )
+
             for i in range(containers.count()):
                 container = containers.nth(i)
                 if not _visible(container):
                     continue
 
-                text = (container.inner_text() or "").strip().lower()
-                if not text or not any(p in text for p in consent_phrases):
+                try:
+                    text = container.inner_text() or ""
+                except Exception:
+                    text = ""
+
+                if not has_cookie_context(text):
                     continue
 
                 controls = container.locator(
-                    "button, [role='button'], input[type='button'], input[type='submit']"
+                    "button, [role='button'], input[type='button'], "
+                    "input[type='submit'], a"
                 )
+
                 for j in range(controls.count()):
                     control = controls.nth(j)
                     if not _visible(control):
                         continue
-                    if control_label(control) in accepted_labels:
+
+                    label = control_label(control)
+                    if is_accept_label(label):
                         return control
+
         except Exception:
             pass
 
-        # TrustArc and similar cookie banners may not use dialog markup.
+        # 2. Fallback for banners that do not have dialog/overlay markup.
         try:
-            body = (page.locator("body").inner_text() or "").strip().lower()
-            if any(p in body for p in consent_phrases):
+            body = page.locator("body").inner_text() or ""
+            if has_cookie_context(body):
                 controls = page.locator(
-                    "button, [role='button'], input[type='button'], input[type='submit']"
+                    "button, [role='button'], input[type='button'], "
+                    "input[type='submit'], a"
                 )
+
+                candidates = []
                 for i in range(controls.count()):
                     control = controls.nth(i)
                     if not _visible(control):
                         continue
-                    if control_label(control) in accepted_labels:
+
+                    label = control_label(control)
+                    if is_accept_label(label):
+                        candidates.append(control)
+
+                # Prefer an explicit cookie-labelled accept control.
+                for control in candidates:
+                    label = control_label(control)
+                    if "cookie" in label or "cookies" in label:
                         return control
+
+                # If the page itself clearly says it uses cookies, an
+                # unambiguous Accept/Allow/Agree control is safe to use.
+                if len(candidates) == 1:
+                    return candidates[0]
+
+                # Prefer "Accept All" over generic Accept when multiple
+                # consent controls are present.
+                for control in candidates:
+                    label = control_label(control)
+                    if "accept all" in label or "allow all" in label:
+                        return control
+
         except Exception:
             pass
 
@@ -2301,46 +2443,85 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout
 
     while time.time() < deadline:
         control = find_consent_control()
+
         if control is not None:
+            label = control_label(control)
+
             print()
             print("=" * 70)
-            print("PRIVACY / COOKIE CONSENT DETECTED")
+            print("COOKIE / PRIVACY CONSENT DETECTED")
             print("=" * 70)
-            print("Automatically accepting the clearly identified consent control...")
+            print(f"Automatically accepting: {label or 'consent control'}")
 
             try:
-                control.scroll_into_view_if_needed()
+                control.scroll_into_view_if_needed(timeout=3000)
             except Exception:
                 pass
 
             try:
-                control.click()
-                page.wait_for_timeout(1000)
-            except Exception as exc:
-                print(f"Automatic consent click failed: {exc}")
-                return False
+                control.click(timeout=5000)
+            except Exception:
+                try:
+                    control.click(force=True, timeout=5000)
+                except Exception as exc:
+                    print(f"Automatic cookie consent click failed: {exc}")
+                    return False
 
-            # Confirm that the consent overlay/control disappeared.
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                time.sleep(1)
+
+            # Verify briefly that the same consent control/banner disappeared.
             verify_deadline = time.time() + wait_timeout_ms / 1000
             while time.time() < verify_deadline:
                 if find_consent_control() is None:
-                    print("Privacy/cookie consent accepted automatically.")
-                    print("Continuing application preparation...")
+                    print("Cookie/privacy consent accepted automatically.")
                     return True
-                try:
-                    page.wait_for_timeout(500)
-                except Exception:
-                    time.sleep(0.5)
 
-            print("Consent control did not disappear after automatic click.")
-            return False
+                try:
+                    page.wait_for_timeout(300)
+                except Exception:
+                    time.sleep(0.3)
+
+            # Some CMPs keep a hidden/duplicate control in the DOM after
+            # accepting. The click itself succeeded, so don't block the job.
+            print("Cookie consent click completed; continuing.")
+            return True
 
         try:
-            page.wait_for_timeout(250)
+            page.wait_for_timeout(300)
         except Exception:
-            time.sleep(0.25)
+            time.sleep(0.3)
 
     return True
+
+
+def _external_page_has_error(page: Page) -> bool:
+    """Detect obvious external job/application error pages before filling anything."""
+    try:
+        title = page.title().lower()
+    except Exception:
+        title = ""
+    body = _text(page).lower()
+
+    strong_errors = (
+        "custom job error",
+        "job not found",
+        "position not found",
+        "position no longer available",
+        "job no longer available",
+        "this job is no longer available",
+        "page not found",
+        "404 not found",
+    )
+
+    if any(message in title or message in body for message in strong_errors):
+        return True
+
+    # Avoid treating ordinary career pages as errors merely because they
+    # contain the number 404 or generic error language.
+    return False
 
 
 def prepare_external_application_page(
@@ -2359,10 +2540,15 @@ def prepare_external_application_page(
     print(f"External page: {page.url}")
     print("Preparing external application page...")
 
+    if _external_page_has_error(page):
+        print("External application page shows a job/application error; stopping safely.")
+        return "FAILED"
+
     consent_completed = _wait_for_manual_consent(page)
     if not consent_completed:
-        print("External application requires manual consent.")
+        print("External application requires consent handling.")
         print("No application submission was performed.")
+        print("Automation will skip this application and continue.")
         return "READY_FOR_REVIEW"
 
     # On unknown company career pages, first follow an unambiguous Apply control
@@ -2378,10 +2564,21 @@ def prepare_external_application_page(
         except Exception:
             pass
 
-        page = _wait_for_external_application(
-            page,
-            timeout_ms=12000,
-        )
+        # _click_external_application_start already isolates newly opened
+        # pages from tabs left behind by earlier jobs. Do not scan the entire
+        # browser context again here, or a stale ATS page can be adopted.
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(750)
+        except Exception:
+            pass
+
+        if _external_page_has_error(page):
+            print("External application page shows a job/application error; stopping safely.")
+            return "FAILED"
 
         body = _text(page)
         ats = detect_ats(page.url, body)
@@ -2395,6 +2592,7 @@ def prepare_external_application_page(
         if not consent_completed:
             print("External application requires consent handling.")
             print("No application submission was performed.")
+            print("Automation will skip this application and continue.")
             return "READY_FOR_REVIEW"
 
         # Re-detect after consent because the banner can obscure the form and
@@ -2405,8 +2603,9 @@ def prepare_external_application_page(
 
     consent_completed = _wait_for_manual_consent(page)
     if not consent_completed:
-        print("External application requires manual consent.")
+        print("External application requires consent handling.")
         print("No application submission was performed.")
+        print("Automation will skip this application and continue.")
         return "READY_FOR_REVIEW"
 
     if ats == "GOOGLE_FORMS":
