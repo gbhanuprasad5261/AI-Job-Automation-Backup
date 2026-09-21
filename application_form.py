@@ -40,6 +40,10 @@ YEARS_OF_EXPERIENCE = os.getenv(
     "0"
 )
 
+# User-confirmed LinkedIn Easy Apply answers.
+NET_CORE_EXPERIENCE = os.getenv("NET_CORE_EXPERIENCE", "0")
+ENGINEERING_EXPERIENCE = os.getenv("ENGINEERING_EXPERIENCE", "0")
+
 CITY = os.getenv(
     "APPLICANT_CITY",
     "Bengaluru"
@@ -176,8 +180,12 @@ def fill_if_empty(locator, value):
 # ============================================================
 
 def _container_has_application_signals(container):
-    """Return True only for a visible modal/container that can safely be treated
-    as the Easy Apply UI. Never use the LinkedIn page shell as a fallback.
+    """Return True only for a visible LinkedIn Easy Apply container.
+
+    LinkedIn changes its Easy Apply DOM classes periodically. The detector
+    therefore accepts known Easy Apply markers plus a conservative combination
+    of modal/overlay structure, application controls, and application text.
+    It never falls back to the whole page.
     """
     try:
         if not container.is_visible():
@@ -185,60 +193,72 @@ def _container_has_application_signals(container):
 
         attrs = " ".join(
             safe_attribute(container, a)
-            for a in ("class", "id", "aria-label", "data-test-modal")
+            for a in ("class", "id", "aria-label", "data-test-modal", "role")
         ).lower()
 
-        # LinkedIn's known Easy Apply containers are sufficient proof.
-        if any(
-            marker in attrs
-            for marker in (
-                "jobs-easy-apply-modal",
-                "jobs-easy-apply-content",
-                "jobs-easy-apply",
-            )
-        ):
+        if any(marker in attrs for marker in (
+            "jobs-easy-apply-modal",
+            "jobs-easy-apply-content",
+            "jobs-easy-apply",
+            "easy-apply",
+        )):
             return True
 
         text = re.sub(r"\s+", " ", safe_text(container)).strip().lower()
 
-        # aria-modal / dialog candidates are accepted only when they actually
-        # look like an application UI, never merely because they exist.
         controls = container.locator(
-            "button, [role='button'], input, textarea, select, "
-            "[role='radio'], [role='checkbox']"
+            "button, [role='button'], input:not([type='hidden']), textarea, "
+            "select, [role='radio'], [role='checkbox'], [role='combobox']"
         )
         control_count = controls.count()
+        if control_count == 0:
+            return False
 
         application_terms = (
-            "contact info",
-            "resume",
-            "application questions",
-            "work experience",
-            "education",
-            "phone number",
-            "cover letter",
-            "submit application",
-            "review your application",
-            "review application",
-            "additional questions",
-            "screening questions",
+            "contact info", "contact information", "resume", "upload resume",
+            "application questions", "work experience", "education",
+            "phone number", "cover letter", "submit application",
+            "review your application", "review application",
+            "additional questions", "screening questions", "application form",
         )
 
         if any(term in text for term in application_terms):
             return True
 
-        if "artdeco-modal" in attrs and control_count > 0:
+        navigation_match = re.search(
+            r"\b(next|continue|review|submit|back)\b", text, re.I
+        )
+
+        modal_structure = any(marker in attrs for marker in (
+            "artdeco-modal", "dialog", "modal", "overlay", "data-test-modal",
+        ))
+
+        if modal_structure and navigation_match:
             return True
 
-        # Some LinkedIn builds expose only aria-modal/role=dialog with little
-        # or no identifying text. Require actual interactive controls plus a
-        # modal-like application action/heading before accepting it.
-        if (
-            ("aria-modal" in attrs or "dialog" in attrs)
-            and control_count > 0
-            and re.search(r"\b(next|continue|review|submit|back)\b", text, re.I)
-        ):
-            return True
+        # Some current LinkedIn builds omit useful modal classes/roles.
+        # The Easy Apply URL itself is an additional signal, but we still
+        # require application-specific text or navigation controls.
+        try:
+            url = container.page.url.lower()
+        except Exception:
+            url = ""
+
+        if "applicanttrackingsystemname=linkedin" in url:
+            heading = container.locator("h1, h2, h3, [role='heading']")
+            heading_text = " ".join(
+                safe_text(heading.nth(i)).lower()
+                for i in range(min(heading.count(), 8))
+                if is_visible(heading.nth(i))
+            )
+            if (
+                navigation_match
+                or any(term in heading_text for term in (
+                    "application", "contact", "experience",
+                    "education", "questions", "resume",
+                ))
+            ):
+                return True
 
         return False
 
@@ -246,42 +266,199 @@ def _container_has_application_signals(container):
         return False
 
 
-def get_application_container(page: Page, wait_seconds=10):
-    """Find the live Easy Apply modal without ever falling back to page.
-
-    Selector order is intentionally strict: known Easy Apply containers first,
-    then generic modal/dialog containers that contain application controls.
-    """
-    selectors = (
+def _candidate_application_selectors():
+    """Selectors covering current and older LinkedIn Easy Apply DOMs."""
+    return (
         ".jobs-easy-apply-modal",
         ".jobs-easy-apply-content",
         "[class*='jobs-easy-apply']",
         "[id*='jobs-easy-apply' i]",
+        "[class*='easy-apply']",
+        "[id*='easy-apply' i]",
         ".artdeco-modal",
         "[data-test-modal='true']",
+        "[data-test-modal]",
         "[aria-modal='true']",
         "[role='dialog']",
+        "[class*='modal']",
+        "[class*='overlay']",
     )
 
+
+def _find_easy_apply_container_from_controls(page):
+    """Find the Easy Apply container by starting from its live controls.
+
+    Some LinkedIn builds no longer expose stable Easy Apply modal classes or
+    ARIA dialog attributes. In those builds, the most reliable anchors are the
+    visible Next/Review/Submit controls and the form fields inside the modal.
+    We climb only a limited number of ancestors and require interactive form
+    controls, so the LinkedIn job-page shell is never used as the container.
+    """
+    try:
+        url = page.url.lower()
+    except Exception:
+        url = ""
+
+    if "applicanttrackingsystemname=linkedin" not in url:
+        return None
+
+    # Navigation controls are strong Easy Apply anchors.
+    button_candidates = page.locator(
+        "button, [role='button'], input[type='button'], input[type='submit']"
+    )
+
+    try:
+        count = button_candidates.count()
+    except Exception:
+        return None
+
+    anchor_words = re.compile(
+        r"^(next|continue|review|submit application|submit|back)$",
+        re.IGNORECASE,
+    )
+
+    for i in range(count):
+        try:
+            button = button_candidates.nth(i)
+            if not button.is_visible():
+                continue
+
+            label = " ".join(
+                part for part in (
+                    safe_text(button),
+                    safe_attribute(button, "aria-label"),
+                    safe_attribute(button, "value"),
+                )
+                if part
+            ).strip()
+
+            if not anchor_words.search(re.sub(r"\s+", " ", label)):
+                continue
+
+            # Walk up a bounded number of ancestors. A valid container must
+            # contain real form controls, not merely text from the job page.
+            candidate = button
+            for _ in range(10):
+                try:
+                    candidate = candidate.locator("xpath=..")
+                    if not candidate.is_visible():
+                        continue
+
+                    controls = candidate.locator(
+                        "input:not([type='hidden']), textarea, select, "
+                        "[role='combobox'], [role='radio'], [role='checkbox'], "
+                        "button, [role='button']"
+                    )
+                    control_count = controls.count()
+                    if control_count < 2 or control_count > 60:
+                        continue
+
+                    try:
+                        tag_name = candidate.evaluate(
+                            "el => el.tagName.toLowerCase()"
+                        )
+                        if tag_name in ("body", "html"):
+                            continue
+                    except Exception:
+                        pass
+
+                    text = re.sub(r"\s+", " ", safe_text(candidate)).strip().lower()
+                    if len(text) > 25000:
+                        continue
+                    application_terms = (
+                        "application", "contact", "resume", "education",
+                        "experience", "questions", "phone", "email",
+                    )
+                    if any(term in text for term in application_terms):
+                        return candidate
+                except Exception:
+                    break
+        except Exception:
+            continue
+
+    return None
+
+
+def _find_easy_apply_container_from_form_fields(page):
+    """Find a compact ancestor around visible Easy Apply form fields."""
+    try:
+        if "applicanttrackingsystemname=linkedin" not in page.url.lower():
+            return None
+
+        fields = page.locator(
+            "input:not([type='hidden']), textarea, select, [role='combobox']"
+        )
+        count = fields.count()
+
+        # Prefer fields that are visibly rendered. Start from a small sample
+        # because LinkedIn can keep many hidden fields in the DOM.
+        checked = 0
+        for i in range(count):
+            field = fields.nth(i)
+            if not field.is_visible():
+                continue
+            checked += 1
+            candidate = field
+            for _ in range(8):
+                candidate = candidate.locator("xpath=..")
+                if not candidate.is_visible():
+                    continue
+                controls = candidate.locator(
+                    "input:not([type='hidden']), textarea, select, "
+                    "[role='combobox'], [role='radio'], [role='checkbox'], "
+                    "button, [role='button']"
+                )
+                if controls.count() < 2:
+                    continue
+                text = re.sub(r"\s+", " ", safe_text(candidate)).strip().lower()
+                if any(term in text for term in (
+                    "contact info", "contact information", "resume",
+                    "application", "education", "experience",
+                    "phone number", "cover letter", "questions",
+                )):
+                    return candidate
+            if checked >= 12:
+                break
+    except Exception:
+        pass
+    return None
+
+
+def get_application_container(page: Page, wait_seconds=12):
+    """Find the live LinkedIn Easy Apply UI without using the page shell."""
+    selectors = _candidate_application_selectors()
     deadline = time.time() + max(0, wait_seconds)
 
     while True:
+        # 1. Stable LinkedIn modal selectors.
         for selector in selectors:
             try:
                 candidates = page.locator(selector)
                 count = candidates.count()
-
-                for i in range(count):
+                for i in range(count - 1, -1, -1):
                     candidate = candidates.nth(i)
                     if _container_has_application_signals(candidate):
                         return candidate
             except Exception:
                 continue
 
+        # 2. Current LinkedIn builds may expose no useful modal class.
+        #    Anchor from the actual Next/Review/Submit controls instead.
+        candidate = _find_easy_apply_container_from_controls(page)
+        if candidate is not None:
+            print("Easy Apply container found from live navigation controls.")
+            return candidate
+
+        # 3. Fallback within the Easy Apply URL: anchor from visible form fields.
+        candidate = _find_easy_apply_container_from_form_fields(page)
+        if candidate is not None:
+            print("Easy Apply container found from live form fields.")
+            return candidate
+
         if time.time() >= deadline:
             break
 
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(300)
 
     print()
     print("=" * 70)
@@ -1119,6 +1296,13 @@ def _value_for_text_question(combined):
     if "notice period" in q:
         return NOTICE_PERIOD
 
+    # User-confirmed experience answers.
+    if ".net core" in q or "dotnet core" in q or "dot net core" in q:
+        return NET_CORE_EXPERIENCE
+
+    if "engineering experience" in q:
+        return ENGINEERING_EXPERIENCE
+
     # Experience
     if (
         "years of experience" in q
@@ -1539,7 +1723,7 @@ def _radio_label_text(container, radio):
 
 
 def _click_radio_answer(group, answer):
-    """Click a radio option only when its label exactly/clearly matches."""
+    """Select a radio option robustly, including LinkedIn custom controls."""
     if group is None or not answer:
         return False
 
@@ -1547,6 +1731,7 @@ def _click_radio_answer(group, answer):
 
     try:
         controls = _radio_controls(group)
+
         for i in range(controls.count()):
             radio = controls.nth(i)
 
@@ -1580,28 +1765,47 @@ def _click_radio_answer(group, answer):
             except Exception:
                 pass
 
-            try:
-                radio.click(timeout=5000)
-            except Exception:
-                try:
-                    radio.evaluate("(el) => el.click()")
-                except Exception:
-                    radio_id = safe_attribute(radio, "id")
-                    if radio_id:
-                        try:
-                            label_element = group.locator(
-                                f"label[for='{radio_id}']"
-                            ).first
-                            if label_element.count() > 0:
-                                label_element.click(timeout=5000)
-                            else:
-                                continue
-                        except Exception:
-                            continue
-                    else:
-                        continue
+            # Preferred: click the associated visible label.
+            radio_id = safe_attribute(radio, "id")
+            clicked = False
 
-            group.page.wait_for_timeout(150)
+            if radio_id:
+                try:
+                    label_element = group.locator(
+                        f"label[for='{radio_id}']"
+                    ).first
+                    if label_element.count() > 0 and label_element.is_visible():
+                        label_element.click(timeout=5000, force=True)
+                        clicked = True
+                except Exception:
+                    pass
+
+            # Fallback: click the exact visible option text.
+            if not clicked:
+                try:
+                    option = group.get_by_text(
+                        re.sub(r"\s+", " ", str(label)).strip(),
+                        exact=True,
+                    ).first
+                    if option.count() > 0 and option.is_visible():
+                        option.click(timeout=5000, force=True)
+                        clicked = True
+                except Exception:
+                    pass
+
+            # Last fallback: activate the radio itself.
+            if not clicked:
+                try:
+                    radio.click(timeout=5000, force=True)
+                    clicked = True
+                except Exception:
+                    try:
+                        radio.evaluate("(el) => el.click()")
+                        clicked = True
+                    except Exception:
+                        pass
+
+            group.page.wait_for_timeout(250)
 
             try:
                 if radio.is_checked():
@@ -1610,38 +1814,83 @@ def _click_radio_answer(group, answer):
                 if safe_attribute(radio, "aria-checked").lower() == "true":
                     return True
 
+            # Some custom controls update only the accessibility state.
+            try:
+                if safe_attribute(radio, "checked").lower() in ("true", "checked"):
+                    return True
+            except Exception:
+                pass
+
     except Exception:
         pass
 
     return False
 
-
 def _radio_question_container_from_text(container, question_patterns):
-    """Find the exact radio group associated with a known question.
+    """Find a radio group by question text, including LinkedIn's non-semantic DOM."""
+    patterns = [p.lower() for p in question_patterns]
 
-    Do not walk arbitrary ancestors looking for two radios: a LinkedIn form
-    can contain multiple radio groups inside one shared wrapper. Instead,
-    inspect each radiogroup independently and derive its own question text.
-    """
+    def matches_question(text_value):
+        q = re.sub(r"\s+", " ", text_value or "").strip().lower()
+        return bool(q) and any(p in q for p in patterns)
+
+    # First: proper ARIA radiogroups.
     try:
         groups = container.locator("fieldset[role='radiogroup'], [role='radiogroup']")
         for i in range(groups.count()):
             group = groups.nth(i)
             if not group.is_visible():
                 continue
-
             controls = _radio_controls(group)
             if controls.count() < 2:
                 continue
-
-            question = _radio_question_text(group).lower()
-            if question and any(pattern.lower() in question for pattern in question_patterns):
+            question = _radio_question_text(group)
+            if matches_question(question):
                 return group
     except Exception:
         pass
 
-    return None
+    # Fallback: LinkedIn sometimes renders the question and radio inputs
+    # without a semantic radiogroup. Find the visible question text, then
+    # walk upward to the smallest ancestor containing 2+ radio controls.
+    try:
+        for pattern in patterns:
+            nodes = container.locator(
+                f"text=/{re.escape(pattern)}/i"
+            )
+            for i in range(nodes.count()):
+                node = nodes.nth(i)
+                if not node.is_visible():
+                    continue
 
+                current = node
+                for _ in range(9):
+                    try:
+                        current = current.locator("xpath=..")
+                        if current.count() == 0 or not current.is_visible():
+                            break
+
+                        group_text = re.sub(
+                            r"\s+", " ", safe_text(current)
+                        ).strip().lower()
+
+                        if not matches_question(group_text):
+                            continue
+
+                        controls = _radio_controls(current)
+                        count = controls.count()
+
+                        # Keep the scope tight: a real yes/no question should
+                        # have two radio controls. Avoid grabbing the whole
+                        # Easy Apply modal.
+                        if 2 <= count <= 4:
+                            return current
+                    except Exception:
+                        break
+    except Exception:
+        pass
+
+    return None
 
 def _find_preferred_work_location_group(container):
     """Find the preferred-work-location radio group when ARIA grouping is absent."""
@@ -1737,6 +1986,16 @@ def _answer_known_radio_questions(container):
             ["are you a fresher", "are you fresher", "fresher"],
             FRESHER,
             "Are you a fresher",
+        ),
+        (
+            [
+                "are you comfortable commuting to this job's location",
+                "comfortable commuting to this job's location",
+                "comfortable commuting",
+                "commuting to this job's location",
+            ],
+            WILLING_ONSITE,
+            "Comfortable commuting to this job's location",
         ),
     ]
 
@@ -2733,6 +2992,10 @@ def job_is_closed(page):
 
 def prepare_current_page(page: Page):
     print(); print("="*70); print("PREPARING APPLICATION PAGE"); print("="*70)
+    try:
+        print(f"Easy Apply URL detected: {'applicantTrackingSystemName=LinkedIn' in page.url}")
+    except Exception:
+        pass
     container=get_application_container(page)
     if container is None:
         print("APPLICATION FORM NOT DETECTED.")
@@ -2943,6 +3206,130 @@ def _final_submission_confirmed(page: Page) -> bool:
     return False
 
 
+
+def verify_final_review_page(page: Page) -> bool:
+    """Perform a conservative read-only verification of LinkedIn's final review.
+
+    This function never clicks controls. It confirms that the visible page
+    looks like the Easy Apply review stage, contains the configured answers
+    that can be verified from page text, and has no obvious required-field
+    validation errors before AUTO_SUBMIT is allowed to proceed.
+    """
+    print()
+    print("=" * 70)
+    print("VERIFYING FINAL REVIEW PAGE")
+    print("=" * 70)
+
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=5000)
+        ).strip()
+    except Exception as exc:
+        print(f"Could not read final review page: {exc}")
+        return False
+
+    normalized = body.lower()
+
+    # Obvious validation failures mean we must never submit.
+    blocking_patterns = (
+        "this field is required",
+        "please fill out this field",
+        "required field",
+        "required information is missing",
+        "please correct the errors",
+        "error occurred",
+    )
+
+    blocking = [p for p in blocking_patterns if p in normalized]
+    if blocking:
+        print("Blocking validation message detected:")
+        for item in blocking:
+            print(f"  - {item}")
+        print("Final review verification FAILED.")
+        return False
+
+    # LinkedIn's review page should expose at least one strong review signal.
+    review_signals = (
+        "review your application",
+        "additional questions",
+        "resume",
+        "application",
+    )
+
+    signal_count = sum(1 for signal in review_signals if signal in normalized)
+    if signal_count < 2:
+        print("Insufficient evidence that this is the final review page.")
+        print("Final review verification FAILED.")
+        return False
+
+    print(f"Review-page signals detected: {signal_count}")
+
+    # Verify configured answers when their labels and values are visible.
+    checks = (
+        (
+            "How many years of work experience do you have with .NET Core?",
+            str(TEXT_ANSWERS.get("how many years of work experience do you have with .net core?", "0")),
+        ),
+        (
+            "How many years of work experience do you have with MySQL?",
+            str(TEXT_ANSWERS.get("how many years of work experience do you have with mysql?", "1")),
+        ),
+        (
+            "How many years of Engineering experience do you currently have?",
+            str(TEXT_ANSWERS.get("how many years of engineering experience do you currently have?", "0")),
+        ),
+        (
+            "What's your current CTC?",
+            str(CURRENT_CTC),
+        ),
+        (
+            "What's your expected CTC?",
+            str(EXPECTED_CTC),
+        ),
+        (
+            "What's your official notice period?",
+            str(NOTICE_PERIOD),
+        ),
+        (
+            "Are you comfortable commuting to this job's location?",
+            str(WILLING_ONSITE),
+        ),
+    )
+
+    verified = 0
+    missing = 0
+
+    for label, expected in checks:
+        label_norm = re.sub(r"\s+", " ", label).strip().lower()
+        expected_norm = re.sub(r"\s+", " ", expected).strip().lower()
+
+        # Search for label followed reasonably closely by the expected value.
+        pattern = re.escape(label_norm) + r".{0,180}?" + re.escape(expected_norm)
+
+        if re.search(pattern, normalized, re.I):
+            print(f"  ✓ {label} -> {expected}")
+            verified += 1
+        else:
+            # Some LinkedIn review layouts render the label/value separately.
+            # Don't fail solely because one configured answer is not exposed
+            # as contiguous body text; report it for visibility.
+            print(f"  ? Could not text-verify: {label} -> {expected}")
+            missing += 1
+
+    if verified == 0:
+        print("No configured answer could be verified on the review page.")
+        print("Final review verification FAILED.")
+        return False
+
+    print(
+        f"Final review verification passed: {verified} answer(s) verified; "
+        f"{missing} not text-verifiable."
+    )
+    return True
+
+
 def handle_final_submission(page: Page):
     """Submit the Easy Apply application only when AUTO_SUBMIT is enabled.
 
@@ -2956,6 +3343,11 @@ def handle_final_submission(page: Page):
     print("=" * 70)
     print("FINAL APPLICATION PAGE DETECTED")
     print("=" * 70)
+
+    if not verify_final_review_page(page):
+        print("Final review verification failed.")
+        print("No submission will be attempted.")
+        return "FAILED"
 
     if not AUTO_SUBMIT:
         print("AUTO_SUBMIT is disabled.")
