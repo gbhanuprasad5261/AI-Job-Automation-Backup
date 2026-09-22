@@ -21,7 +21,7 @@ TRACKER_FILE = "data/application_tracker.csv"
 APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
 MIN_MATCH_SCORE = 70
-MAX_APPLICATIONS_PER_RUN = 1
+MAX_APPLICATIONS_PER_RUN = 15
 MAX_CANDIDATE_JOBS_PER_RUN = 10
 
 ALLOWED_LOCATION_KEYWORDS = (
@@ -40,104 +40,6 @@ CHROME_CDP_URL = "http://127.0.0.1:9222"
 # ---------------------------------------
 # Navigation helper
 # ---------------------------------------
-
-def _wait_for_cookie_consent(page, timeout_ms=8000):
-    """Automatically accept clearly identified cookie/privacy banners."""
-    import re
-    import time
-
-    phrases = (
-        "we use cookies",
-        "cookie preferences",
-        "cookie consent",
-        "cookie policy",
-        "cookies necessary",
-        "use cookies",
-        "privacy preferences",
-        "privacy notice",
-        "data privacy",
-    )
-    reject_words = (
-        "reject", "decline", "deny", "do not accept",
-        "necessary only", "only necessary",
-    )
-
-    def visible(el):
-        try:
-            return el.is_visible()
-        except Exception:
-            return False
-
-    def label(el):
-        try:
-            values = [
-                el.inner_text() or "",
-                el.get_attribute("aria-label") or "",
-                el.get_attribute("title") or "",
-                el.get_attribute("value") or "",
-            ]
-            return re.sub(r"\s+", " ", " ".join(values).lower()).strip()
-        except Exception:
-            return ""
-
-    def accept_label(value):
-        if not value or any(x in value for x in reject_words):
-            return False
-        return bool(re.search(
-            r"\b(?:accept(?:\s+all)?(?:\s+(?:cookies?|tracking|optional))?"
-            r"|allow(?:\s+all)?(?:\s+(?:cookies?|tracking|optional))?"
-            r"|agree|i\s+agree|consent)\b",
-            value,
-            re.I,
-        ))
-
-    deadline = time.time() + timeout_ms / 1000
-    while time.time() < deadline:
-        try:
-            body = page.locator("body").inner_text() or ""
-            if any(p in body.lower() for p in phrases):
-                controls = page.locator(
-                    "button, [role='button'], input[type='button'], "
-                    "input[type='submit'], a"
-                )
-                candidates = []
-                for i in range(controls.count()):
-                    el = controls.nth(i)
-                    if not visible(el):
-                        continue
-                    text = label(el)
-                    if accept_label(text):
-                        candidates.append((el, text))
-
-                # Cookie-labelled accept controls first.
-                for el, text in candidates:
-                    if "cookie" in text or "cookies" in text:
-                        el.click(timeout=5000)
-                        page.wait_for_timeout(800)
-                        return True
-
-                # Prefer Accept All/Allow All.
-                for el, text in candidates:
-                    if "accept all" in text or "allow all" in text:
-                        el.click(timeout=5000)
-                        page.wait_for_timeout(800)
-                        return True
-
-                # A single unambiguous consent button is safe.
-                if len(candidates) == 1:
-                    candidates[0][0].click(timeout=5000)
-                    page.wait_for_timeout(800)
-                    return True
-        except Exception:
-            pass
-
-        try:
-            page.wait_for_timeout(300)
-        except Exception:
-            time.sleep(0.3)
-
-    return False
-
 
 def navigate_page(page, url, timeout=30000, settle_ms=5000, required_url_fragment=None):
     """Navigate while tolerating slow post-navigation page loading."""
@@ -646,7 +548,7 @@ def is_current_job_already_applied(page):
 
 
 def find_easy_apply_button(page):
-    """Find the Easy Apply control for the CURRENT LinkedIn job only."""
+    """Find the Easy Apply control belonging to the CURRENT LinkedIn job."""
 
     def visible(element):
         try:
@@ -654,75 +556,162 @@ def find_easy_apply_button(page):
         except Exception:
             return False
 
-    def describe(element):
-        attrs = {}
-        for name in ("aria-label", "title", "href", "class"):
-            try:
-                attrs[name] = element.get_attribute(name) or ""
-            except Exception:
-                attrs[name] = ""
+    def get_text(element):
         try:
-            attrs["text"] = (element.inner_text() or "").strip()
+            return (element.inner_text() or "").strip()
         except Exception:
-            attrs["text"] = ""
-        return attrs
+            return ""
+
+    def get_attr(element, name):
+        try:
+            return element.get_attribute(name) or ""
+        except Exception:
+            return ""
+
+    def is_easy_apply(element):
+        text = get_text(element).lower()
+        aria = get_attr(element, "aria-label").lower()
+        title = get_attr(element, "title").lower()
+        href = get_attr(element, "href").lower()
+        classes = get_attr(element, "class").lower()
+
+        combined = f"{text} {aria} {title}"
+
+        return (
+            "easy apply" in combined
+            or "linkedin apply to" in combined
+            or "opensduiapplyflow=true" in href
+            or "jobs-apply-button" in classes
+        )
 
     def visible_candidates(selector):
         try:
             locator = page.locator(selector)
-            return [
-                locator.nth(i)
-                for i in range(locator.count())
-                if visible(locator.nth(i))
-            ]
+            result = []
+
+            for i in range(locator.count()):
+                element = locator.nth(i)
+                if visible(element):
+                    result.append(element)
+
+            return result
         except Exception:
             return []
 
-    # LinkedIn can render Easy Apply buttons on recommended-job cards.
-    # Therefore never scan every page-wide button for the words Easy Apply.
-    current_job_selectors = (
-        # New LinkedIn UI: this exact accessible name explicitly refers to
-        # the current job, so it is safe to prefer over page-wide matches.
+    # ---------------------------------------------------------
+    # 1. Strong current-job selectors
+    # ---------------------------------------------------------
+    selectors = (
         ".jobs-details__main-content [aria-label='Easy Apply to this job']",
-        "main [aria-label='Easy Apply to this job']",
-        "[aria-label='Easy Apply to this job']",
-        ".jobs-details__main-content button.jobs-apply-button",
         ".jobs-details__main-content [aria-label^='LinkedIn Apply to']",
+        ".jobs-details__main-content button.jobs-apply-button",
         ".jobs-details__main-content button[aria-label*='Easy Apply']",
         ".jobs-details__main-content [role='button'][aria-label*='Easy Apply']",
-        "main button.jobs-apply-button",
+
+        "main [aria-label='Easy Apply to this job']",
         "main [aria-label^='LinkedIn Apply to']",
-        "main [role='button'][aria-label*='Easy Apply']",
+        "main button.jobs-apply-button",
     )
 
-    for selector in current_job_selectors:
+    for selector in selectors:
         for element in visible_candidates(selector):
-            data = describe(element)
-            combined = f"{data['text']} {data['aria-label']} {data['title']}".lower()
-            if (
-                "easy apply" in combined
-                or "linkedin apply to" in combined
-                or "openSDUIApplyFlow=true" in data["href"]
-                or "jobs-apply-button" in data["class"]
-            ):
+            if is_easy_apply(element):
                 print("Current-job Easy Apply control found.")
                 return element
 
-    # New LinkedIn UI can expose the apply flow through a stable aria label.
-    candidates = visible_candidates("[aria-label^='LinkedIn Apply to']")
-    if len(candidates) == 1:
+    # ---------------------------------------------------------
+    # 2. Find the current job title and walk UP its DOM tree.
+    #
+    # This is important because LinkedIn may show Easy Apply
+    # buttons for recommended/sidebar jobs elsewhere on the page.
+    # ---------------------------------------------------------
+    title_candidates = []
+
+    for selector in (
+        ".jobs-details__main-content h1",
+        ".jobs-details__main-content .job-details-jobs-unified-top-card__job-title",
+        "main h1",
+    ):
+        try:
+            locator = page.locator(selector)
+
+            for i in range(locator.count()):
+                element = locator.nth(i)
+
+                if visible(element) and get_text(element):
+                    title_candidates.append(element)
+
+        except Exception:
+            pass
+
+    # Use the first visible current-job title.
+    for title_element in title_candidates[:3]:
+        try:
+            # Start from the title and progressively move upward.
+            container = title_element
+
+            for level in range(8):
+                if not container:
+                    break
+
+                try:
+                    candidates = container.locator(
+                        "button, a, [role='button']"
+                    )
+
+                    matching = []
+
+                    for i in range(candidates.count()):
+                        candidate = candidates.nth(i)
+
+                        if visible(candidate) and is_easy_apply(candidate):
+                            matching.append(candidate)
+
+                    if len(matching) == 1:
+                        print(
+                            "Current-job Easy Apply control found "
+                            "using job-title container."
+                        )
+                        return matching[0]
+
+                except Exception:
+                    pass
+
+                try:
+                    container = container.locator("..")
+                except Exception:
+                    break
+
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # 3. Last safe fallback:
+    # accept a page-wide control ONLY when it is unique.
+    # ---------------------------------------------------------
+    candidates = visible_candidates(
+        "[aria-label^='LinkedIn Apply to']"
+    )
+
+    matching = [element for element in candidates if is_easy_apply(element)]
+
+    if len(matching) == 1:
         print("Unique LinkedIn Apply control found.")
-        return candidates[0]
+        return matching[0]
 
-    # Only accept a page-wide jobs-apply-button when it is unique.
-    candidates = visible_candidates("button.jobs-apply-button")
-    if len(candidates) == 1:
-        data = describe(candidates[0])
-        combined = f"{data['text']} {data['aria-label']} {data['title']}".lower()
-        if "easy apply" in combined or "linkedin apply to" in combined or "openSDUIApplyFlow=true" in data["href"]:
-            print("Unique LinkedIn Easy Apply control found.")
-            return candidates[0]
+    candidates = visible_candidates(
+        "button.jobs-apply-button"
+    )
 
+    matching = [element for element in candidates if is_easy_apply(element)]
+
+    if len(matching) == 1:
+        print("Unique LinkedIn Easy Apply control found.")
+        return matching[0]
+
+    # ---------------------------------------------------------
+    # 4. External application detection.
+    # ---------------------------------------------------------
     try:
         body = page.locator("body").inner_text().lower()
     except Exception:
@@ -735,6 +724,7 @@ def find_easy_apply_button(page):
         "application on company website",
         "apply via company website",
     )
+
     if any(signal in body for signal in external_signals):
         print("External application detected.")
         return None
@@ -859,6 +849,29 @@ def save_diagnostic_screenshot(page):
             f"Screenshot failed: {e}"
         )
 
+
+
+# ---------------------------------------
+# Detect confirmed LinkedIn submission
+# ---------------------------------------
+
+def detect_linkedin_submission_confirmation(page):
+    """Return True only for strong, visible LinkedIn submission-confirmation text."""
+    strong_signals = (
+        "your application was sent to",
+        "application was sent to",
+        "your application has been submitted",
+        "application has been submitted",
+        "application submitted successfully",
+        "application submitted",
+    )
+
+    try:
+        body_text = (page.locator("body").inner_text(timeout=5000) or "").lower()
+    except Exception:
+        return False
+
+    return any(signal in body_text for signal in strong_signals)
 
 
 # ---------------------------------------
@@ -1288,17 +1301,26 @@ def open_easy_apply(job):
                         current_company="N/A",
                     )
 
+                    if result == "LOGIN_REQUIRED":
+                        print()
+                        print("=" * 70)
+                        print("EXTERNAL APPLICATION REQUIRES LOGIN/ACCOUNT SETUP")
+                        print("=" * 70)
+                        print("No external submission was performed.")
+                        print("This job will be skipped without asking for manual submission confirmation.")
+                        record_application_status(job, "LOGIN_REQUIRED")
+                        return False
+
                     if result == "READY_FOR_REVIEW":
                         print()
                         print("=" * 70)
-                        print("EXTERNAL APPLICATION NOT SUBMITTED")
+                        print("EXTERNAL APPLICATION READY FOR REVIEW")
                         print("=" * 70)
-                        print(
-                            "Automation could not safely verify a completed submission."
-                        )
-                        print(
-                            "Tracker remains NOT APPLIED. Continuing automatically..."
-                        )
+                        print("No external submission was performed.")
+                        print("Unattended mode: skipping this application.")
+                        print("The automation will continue to the next eligible job.")
+
+                        record_application_status(job, "READY_FOR_REVIEW")
                         return False
 
                     print()
@@ -1380,28 +1402,9 @@ def open_easy_apply(job):
         # Resolve the actual Easy Apply UI
         # ---------------------------------------
         original_page = page
+        page.wait_for_timeout(3000)
 
         def has_application_ui(candidate_page):
-            """
-            Detect LinkedIn Easy Apply using BOTH DOM and URL evidence.
-
-            LinkedIn can launch Easy Apply as an internal route such as:
-              ?companyName=...&applicantTrackingSystemName=LinkedIn
-
-            In that state, the classic .jobs-easy-apply-modal selector may
-            not be exposed even though the Easy Apply flow is active.
-            """
-            try:
-                url = (candidate_page.url or "").lower()
-            except Exception:
-                url = ""
-
-            # Strong LinkedIn Easy Apply route signal.
-            linkedin_apply_route = (
-                "applicanttrackingsystemname=linkedin" in url
-                and "companyname=" in url
-            )
-
             selectors = (
                 ".jobs-easy-apply-modal",
                 ".jobs-easy-apply-content",
@@ -1409,9 +1412,7 @@ def open_easy_apply(job):
                 ".artdeco-modal[role='dialog']",
                 "[aria-modal='true']",
                 "[role='dialog']",
-                "section[aria-label*='application' i]",
             )
-
             for selector in selectors:
                 try:
                     locator = candidate_page.locator(selector)
@@ -1419,95 +1420,47 @@ def open_easy_apply(job):
                         el = locator.nth(i)
                         if not el.is_visible():
                             continue
-
                         try:
                             text = (el.inner_text() or "").lower()
                         except Exception:
                             text = ""
-
-                        classes = (
-                            el.get_attribute("class") or ""
-                        ).lower()
-
-                        if (
-                            "jobs-easy-apply" in classes
-                            or any(token in text for token in (
-                                "application",
-                                "resume",
-                                "contact info",
-                                "work experience",
-                                "education",
-                                "submit application",
-                                "review application",
-                                "continue to next step",
-                            ))
-                        ):
+                        if any(token in text for token in (
+                            "application", "resume", "contact info",
+                            "work experience", "education", "submit application",
+                            "review application", "continue to next step",
+                        )) or "jobs-easy-apply" in (el.get_attribute("class") or ""):
                             return True
                 except Exception:
                     continue
-
-            # URL itself is strong evidence that the Easy Apply route opened.
-            # We deliberately require the LinkedIn-specific query parameters,
-            # so a normal LinkedIn job URL is not treated as an application.
-            if linkedin_apply_route:
-                return True
-
             return False
 
-        # LinkedIn may need several seconds to mount its application UI.
-        # Poll instead of taking one screenshot after a fixed 3-second wait.
-        application_page_found = False
-
-        for _ in range(24):
-            if has_application_ui(original_page):
-                page = original_page
-                application_page_found = True
-                print("LinkedIn Easy Apply flow detected on the original job page.")
-                break
-
-            # Check only additional LinkedIn pages. Never switch to an
-            # arbitrary tab such as a company or unrelated LinkedIn page.
-            for candidate_page in list(context.pages):
+        if has_application_ui(original_page):
+            page = original_page
+            print("Easy Apply modal detected on the original LinkedIn job page.")
+        else:
+            # Check actual popups/new tabs only. Never switch to an arbitrary
+            # LinkedIn page such as a company-home tab.
+            for candidate_page in context.pages:
                 if candidate_page is original_page:
                     continue
-
                 try:
-                    candidate_url = (candidate_page.url or "").lower()
-                    if "linkedin.com" not in candidate_url:
+                    if "linkedin.com" not in (candidate_page.url or "").lower():
                         continue
-
                     if has_application_ui(candidate_page):
                         page = candidate_page
-                        application_page_found = True
-                        print(
-                            "LinkedIn Easy Apply flow detected on an additional page."
-                        )
+                        print("Easy Apply modal detected on an additional LinkedIn page.")
                         break
                 except Exception:
                     continue
 
-            if application_page_found:
-                break
-
-            try:
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-        if not application_page_found:
+        if not has_application_ui(page):
             print()
-            print("EASY APPLY FLOW NOT DETECTED")
+            print("EASY APPLY MODAL NOT DETECTED")
             print(f"Current page URL after click: {page.url}")
             print("The automation will NOT process this page.")
             print("No form navigation or submission will be performed.")
             save_diagnostic_screenshot(original_page)
             return False
-
-        print()
-        print("=" * 70)
-        print("EASY APPLY FORM OPENED")
-        print("=" * 70)
-        print(f"Application page URL: {page.url}")
 
         print()
         print("=" * 70)
@@ -1535,15 +1488,13 @@ def open_easy_apply(job):
                 )
 
             elif application_result == "READY_FOR_REVIEW":
-                print(
-                    "\nApplication reached a review/unknown-field state."
-                )
-                print(
-                    "Automation could not safely verify submission."
-                )
-                print(
-                    "Tracker remains NOT APPLIED. Continuing automatically..."
-                )
+                print()
+                print("Form reached final review.")
+                print("Unattended mode: submission was not confirmed.")
+                print("Skipping this application and continuing.")
+
+                record_application_status(job, "READY_FOR_REVIEW")
+                return False
 
             else:
                 print(
@@ -1596,42 +1547,23 @@ def main():
     print()
 
     # ---------------------------------------
-    # Select starting job
-    # ---------------------------------------
-
-    try:
-
-        choice = int(
-            input(
-                f"Select starting job "
-                f"(1-{len(jobs)}): "
-            )
-        )
-
-    except ValueError:
-
-        print(
-            "Invalid selection."
-        )
-
-        return
-
-    if choice < 1 or choice > len(jobs):
-
-        print(
-            "Invalid job number."
-        )
-
-        return
-
-    # ---------------------------------------
     # Try selected and following jobs
     # ---------------------------------------
 
-    for index in range(
-        choice - 1,
-        len(jobs)
-    ):
+    applications_this_run = 0
+
+    for index in range(len(jobs)):
+
+        if applications_this_run >= MAX_APPLICATIONS_PER_RUN:
+            print()
+            print("=" * 70)
+            print("APPLICATION LIMIT REACHED")
+            print("=" * 70)
+            print(
+                f"Applications attempted successfully this run: "
+                f"{applications_this_run}/{MAX_APPLICATIONS_PER_RUN}"
+            )
+            break
 
         job = jobs[index]
 
@@ -1664,6 +1596,8 @@ def main():
         # can change after the CSV is generated.
 
         success = open_easy_apply(job)
+        if success:
+            applications_this_run += 1
 
         # ---------------------------------------
         # Active Easy Apply found
