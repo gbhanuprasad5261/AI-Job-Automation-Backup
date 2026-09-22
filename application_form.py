@@ -3207,7 +3207,7 @@ def _final_submission_confirmed(page: Page) -> bool:
 
 
 
-def verify_final_review_page(page: Page) -> bool:
+def verify_final_review_page(page: Page, container=None) -> bool:
     """Perform a conservative read-only verification of LinkedIn's final review.
 
     This function never clicks controls. It confirms that the visible page
@@ -3270,15 +3270,15 @@ def verify_final_review_page(page: Page) -> bool:
     checks = (
         (
             "How many years of work experience do you have with .NET Core?",
-            str(TEXT_ANSWERS.get("how many years of work experience do you have with .net core?", "0")),
+            "0",
         ),
         (
             "How many years of work experience do you have with MySQL?",
-            str(TEXT_ANSWERS.get("how many years of work experience do you have with mysql?", "1")),
+            "1",
         ),
         (
             "How many years of Engineering experience do you currently have?",
-            str(TEXT_ANSWERS.get("how many years of engineering experience do you currently have?", "0")),
+            "0",
         ),
         (
             "What's your current CTC?",
@@ -3562,6 +3562,12 @@ def inspect_and_prepare_form(
             print("=" * 70)
             print("FINAL APPLICATION REVIEW REQUIRED")
             print("=" * 70)
+            review_container = get_application_container(page, wait_seconds=3)
+            if not verify_final_review_page(page, review_container):
+                print("Final review verification failed.")
+                print("No Submit button will be clicked.")
+                return False
+
             print("All detected required fields are filled.")
             print("AUTO_SUBMIT is disabled for safety.")
             print("No Submit button will be clicked by automation.")
