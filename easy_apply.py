@@ -22,7 +22,7 @@ APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
 MIN_MATCH_SCORE = 70
 MAX_APPLICATIONS_PER_RUN = 15
-MAX_CANDIDATE_JOBS_PER_RUN = 10
+MAX_CANDIDATE_JOBS_PER_RUN = 30
 
 ALLOWED_LOCATION_KEYWORDS = (
     "bengaluru",
@@ -136,6 +136,21 @@ def _load_application_history():
         return []
 
 
+def get_today_applied_count():
+    """Return the number of confirmed applications submitted today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    count = 0
+
+    for row in _load_application_history():
+        status = (row.get("Status") or "").strip().upper()
+        applied_date = (row.get("Applied Date") or "").strip()
+
+        if status == "APPLIED" and applied_date == today:
+            count += 1
+
+    return count
+
+
 def _history_status_for_job(job):
     """Return APPLIED when this exact job is already in submission history."""
     job_url = _normalize_url(
@@ -242,13 +257,18 @@ def _write_application_history(rows, fields):
 # ---------------------------------------
 
 def _effective_tracker_status(row):
-    candidates = {(row.get("Application Status") or "").strip().upper(), (row.get("Status") or "").strip().upper()}
-    if "APPLIED" in candidates: return "APPLIED"
-    if "READY_FOR_REVIEW" in candidates: return "READY_FOR_REVIEW"
-    if "INELIGIBLE" in candidates: return "INELIGIBLE"
-    if "LOGIN_REQUIRED" in candidates: return "LOGIN_REQUIRED"
-    if "CLOSED" in candidates: return "CLOSED"
-    return next((x for x in candidates if x), "NOT APPLIED")
+    """Return the status that should affect future job selection.
+
+    Only a confirmed APPLIED result is permanent. Other statuses are
+    informational and must not permanently block a fresh job-analysis row.
+    """
+    candidates = {
+        (row.get("Application Status") or "").strip().upper(),
+        (row.get("Status") or "").strip().upper(),
+    }
+    if "APPLIED" in candidates:
+        return "APPLIED"
+    return "NOT APPLIED"
 
 def _normalize_url(value):
     return (value or "").strip().lower().split("?", 1)[0].rstrip("/")
@@ -257,13 +277,16 @@ def _normalize_text(value):
     return " ".join((value or "").strip().lower().split())
 
 def get_application_statuses():
-    tracker = load_csv(TRACKER_FILE); statuses = {}
-    priority = {"NOT APPLIED":0,"CLOSED":1,"LOGIN_REQUIRED":2,"INELIGIBLE":3,"READY_FOR_REVIEW":4,"APPLIED":5}
+    tracker = load_csv(TRACKER_FILE)
+    statuses = {}
     for row in tracker:
-        title=(row.get("Title") or "").strip()
-        if not title: continue
-        status=_effective_tracker_status(row); old=statuses.get(title)
-        if old is None or priority.get(status,0)>priority.get(old,0): statuses[title]=status
+        title = (row.get("Title") or "").strip()
+        if not title:
+            continue
+        status = _effective_tracker_status(row)
+        # APPLIED is the only persistent status used to exclude jobs.
+        if status == "APPLIED":
+            statuses[title] = "APPLIED"
     return statuses
 
 def get_application_status(job):
@@ -272,21 +295,29 @@ def get_application_status(job):
 
     tracker = load_csv(TRACKER_FILE)
     job_url = _normalize_url(convert_to_job_url(job.get("Link", "")))
-    title = _normalize_text(job.get("Title", "")); company = _normalize_text(job.get("Company", ""))
-    priority = {"NOT APPLIED":0,"CLOSED":1,"LOGIN_REQUIRED":2,"INELIGIBLE":3,"READY_FOR_REVIEW":4,"APPLIED":5}
-    best="NOT APPLIED"
+    title = _normalize_text(job.get("Title", ""))
+    company = _normalize_text(job.get("Company", ""))
+
+    # A confirmed APPLIED record is the only tracker status that permanently
+    # excludes a job. CLOSED/LOGIN_REQUIRED/INELIGIBLE/READY_FOR_REVIEW are
+    # retryable outcomes and must not block a fresh job-analysis row.
     if job_url:
         for row in tracker:
-            row_url=_normalize_url(row.get("URL") or row.get("Link") or "")
-            if row_url==job_url:
-                s=_effective_tracker_status(row)
-                if priority.get(s,0)>priority.get(best,0): best=s
-        if best!="NOT APPLIED": return best
+            row_url = _normalize_url(row.get("URL") or row.get("Link") or "")
+            if row_url == job_url and _effective_tracker_status(row) == "APPLIED":
+                return "APPLIED"
+
     for row in tracker:
-        if title and company and _normalize_text(row.get("Title"))==title and _normalize_text(row.get("Company"))==company:
-            s=_effective_tracker_status(row)
-            if priority.get(s,0)>priority.get(best,0): best=s
-    return best
+        if (
+            title
+            and company
+            and _normalize_text(row.get("Title")) == title
+            and _normalize_text(row.get("Company")) == company
+            and _effective_tracker_status(row) == "APPLIED"
+        ):
+            return "APPLIED"
+
+    return "NOT APPLIED"
 
 
 def parse_match_score(value):
@@ -357,8 +388,8 @@ def get_recommended_jobs():
         reverse=True
     )
 
-    # Keep the application limit at 1, but retain several eligible candidates
-    # so closed/unavailable jobs can be skipped without ending the run.
+    # Retain enough eligible candidates so closed/unavailable/unsupported jobs
+    # can be skipped while the daily confirmed-application limit is enforced.
     return recommended[:MAX_CANDIDATE_JOBS_PER_RUN]
 
 
@@ -1479,13 +1510,21 @@ def open_easy_apply(job):
             )
 
             if application_result == "SUBMITTED":
-                record_application_status(
+                tracker_success = record_application_status(
                     job,
                     "APPLIED"
                 )
+
+                if tracker_success:
+                    print(
+                        "\nConfirmed submission: tracker marked APPLIED."
+                    )
+                    return True
+
                 print(
-                    "\nConfirmed submission: tracker marked APPLIED."
+                    "\nSubmission was reported, but application tracking failed."
                 )
+                return False
 
             elif application_result == "READY_FOR_REVIEW":
                 print()
@@ -1514,7 +1553,7 @@ def open_easy_apply(job):
 
             return False
 
-        return True
+        return False
 
 
 # ---------------------------------------
@@ -1534,10 +1573,28 @@ def main():
 
     jobs = get_recommended_jobs()
 
+    today_applied = get_today_applied_count()
+    daily_remaining = MAX_APPLICATIONS_PER_RUN - today_applied
+
     print()
     print(
         f"Eligible jobs: {len(jobs)}"
     )
+    print(
+        f"Applications already submitted today: "
+        f"{today_applied}/{MAX_APPLICATIONS_PER_RUN}"
+    )
+
+    if daily_remaining <= 0:
+        print()
+        print("=" * 70)
+        print("DAILY APPLICATION LIMIT REACHED")
+        print("=" * 70)
+        print(
+            f"Confirmed applications today: "
+            f"{today_applied}/{MAX_APPLICATIONS_PER_RUN}"
+        )
+        return
 
     display_jobs(jobs)
 
@@ -1547,21 +1604,22 @@ def main():
     print()
 
     # ---------------------------------------
-    # Try selected and following jobs
+    # Try eligible jobs until today's confirmed
+    # application limit has been reached.
     # ---------------------------------------
 
     applications_this_run = 0
 
     for index in range(len(jobs)):
 
-        if applications_this_run >= MAX_APPLICATIONS_PER_RUN:
+        if applications_this_run >= daily_remaining:
             print()
             print("=" * 70)
             print("APPLICATION LIMIT REACHED")
             print("=" * 70)
             print(
-                f"Applications attempted successfully this run: "
-                f"{applications_this_run}/{MAX_APPLICATIONS_PER_RUN}"
+                f"Confirmed applications this run: "
+                f"{applications_this_run}/{daily_remaining}"
             )
             break
 
@@ -1596,25 +1654,23 @@ def main():
         # can change after the CSV is generated.
 
         success = open_easy_apply(job)
+
         if success:
             applications_this_run += 1
 
-        # ---------------------------------------
-        # Active Easy Apply found
-        # ---------------------------------------
-
-        if success:
-
             print()
             print("=" * 70)
-
+            print("APPLICATION CONFIRMED")
+            print("=" * 70)
             print(
-                "READY FOR APPLICATION AUTOMATION"
+                f"Confirmed applications today: "
+                f"{today_applied + applications_this_run}/{MAX_APPLICATIONS_PER_RUN}"
             )
 
-            print("=" * 70)
-
-            return
+            if applications_this_run >= daily_remaining:
+                print()
+                print("Daily confirmed-application limit reached.")
+                break
 
         # ---------------------------------------
         # Try next job
