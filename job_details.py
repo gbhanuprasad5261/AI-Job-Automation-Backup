@@ -1,12 +1,15 @@
 import csv
+import json
 import os
 import re
 
 from playwright.sync_api import sync_playwright
+from config import CHROME_CDP_URL
 
 
 INPUT_FILE = "jobs.csv"
 OUTPUT_FILE = "data/job_details.csv"
+DIAGNOSTICS_FILE = "data/job_details_diagnostics.json"
 
 
 def extract_text(page, selectors):
@@ -302,37 +305,137 @@ def extract_location_from_header(page):
     return ""
 
 
-def extract_description(page):
+def extract_description(page, diagnostics=None):
     description = ""
+    winner = None
 
+    if diagnostics is None:
+        diagnostics = {}
+
+    diagnostics.update({
+        "candidates": [],
+        "body_fallback_reached": False,
+        "body_contains_about_the_job": None,
+        "body_text_length": None,
+        "sdui_component_present": False,
+        "winner": None,
+        "selected_description_length": 0,
+    })
+
+    sdui_selector = 'div[data-sdui-component="com.linkedin.sdui.generated.jobseeker.dsl.impl.aboutTheJob"]'
     selectors = [
+        sdui_selector,
         "div.jobs-description__content",
         "div.jobs-box__html-content",
         "div#job-details",
         "article",
     ]
 
+    sdui_description = ""
+    sdui_winner_suffix = " > p"
+    compatibility_description = ""
+    compatibility_winner = None
+
     for selector in selectors:
+        match_count = 0
+        text = ""
+        content_selector = None
+        ui_tail_excluded = False
+
         try:
-            locator = page.locator(selector).first
+            matches = page.locator(selector)
+            match_count = matches.count()
 
-            if locator.count() > 0:
-                text = locator.inner_text().strip()
+            if match_count > 0:
+                locator = matches.first
+                if selector == sdui_selector:
+                    diagnostics["sdui_component_present"] = True
+                    # The observed SDUI component keeps the description in a paragraph.
+                    content_selector = "p"
+                    paragraphs = locator.locator(content_selector)
+                    if paragraphs.count() > 0:
+                        paragraph = paragraphs.first
+                        expandable_box = paragraph.locator(
+                            '[data-testid="expandable-text-box"]'
+                        )
+                        if expandable_box.count() > 0:
+                            extraction = expandable_box.first.evaluate("""element => {
+                                const button = Array.from(element.children).find(
+                                    child => child.getAttribute("data-testid") === "expandable-text-button"
+                                );
+                                const tailNode = button && button.previousSibling;
+                                const renderedText = element.innerText;
 
-                if len(text) > len(description):
-                    description = text
+                                if (tailNode && tailNode.nodeType === Node.TEXT_NODE && tailNode.nodeValue) {
+                                    const boundary = renderedText.lastIndexOf(tailNode.nodeValue);
+                                    if (boundary >= 0) {
+                                        return {
+                                            text: renderedText.slice(0, boundary).trimEnd(),
+                                            ui_tail_excluded: true
+                                        };
+                                    }
+                                }
+
+                                return {text: renderedText.trim(), ui_tail_excluded: false};
+                            }""")
+                            text = extraction["text"]
+                            ui_tail_excluded = extraction["ui_tail_excluded"]
+                            content_selector += ' > [data-testid="expandable-text-box"]'
+                            sdui_winner_suffix += ' > [data-testid="expandable-text-box"]'
+                            if ui_tail_excluded:
+                                sdui_winner_suffix += " (before expandable-text-button tail)"
+                        else:
+                            text = paragraph.inner_text().strip()
+                else:
+                    text = locator.inner_text().strip()
+
+                if text:
+                    if selector == sdui_selector:
+                        sdui_description = text
+                    elif len(text) > len(compatibility_description):
+                        compatibility_description = text
+                        compatibility_winner = selector
         except Exception:
             pass
 
-    # Fallback: use body only when it actually contains the job description.
-    if not description:
+        candidate_diagnostic = {
+            "selector": selector,
+            "matching_elements": match_count,
+            "first_match_has_nonempty_text": bool(text),
+            "text_length": len(text),
+            "text_preview": text[:150],
+            "contains_about_the_job": "About the job" in text,
+        }
+        if content_selector:
+            candidate_diagnostic["description_content_selector"] = content_selector
+        if selector == sdui_selector:
+            candidate_diagnostic["ui_tail_excluded"] = ui_tail_excluded
+        diagnostics["candidates"].append(candidate_diagnostic)
+
+    if sdui_description:
+        description = sdui_description
+        winner = sdui_selector + sdui_winner_suffix
+    elif compatibility_description:
+        description = compatibility_description
+        winner = compatibility_winner
+
+    # Body fallback is reserved for pages where no scoped candidate yielded text.
+    if not description and not diagnostics["sdui_component_present"]:
+        diagnostics["body_fallback_reached"] = True
         try:
             body_text = page.locator("body").inner_text()
+            body_has_description = "About the job" in body_text
+            diagnostics["body_contains_about_the_job"] = body_has_description
+            diagnostics["body_text_length"] = len(body_text)
 
-            if "About the job" in body_text:
+            if body_has_description:
                 description = body_text
+                winner = "body.inner_text() fallback"
         except Exception:
             pass
+
+    diagnostics["winner"] = winner
+    diagnostics["selected_description_length"] = len(description)
 
     return description
 
@@ -359,10 +462,11 @@ def extract_job_details():
         return
 
     results = []
+    description_diagnostics = []
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(
-            "http://127.0.0.1:9222"
+            CHROME_CDP_URL
         )
 
         context = browser.contexts[0]
@@ -396,6 +500,10 @@ def extract_job_details():
                     )
 
             description = ""
+            job_diagnostic = {
+                "job_url": link,
+                "title": title,
+            }
 
             print(f"Title   : {title}")
             print(f"Company : {company}")
@@ -431,7 +539,8 @@ def extract_job_details():
                     location = linkedin_location
 
                 # Description.
-                description = extract_description(page)
+                description = extract_description(page, job_diagnostic)
+                description_diagnostics.append(job_diagnostic)
 
                 print()
 
@@ -466,6 +575,13 @@ def extract_job_details():
 
             except Exception as e:
                 print(f"Error processing job {i}: {e}")
+
+                if not any(
+                    item is job_diagnostic
+                    for item in description_diagnostics
+                ):
+                    job_diagnostic["error"] = str(e)
+                    description_diagnostics.append(job_diagnostic)
 
                 results.append({
                     "Title": title,
@@ -511,6 +627,13 @@ def extract_job_details():
             )
 
             writer.writerow(job)
+
+    with open(
+        DIAGNOSTICS_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(description_diagnostics, file, ensure_ascii=False, indent=2)
 
     descriptions_found = sum(
         1
