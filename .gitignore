@@ -7,6 +7,7 @@ playwright_profile/
 
 # Python
 venv/
+venv312/
 .venv/
 __pycache__/
 *.pyc
@@ -20,6 +21,14 @@ screenshots/
 # Logs / temporary files
 *.log
 *.tmp
+
+# Local validation output and browser search captures
+/config_output.txt
+/external_app_current.txt
+/job_analyzer_output.txt
+/job_details_output.txt
+/job_search_output.txt
+/search_results*.png
 
 # IDE
 .vscode/
