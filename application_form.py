@@ -1,7 +1,9 @@
 import os
 import re
 import time
+import config
 from playwright.sync_api import Page
+from config import UNKNOWN_QUESTIONS_POLICY
 
 
 # ============================================================
@@ -110,7 +112,7 @@ TECH_EXPERIENCE = {
 #
 # Keep this FALSE during testing.
 
-AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "false").strip().lower() == "true"
+AUTO_SUBMIT = config.AUTO_SUBMIT
 
 
 # ============================================================
@@ -467,6 +469,11 @@ def get_application_container(page: Page, wait_seconds=12):
     print("The real LinkedIn Easy Apply modal was not detected.")
     print("The LinkedIn page shell will NOT be processed.")
     return None
+
+
+def _valid_application_step(current, total):
+    return 1 <= current <= total
+
 
 def print_application_status(page: Page):
     try:
@@ -1264,6 +1271,66 @@ def _field_metadata(element):
         safe_attribute(element, "name"),
         safe_attribute(element, "id"),
     ]).lower()
+
+
+def _unknown_question_policy_action(is_required, policy=None):
+    policy = (policy or UNKNOWN_QUESTIONS_POLICY).strip().upper()
+    if is_required:
+        return "STOP_REQUIRED"
+    if policy == "REVIEW":
+        return "STOP_REVIEW"
+    return "SKIP"
+
+
+def _unanswered_unknown_text_questions(container):
+    fields = container.locator("input, textarea")
+    optional = []
+    required_unknown = []
+    excluded_types = {
+        "hidden", "file", "radio", "checkbox", "submit", "button", "password"
+    }
+
+    for i in range(fields.count()):
+        try:
+            element = fields.nth(i)
+            if not element.is_visible():
+                continue
+
+            field_type = safe_attribute(element, "type").lower()
+            if field_type in excluded_types:
+                continue
+
+            if (element.input_value() or "").strip():
+                continue
+
+            metadata = _field_metadata(element)
+            if not metadata:
+                continue
+
+            known_special_field = any(
+                marker in metadata
+                for marker in (
+                    "email", "phone", "firstname", "lastname",
+                    "first name", "last name",
+                )
+            )
+            if known_special_field or _value_for_text_question(metadata) is not None:
+                continue
+
+            required = bool(
+                element.evaluate(
+                    "el => el.required || el.hasAttribute('required') "
+                    "|| el.getAttribute('aria-required') === 'true'"
+                )
+            ) or bool(re.search(r"\*\s*$", metadata))
+            if required:
+                required_unknown.append(metadata)
+            else:
+                optional.append(metadata)
+        except Exception:
+            continue
+
+    return optional, required_unknown
 
 
 def _value_for_text_question(combined):
@@ -2317,10 +2384,6 @@ def inspect_radio_buttons(container):
             required_marker = required_marker or "this field is required" in group_text.lower()
             required_marker = required_marker or safe_attribute(group, "aria-required").lower() == "true"
 
-            if not required_marker:
-                # Unknown optional radio groups are intentionally skipped.
-                continue
-
             key = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
             if key in seen:
                 continue
@@ -2348,6 +2411,16 @@ def inspect_radio_buttons(container):
             chosen = _choose_safe_radio_answer(question, answers)
             if chosen and _click_radio_answer(group, chosen):
                 print(f"Selected safe answer: {question} -> {chosen}")
+                continue
+
+            if not required_marker:
+                action = _unknown_question_policy_action(is_required=False)
+                if action == "STOP_REVIEW":
+                    print("UNKNOWN OPTIONAL RADIO QUESTION REQUIRES REVIEW.")
+                    print("QUESTION:", question)
+                    unresolved += 1
+                else:
+                    print("Unknown optional radio question left unanswered under SKIP:", question)
                 continue
 
             print()
@@ -2652,7 +2725,7 @@ def inspect_required_fields(container):
     )
 
     required = container.locator(
-        "[required]"
+        "[required], [aria-required='true']"
     )
 
     print(
@@ -3004,7 +3077,27 @@ def prepare_current_page(page: Page):
     print_application_status(page)
     fill_education_editor(page); fill_name(container); fill_email(container); fill_phone(container); upload_resume(container); fill_common_text_fields(container)
     unresolved_radios=inspect_radio_buttons(container); inspect_checkboxes(container); inspect_selects(container); unanswered=inspect_required_fields(container)
-    if unresolved_radios>0: print(f"Unknown required radio questions blocking navigation: {unresolved_radios}")
+    unknown_optional_text, unknown_required_text = _unanswered_unknown_text_questions(container)
+    if unknown_required_text:
+        unresolved_radios += len(unknown_required_text)
+        print(
+            "Unknown required text question(s) block navigation: "
+            f"{len(unknown_required_text)}"
+        )
+    if unknown_optional_text:
+        action = _unknown_question_policy_action(is_required=False)
+        if action == "STOP_REVIEW":
+            print(
+                "Unknown optional text question(s) require manual review: "
+                f"{len(unknown_optional_text)}"
+            )
+            unresolved_radios += len(unknown_optional_text)
+        else:
+            print(
+                "Unknown optional text question(s) left unanswered under SKIP: "
+                f"{len(unknown_optional_text)}"
+            )
+    if unresolved_radios>0: print(f"Unknown questions blocking navigation: {unresolved_radios}")
     return unanswered+unresolved_radios
 
 def _form_fingerprint(page):
@@ -3349,7 +3442,7 @@ def handle_final_submission(page: Page):
         print("No submission will be attempted.")
         return "FAILED"
 
-    if not AUTO_SUBMIT:
+    if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT is disabled.")
         print("No Submit button was clicked by automation.")
         print("Please review the application and submit manually if appropriate.")
@@ -3499,9 +3592,10 @@ def inspect_and_prepare_form(
         if unanswered > 0:
 
             print()
-            print(
-                "REQUIRED INFORMATION IS MISSING."
-            )
+            if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
+                print("Unknown or required questions remain; stopping for manual review.")
+            else:
+                print("REQUIRED INFORMATION IS MISSING.")
 
             print(
                 "Automation will stop here."
