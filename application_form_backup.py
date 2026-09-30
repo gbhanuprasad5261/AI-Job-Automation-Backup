@@ -85,7 +85,7 @@ TECH_EXPERIENCE = {
 #
 # Keep this FALSE during testing.
 
-AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "true").strip().lower() == "true"
+AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "false").strip().lower() == "true"
 
 
 # ============================================================
