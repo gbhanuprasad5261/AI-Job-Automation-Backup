@@ -10,7 +10,8 @@ and daily-limit fixes.
 - Uses LinkedIn job ID for tracker identity
 - Avoids re-offering APPLIED / SUBMITTED / INTERVIEW / REJECTED / WITHDRAWN jobs
 - Handles LinkedIn navigation timeouts more gracefully
-- Auto-submit follows `AUTO_SUBMIT`
+- Auto-submit is disabled by default (`AUTO_SUBMIT=false`); final submission requires explicit opt-in
+- Unknown-question handling defaults to `SKIP`; unanswered required questions stop the workflow
 - Application form knows the supplied contact, education, CTC, notice period,
   work-eligibility, relocation, internship, shift/weekend, disability/criminal-history,
   and technology-experience answers
@@ -34,11 +35,11 @@ Keep your existing `.env`, `resume/resume.pdf`, `data/`, and other project files
 PowerShell:
 
 ```powershell
-.\venv\Scripts\python.exe -m py_compile config.py application_tracker.py job_analyzer.py skill_matcher.py application_form.py easy_apply.py
-.\venv\Scripts\python.exe skill_matcher.py
-.\venv\Scripts\python.exe job_analyzer.py
+python -m py_compile config.py application_tracker.py job_analyzer.py skill_matcher.py application_form.py easy_apply.py
+python skill_matcher.py
+python job_analyzer.py
 .\start_chrome.bat
-.\venv\Scripts\python.exe easy_apply.py
+python easy_apply.py
 ```
 
 Do not commit `.env`, LinkedIn credentials, or private resume files to GitHub.
@@ -222,8 +223,15 @@ playwright install chromium
 ## ▶️ Usage
 
 ```bash
-python main.py
+python job_search.py
+python job_details.py
+python job_analyzer.py
+python easy_apply.py
 ```
+
+Run these stages in order. `main.py` only prints the configured LinkedIn email and a masked password; it does not run the job pipeline. The application stage reads the existing analysis CSV. With the default `AUTO_SUBMIT=false`, automation stops before clicking a final Submit control.
+
+The active analyzer and application selector currently use a fixed 70% match threshold and 15-application run limit. Although `config.py` reads `MIN_MATCH_SCORE` and `DAILY_APPLICATION_LIMIT`, those values are not wired into the active stages yet; changing them in `.env` does not change those limits. `CHROME_CDP_URL` is used by search and details extraction, while `easy_apply.py` currently connects to `127.0.0.1:9222` directly.
 
 A typical run:
 
