@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime
 
+import config
 from application_form import inspect_and_prepare_form
 from external_app import (
     find_external_apply_link,
@@ -20,7 +21,6 @@ ANALYSIS_FILE = "data/job_analysis.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
-MIN_MATCH_SCORE = 70
 MAX_APPLICATIONS_PER_RUN = 15
 MAX_CANDIDATE_JOBS_PER_RUN = 30
 
@@ -33,9 +33,6 @@ ALLOWED_LOCATION_KEYWORDS = (
 )
 
 ALLOW_EXTERNAL_APPLICATIONS = True
-
-CHROME_CDP_URL = "http://127.0.0.1:9222"
-
 
 # ---------------------------------------
 # Navigation helper
@@ -389,7 +386,7 @@ def get_recommended_jobs():
 
         status = get_application_status(job)
 
-        if score < MIN_MATCH_SCORE:
+        if score < config.MIN_MATCH_SCORE:
             continue
 
         if not is_allowed_location(location):
@@ -448,7 +445,7 @@ def display_jobs(jobs):
 
         print(
             f"Minimum Match Score : "
-            f"{MIN_MATCH_SCORE}%"
+            f"{config.MIN_MATCH_SCORE}%"
         )
 
         print(
@@ -1121,7 +1118,7 @@ def open_easy_apply(job):
 
             browser = (
                 p.chromium.connect_over_cdp(
-                    CHROME_CDP_URL
+                    config.CHROME_CDP_URL
                 )
             )
 
