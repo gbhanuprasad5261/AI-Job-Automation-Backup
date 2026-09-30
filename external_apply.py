@@ -10,7 +10,9 @@ import re
 import time
 from urllib.parse import parse_qs, unquote, urlparse
 
+import config
 from playwright.sync_api import Page
+from config import UNKNOWN_QUESTIONS_POLICY
 
 try:
     from dotenv import load_dotenv
@@ -25,7 +27,7 @@ EXPECTED_CTC = "5,00,000"
 GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/gbhanuprasad5261")
 RESUME_PATH = os.getenv("RESUME_PATH", "resume/resume.pdf")
 SUCCESSFACTORS_PASSWORD = os.getenv("SUCCESSFACTORS_PASSWORD", "").strip()
-AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "true").strip().lower() == "true"
+AUTO_SUBMIT = config.AUTO_SUBMIT
 
 
 DEFAULT_COVER_LETTER = """I am a Bachelor of Technology graduate in Computer Science and Engineering with a specialization in Artificial Intelligence and Data Science, graduating in 2025 from Siddartha Institute of Science and Technology. I am actively seeking an entry-level Software Engineer, Java Developer, or Backend Developer opportunity where I can apply my technical foundation, learn from experienced engineers, and contribute to real-world software products.
@@ -1015,7 +1017,11 @@ def _prepare_google_form(
 
 def _auto_submit_google_form(page: Page) -> str:
     """Submit Google Forms only after required-question verification."""
-    if not AUTO_SUBMIT:
+    if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
+        print("UNKNOWN_QUESTIONS_POLICY=REVIEW: Google Form submission stopped for manual review.")
+        return "READY_FOR_REVIEW"
+
+    if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT disabled: Google Form submission was not performed.")
         return "READY_FOR_REVIEW"
 
@@ -1853,7 +1859,11 @@ def _external_submission_verified(page: Page, previous_url: str) -> bool:
 
 def _auto_submit_external_application(page: Page) -> str:
     """Submit only a fully populated external application when AUTO_SUBMIT is enabled."""
-    if not AUTO_SUBMIT:
+    if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
+        print("UNKNOWN_QUESTIONS_POLICY=REVIEW: external submission stopped for manual review.")
+        return "READY_FOR_REVIEW"
+
+    if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT disabled: external submission was not performed.")
         return "READY_FOR_REVIEW"
 
