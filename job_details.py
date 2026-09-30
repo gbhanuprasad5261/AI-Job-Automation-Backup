@@ -323,8 +323,15 @@ def extract_description(page, diagnostics=None):
     })
 
     sdui_selector = 'div[data-sdui-component="com.linkedin.sdui.generated.jobseeker.dsl.impl.aboutTheJob"]'
+    job_id_match = re.search(r"/jobs/view/(\d+)", page.url)
+    current_job_description_selector = (
+        f'div[id="JobDetails_AboutTheJob_{job_id_match.group(1)}"]'
+        if job_id_match
+        else 'div[id^="JobDetails_AboutTheJob_"]'
+    )
+    sdui_selectors = (current_job_description_selector, sdui_selector)
     selectors = [
-        sdui_selector,
+        *sdui_selectors,
         "div.jobs-description__content",
         "div.jobs-box__html-content",
         "div#job-details",
@@ -332,6 +339,7 @@ def extract_description(page, diagnostics=None):
     ]
 
     sdui_description = ""
+    sdui_winner_selector = None
     sdui_winner_suffix = " > p"
     compatibility_description = ""
     compatibility_winner = None
@@ -348,7 +356,7 @@ def extract_description(page, diagnostics=None):
 
             if match_count > 0:
                 locator = matches.first
-                if selector == sdui_selector:
+                if selector in sdui_selectors:
                     diagnostics["sdui_component_present"] = True
                     # The observed SDUI component keeps the description in a paragraph.
                     content_selector = "p"
@@ -360,23 +368,34 @@ def extract_description(page, diagnostics=None):
                         )
                         if expandable_box.count() > 0:
                             extraction = expandable_box.first.evaluate("""element => {
-                                const button = Array.from(element.children).find(
-                                    child => child.getAttribute("data-testid") === "expandable-text-button"
-                                );
-                                const tailNode = button && button.previousSibling;
-                                const renderedText = element.innerText;
+                                const content = element.cloneNode(true);
+                                const parent = element.parentNode;
+                                if (!parent) {
+                                    return {text: element.innerText.trim(), ui_tail_excluded: false};
+                                }
 
-                                if (tailNode && tailNode.nodeType === Node.TEXT_NODE && tailNode.nodeValue) {
-                                    const boundary = renderedText.lastIndexOf(tailNode.nodeValue);
-                                    if (boundary >= 0) {
+                                parent.insertBefore(content, element.nextSibling);
+                                try {
+                                    const button = content.querySelector(
+                                        '[data-testid="expandable-text-button"]'
+                                    );
+
+                                    if (button) {
+                                        const tailNode = button.previousSibling;
+                                        if (tailNode && tailNode.nodeType === Node.TEXT_NODE && tailNode.nodeValue) {
+                                            tailNode.remove();
+                                        }
+                                        button.remove();
                                         return {
-                                            text: renderedText.slice(0, boundary).trimEnd(),
+                                            text: content.innerText.trimEnd(),
                                             ui_tail_excluded: true
                                         };
                                     }
-                                }
 
-                                return {text: renderedText.trim(), ui_tail_excluded: false};
+                                    return {text: content.innerText.trim(), ui_tail_excluded: false};
+                                } finally {
+                                    content.remove();
+                                }
                             }""")
                             text = extraction["text"]
                             ui_tail_excluded = extraction["ui_tail_excluded"]
@@ -390,8 +409,9 @@ def extract_description(page, diagnostics=None):
                     text = locator.inner_text().strip()
 
                 if text:
-                    if selector == sdui_selector:
+                    if selector in sdui_selectors and not sdui_description:
                         sdui_description = text
+                        sdui_winner_selector = selector
                     elif len(text) > len(compatibility_description):
                         compatibility_description = text
                         compatibility_winner = selector
@@ -408,13 +428,13 @@ def extract_description(page, diagnostics=None):
         }
         if content_selector:
             candidate_diagnostic["description_content_selector"] = content_selector
-        if selector == sdui_selector:
+        if selector in sdui_selectors:
             candidate_diagnostic["ui_tail_excluded"] = ui_tail_excluded
         diagnostics["candidates"].append(candidate_diagnostic)
 
     if sdui_description:
         description = sdui_description
-        winner = sdui_selector + sdui_winner_suffix
+        winner = sdui_winner_selector + sdui_winner_suffix
     elif compatibility_description:
         description = compatibility_description
         winner = compatibility_winner
