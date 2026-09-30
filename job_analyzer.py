@@ -1,6 +1,7 @@
 import csv
 import os
 
+import config
 from skill_matcher import match_resume
 from profile import PROFILE
 
@@ -11,8 +12,6 @@ from profile import PROFILE
 
 INPUT_FILE = "data/job_details.csv"
 OUTPUT_FILE = "data/job_analysis.csv"
-
-MIN_MATCH_SCORE = 70
 
 TARGET_LOCATIONS = [
     "bengaluru",
@@ -267,7 +266,7 @@ def calculate_priority(score):
     if score >= 85:
         return "HIGH"
 
-    if score >= MIN_MATCH_SCORE:
+    if score >= config.MIN_MATCH_SCORE:
         return "MEDIUM"
 
     return "LOW"
@@ -420,7 +419,7 @@ def analyze_jobs():
 
             application_eligible = "Yes"
 
-            if score < MIN_MATCH_SCORE:
+            if score < config.MIN_MATCH_SCORE:
                 application_eligible = "No"
 
             if not location_matches(location):
@@ -429,7 +428,7 @@ def analyze_jobs():
             if experience_skip:
                 application_eligible = "No"
 
-            if score < MIN_MATCH_SCORE:
+            if score < config.MIN_MATCH_SCORE:
                 skipped_score += 1
 
             if not location_matches(location):
@@ -670,7 +669,7 @@ def analyze_jobs():
 
     print(
         f"Minimum Match Score : "
-        f"{MIN_MATCH_SCORE}%"
+        f"{config.MIN_MATCH_SCORE}%"
     )
 
     print(
