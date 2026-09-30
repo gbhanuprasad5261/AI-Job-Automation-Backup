@@ -159,7 +159,8 @@ def _history_status_for_job(job):
     title = _normalize_text(job.get("Title", ""))
     company = _normalize_text(job.get("Company", ""))
 
-    for row in _load_application_history():
+    rows = _load_application_history()
+    for row in rows:
         status = (row.get("Status") or "").strip().upper()
         if status != "APPLIED":
             continue
@@ -171,19 +172,20 @@ def _history_status_for_job(job):
         if job_url and row_url and job_url == row_url:
             return "APPLIED"
 
-        row_title = _normalize_text(row.get("Title", ""))
-        row_company = _normalize_text(row.get("Company", ""))
-
-        if title and company and row_title == title and row_company == company:
-            return "APPLIED"
+    row = _unique_title_company_match(rows, title, company, job_url)
+    if row and (row.get("Status") or "").strip().upper() == "APPLIED":
+        return "APPLIED"
 
     return "NOT APPLIED"
 
 
-def _record_application_history(job, status):
+def _record_application_history(job, status, submission_confirmed=False):
     """Persist confirmed application status in one shared history CSV."""
     if status != "APPLIED":
         return True
+    if not submission_confirmed:
+        print("Application history write blocked: submission is not confirmed.")
+        return False
 
     os.makedirs(
         os.path.dirname(APPLICATION_HISTORY_FILE) or ".",
@@ -207,21 +209,21 @@ def _record_application_history(job, status):
     title = _normalize_text(job.get("Title", ""))
     company = _normalize_text(job.get("Company", ""))
 
-    # Never create duplicate history records.
+    # Prefer exact URLs; use title/company only for a unique, non-conflicting row.
     for row in rows:
         row_url = _normalize_url(
             convert_to_job_url(row.get("URL") or row.get("Link") or "")
         )
-        row_title = _normalize_text(row.get("Title", ""))
-        row_company = _normalize_text(row.get("Company", ""))
-
-        if (
-            (job_url and row_url and job_url == row_url)
-            or (title and company and row_title == title and row_company == company)
-        ):
+        if job_url and row_url and job_url == row_url:
             row["Status"] = "APPLIED"
             row["Applied Date"] = row.get("Applied Date") or datetime.now().strftime("%Y-%m-%d")
             return _write_application_history(rows, fields)
+
+    row = _unique_title_company_match(rows, title, company, job_url)
+    if row:
+        row["Status"] = "APPLIED"
+        row["Applied Date"] = row.get("Applied Date") or datetime.now().strftime("%Y-%m-%d")
+        return _write_application_history(rows, fields)
 
     rows.append({
         "Title": job.get("Title", ""),
@@ -276,6 +278,29 @@ def _normalize_url(value):
 def _normalize_text(value):
     return " ".join((value or "").strip().lower().split())
 
+def _unique_title_company_match(rows, title, company, job_url=""):
+    """Return a sole title/company candidate unless its URL conflicts."""
+    if not title or not company:
+        return None
+
+    candidates = [
+        row
+        for row in rows
+        if _normalize_text(row.get("Title")) == title
+        and _normalize_text(row.get("Company")) == company
+    ]
+    if len(candidates) != 1:
+        return None
+
+    candidate = candidates[0]
+    candidate_url = _normalize_url(
+        convert_to_job_url(candidate.get("URL") or candidate.get("Link") or "")
+    )
+    if job_url and candidate_url and job_url != candidate_url:
+        return None
+
+    return candidate
+
 def get_application_statuses():
     tracker = load_csv(TRACKER_FILE)
     statuses = {}
@@ -307,15 +332,9 @@ def get_application_status(job):
             if row_url == job_url and _effective_tracker_status(row) == "APPLIED":
                 return "APPLIED"
 
-    for row in tracker:
-        if (
-            title
-            and company
-            and _normalize_text(row.get("Title")) == title
-            and _normalize_text(row.get("Company")) == company
-            and _effective_tracker_status(row) == "APPLIED"
-        ):
-            return "APPLIED"
+    row = _unique_title_company_match(tracker, title, company, job_url)
+    if row and _effective_tracker_status(row) == "APPLIED":
+        return "APPLIED"
 
     return "NOT APPLIED"
 
@@ -377,6 +396,18 @@ def get_recommended_jobs():
             continue
 
         if status != "NOT APPLIED":
+            continue
+
+        if (job.get("Application Eligible") or "").strip().casefold() != "yes":
+            continue
+
+        if (job.get("Experience Skip") or "").strip().casefold() == "yes":
+            continue
+
+        if (
+            "Data Status" in job
+            and (job.get("Data Status") or "").strip().upper() != "OK"
+        ):
             continue
 
         recommended.append(job)
@@ -909,17 +940,24 @@ def detect_linkedin_submission_confirmation(page):
 # Record Application Status
 # ---------------------------------------
 
-def record_application_status(job, status):
+def record_application_status(job, status, submission_confirmed=False):
     """
     Update the tracker for the job after a confirmed application result.
 
     Matching order:
       1. Exact LinkedIn job URL
-      2. Exact Title + Company
+      2. Unique normalized Title + Company when URLs do not conflict
 
     A confirmed APPLIED result is also written to the general application
     history so future runs skip the job even if tracker rows are regenerated.
     """
+    status = str(status or "").strip().upper()
+    if status in {"APPLIED", "SUBMITTED"} and not submission_confirmed:
+        print("Application status write blocked: submission is not confirmed.")
+        return False
+    if status == "SUBMITTED":
+        status = "APPLIED"
+
     try:
         if not os.path.exists(TRACKER_FILE):
             print(f"Tracker file not found: {TRACKER_FILE}")
@@ -961,20 +999,16 @@ def record_application_status(job, status):
                         updated = True
                         break
 
-            # Exact Title + Company fallback.
-            if not updated and title and company:
-                for row in rows:
-                    if (
-                        _normalize_text(row.get("Title", "")) == title
-                        and _normalize_text(row.get("Company", "")) == company
-                    ):
-                        row["Status"] = status
-                        if "Application Status" in fieldnames:
-                            row["Application Status"] = status
-                        if status == "APPLIED" and "Applied Date" in fieldnames:
-                            row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
-                        updated = True
-                        break
+            # Fall back only when title/company resolves to one safe candidate.
+            if not updated:
+                row = _unique_title_company_match(rows, title, company, job_url)
+                if row:
+                    row["Status"] = status
+                    if "Application Status" in fieldnames:
+                        row["Application Status"] = status
+                    if status == "APPLIED" and "Applied Date" in fieldnames:
+                        row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+                    updated = True
 
             if not updated:
                 new_row = {field: "" for field in fieldnames}
@@ -1011,7 +1045,11 @@ def record_application_status(job, status):
             print(f"Application tracker updated: {status}")
 
         if status == "APPLIED":
-            history_updated = _record_application_history(job, "APPLIED")
+            history_updated = _record_application_history(
+                job,
+                "APPLIED",
+                submission_confirmed=True,
+            )
             if not history_updated:
                 print("Warning: tracker updated but application history update failed.")
                 return False
@@ -1229,7 +1267,11 @@ def open_easy_apply(job):
             print("=" * 70)
             print("LinkedIn shows that this application was already submitted.")
             print("No Easy Apply click, external application, or resume upload was performed.")
-            record_application_status(job, "APPLIED")
+            record_application_status(
+                job,
+                "APPLIED",
+                submission_confirmed=True,
+            )
             return False
 
         # ---------------------------------------
@@ -1331,6 +1373,18 @@ def open_easy_apply(job):
                         current_location="Bengaluru",
                         current_company="N/A",
                     )
+
+                    if result == "SUBMITTED":
+                        tracker_success = record_application_status(
+                            job,
+                            "APPLIED",
+                            submission_confirmed=True,
+                        )
+                        if tracker_success:
+                            print("Confirmed external submission: tracker marked APPLIED.")
+                            return True
+                        print("External submission was confirmed, but application tracking failed.")
+                        return False
 
                     if result == "LOGIN_REQUIRED":
                         print()
@@ -1512,7 +1566,8 @@ def open_easy_apply(job):
             if application_result == "SUBMITTED":
                 tracker_success = record_application_status(
                     job,
-                    "APPLIED"
+                    "APPLIED",
+                    submission_confirmed=True,
                 )
 
                 if tracker_success:
