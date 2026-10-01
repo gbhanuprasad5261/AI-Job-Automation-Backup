@@ -1405,6 +1405,13 @@ def open_easy_apply(job):
                         record_application_status(job, "READY_FOR_REVIEW")
                         return False
 
+                    if result == "FORM_NOT_FOUND":
+                        print()
+                        print("No recognizable external application form was reached.")
+                        print("No external submission was performed.")
+                        record_application_status(job, "FORM_NOT_FOUND")
+                        return False
+
                     print()
                     print(f"External application stopped with status: {result}")
                     return False
