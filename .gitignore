@@ -21,6 +21,7 @@ screenshots/
 # Logs / temporary files
 *.log
 *.tmp
+/runtime/phase7g_diagnostics.jsonl
 
 # Local validation output and browser search captures
 /config_output.txt
