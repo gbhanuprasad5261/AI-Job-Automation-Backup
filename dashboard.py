@@ -124,6 +124,11 @@ def show_dashboard(jobs):
         f"{status_counter.get('REJECTED', 0)}"
     )
 
+    print(
+        f"Form Not Found      : "
+        f"{status_counter.get('FORM_NOT_FOUND', 0)}"
+    )
+
     # ---------------------------------------
     # Top Jobs
     # ---------------------------------------
