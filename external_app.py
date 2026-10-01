@@ -13,6 +13,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 import config
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
+from runtime_diagnostics import (
+    element_diagnostic,
+    overlay_diagnostics,
+    page_diagnostic,
+    write_diagnostic,
+)
 
 try:
     from dotenv import load_dotenv
@@ -1718,6 +1724,8 @@ def _click_external_application_start(page: Page):
             continue
 
         print(f"Application-start control found: {normalized[:120]}")
+        control_diagnostic = element_diagnostic(control)
+        control_diagnostic["normalized_label"] = normalized[:240]
 
         before_pages = set(_all_application_pages(page))
 
@@ -1730,7 +1738,23 @@ def _click_external_application_start(page: Page):
             control.click(timeout=5000)
         except Exception as exc:
             print(f"Application control click failed: {exc}")
+            write_diagnostic({
+                "event": "external_application_control_click",
+                "click_result": "exception",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc)[:500],
+                "page": page_diagnostic(page, include_page_count=True),
+                "candidate": control_diagnostic,
+                "visible_overlays": overlay_diagnostics(page),
+            })
             continue
+
+        write_diagnostic({
+            "event": "external_application_control_click",
+            "click_result": "success",
+            "page": page_diagnostic(page, include_page_count=True),
+            "candidate": control_diagnostic,
+        })
 
         try:
             page.wait_for_timeout(1000)
