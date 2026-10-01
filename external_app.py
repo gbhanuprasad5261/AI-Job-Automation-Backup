@@ -2525,7 +2525,7 @@ def prepare_external_application_page(
     if not _looks_like_application_form(page):
         print("No recognizable external application form was reached.")
         print("No external submission was performed.")
-        return "READY_FOR_REVIEW"
+        return "FORM_NOT_FOUND"
 
     special_fields = _fill_known_application_fields(page, name)
     if special_fields:
