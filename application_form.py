@@ -284,6 +284,7 @@ def _candidate_application_selectors():
         "[role='dialog']",
         "[class*='modal']",
         "[class*='overlay']",
+        'div[data-sdui-screen="com.linkedin.sdui.flagshipnav.jobs.easyapply.EasyApply"]',
     )
 
 
