@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+import time
 from datetime import datetime
 
 import config
@@ -11,6 +12,12 @@ from external_app import (
     prepare_external_application_page,
 )
 from playwright.sync_api import sync_playwright
+from runtime_diagnostics import (
+    element_diagnostic,
+    page_diagnostic,
+    selector_diagnostics,
+    write_diagnostic,
+)
 
 
 # ---------------------------------------
@@ -33,6 +40,101 @@ ALLOWED_LOCATION_KEYWORDS = (
 )
 
 ALLOW_EXTERNAL_APPLICATIONS = True
+
+EASY_APPLY_MODAL_SELECTORS = (
+    ".jobs-easy-apply-modal",
+    ".jobs-easy-apply-content",
+    "[class*='jobs-easy-apply']",
+    ".artdeco-modal[role='dialog']",
+    "[aria-modal='true']",
+    "[role='dialog']",
+)
+EASY_APPLY_SDUI_SELECTOR = (
+    'div[data-sdui-screen="'
+    'com.linkedin.sdui.flagshipnav.jobs.easyapply.EasyApply"]'
+)
+
+
+def _sdui_easy_apply_diagnostics(candidate_page):
+    """Summarize the observed SDUI Easy Apply screen without accepting its button."""
+    result = {
+        "selector": EASY_APPLY_SDUI_SELECTOR,
+        "match_count": 0,
+        "visible_match_count": 0,
+        "candidates": [],
+    }
+    try:
+        locator = candidate_page.locator(EASY_APPLY_SDUI_SELECTOR)
+        result["match_count"] = locator.count()
+        for index in range(result["match_count"]):
+            element = locator.nth(index)
+            try:
+                if not element.is_visible():
+                    continue
+            except Exception:
+                continue
+            result["visible_match_count"] += 1
+            if len(result["candidates"]) >= 3:
+                continue
+            try:
+                class_name = element.get_attribute("class") or ""
+            except Exception:
+                class_name = ""
+            try:
+                text_preview = " ".join((element.inner_text() or "").split())[:240]
+            except Exception:
+                text_preview = ""
+            result["candidates"].append({
+                "class": class_name,
+                "text_preview": text_preview,
+            })
+    except Exception:
+        pass
+    return result
+
+
+def _detect_easy_apply_container(candidate_page):
+    """Return the existing legacy detection or the visible SDUI screen signal."""
+    for selector in EASY_APPLY_MODAL_SELECTORS:
+        try:
+            locator = candidate_page.locator(selector)
+            for index in range(locator.count()):
+                element = locator.nth(index)
+                if not element.is_visible():
+                    continue
+                try:
+                    text = (element.inner_text() or "").lower()
+                except Exception:
+                    text = ""
+                try:
+                    class_name = element.get_attribute("class") or ""
+                except Exception:
+                    class_name = ""
+                if any(token in text for token in (
+                    "application", "resume", "contact info",
+                    "work experience", "education", "submit application",
+                    "review application", "continue to next step",
+                )) or "jobs-easy-apply" in class_name:
+                    return {
+                        "detected": True,
+                        "source": "legacy",
+                        "sdui_diagnostics": None,
+                    }
+        except Exception:
+            continue
+
+    sdui_diagnostics = _sdui_easy_apply_diagnostics(candidate_page)
+    if sdui_diagnostics["visible_match_count"]:
+        return {
+            "detected": True,
+            "source": "sdui",
+            "sdui_diagnostics": sdui_diagnostics,
+        }
+    return {
+        "detected": False,
+        "source": None,
+        "sdui_diagnostics": sdui_diagnostics,
+    }
 
 # ---------------------------------------
 # Navigation helper
@@ -1446,6 +1548,24 @@ def open_easy_apply(job):
         print("EASY APPLY BUTTON FOUND")
         print("=" * 70)
 
+        job_id = job.get("Job ID") or job.get("JobID") or ""
+        if not job_id:
+            job_id_match = re.search(r"/jobs/view/(\d+)", link)
+            job_id = job_id_match.group(1) if job_id_match else ""
+
+        control_diagnostic = element_diagnostic(easy_apply)
+        control_diagnostic["text_or_label"] = (
+            control_diagnostic.get("text_preview")
+            or control_diagnostic.get("aria_label")
+            or control_diagnostic.get("title")
+        )
+        write_diagnostic({
+            "event": "easy_apply_control_before_click",
+            "job_id": str(job_id),
+            "page": page_diagnostic(page),
+            "control": control_diagnostic,
+        })
+
         try:
 
             easy_apply.scroll_into_view_if_needed()
@@ -1454,11 +1574,26 @@ def open_easy_apply(job):
                 500
             )
 
+            click_started = time.perf_counter()
             easy_apply.click(
                 timeout=10000
             )
+            click_method = "locator_click"
 
         except Exception as e:
+
+            if "click_started" not in locals():
+                click_started = time.perf_counter()
+
+            write_diagnostic({
+                "event": "easy_apply_click_attempt",
+                "job_id": str(job_id),
+                "click_result": "locator_click_exception",
+                "exception_type": type(e).__name__,
+                "exception_message": str(e)[:500],
+                "page": page_diagnostic(page, include_page_count=True),
+                "control": control_diagnostic,
+            })
 
             print()
             print(
@@ -1474,8 +1609,23 @@ def open_easy_apply(job):
                 easy_apply.evaluate(
                     "(element) => element.click()"
                 )
+                click_method = "javascript_click"
 
             except Exception as js_error:
+
+                write_diagnostic({
+                    "event": "easy_apply_click_result",
+                    "job_id": str(job_id),
+                    "click_result": "failed",
+                    "click_method": "javascript_click",
+                    "exception_type": type(js_error).__name__,
+                    "exception_message": str(js_error)[:500],
+                    "elapsed_seconds": round(
+                        time.perf_counter() - click_started, 3
+                    ),
+                    "page": page_diagnostic(page, include_page_count=True),
+                    "control": control_diagnostic,
+                })
 
                 print(
                     "JavaScript click failed:"
@@ -1487,41 +1637,70 @@ def open_easy_apply(job):
 
                 return False
 
+        write_diagnostic({
+            "event": "easy_apply_click_result",
+            "job_id": str(job_id),
+            "click_result": "success",
+            "click_method": click_method,
+            "elapsed_seconds": round(
+                time.perf_counter() - click_started, 3
+            ),
+            "page": page_diagnostic(page, include_page_count=True),
+            "control": control_diagnostic,
+        })
+
         # ---------------------------------------
         # Resolve the actual Easy Apply UI
         # ---------------------------------------
         original_page = page
         page.wait_for_timeout(3000)
 
+        modal_selectors = EASY_APPLY_MODAL_SELECTORS
+
+        modal_probe = []
+        diagnostic_pages = [original_page]
+        for candidate_page in context.pages:
+            if candidate_page is original_page:
+                continue
+            try:
+                if "linkedin.com" in (candidate_page.url or "").lower():
+                    diagnostic_pages.append(candidate_page)
+            except Exception:
+                continue
+
+        for candidate_page in diagnostic_pages:
+            modal_probe.append({
+                "page": page_diagnostic(
+                    candidate_page,
+                    include_page_count=True,
+                ),
+                "selectors": selector_diagnostics(
+                    candidate_page,
+                    modal_selectors,
+                ),
+            })
+
+        sdui_diagnostics_logged = set()
+
         def has_application_ui(candidate_page):
-            selectors = (
-                ".jobs-easy-apply-modal",
-                ".jobs-easy-apply-content",
-                "[class*='jobs-easy-apply']",
-                ".artdeco-modal[role='dialog']",
-                "[aria-modal='true']",
-                "[role='dialog']",
-            )
-            for selector in selectors:
-                try:
-                    locator = candidate_page.locator(selector)
-                    for i in range(locator.count()):
-                        el = locator.nth(i)
-                        if not el.is_visible():
-                            continue
-                        try:
-                            text = (el.inner_text() or "").lower()
-                        except Exception:
-                            text = ""
-                        if any(token in text for token in (
-                            "application", "resume", "contact info",
-                            "work experience", "education", "submit application",
-                            "review application", "continue to next step",
-                        )) or "jobs-easy-apply" in (el.get_attribute("class") or ""):
-                            return True
-                except Exception:
-                    continue
-            return False
+            detection = _detect_easy_apply_container(candidate_page)
+            sdui = detection["sdui_diagnostics"]
+            page_key = id(candidate_page)
+            if detection["source"] == "sdui" and page_key not in sdui_diagnostics_logged:
+                sdui_diagnostics_logged.add(page_key)
+                write_diagnostic({
+                    "event": "easy_apply_sdui_container_detected",
+                    "job_id": str(job_id),
+                    "page": page_diagnostic(
+                        candidate_page,
+                        include_page_count=True,
+                    ),
+                    "selector": sdui["selector"],
+                    "match_count": sdui["match_count"],
+                    "visible_match_count": sdui["visible_match_count"],
+                    "candidates": sdui["candidates"],
+                })
+            return detection["detected"]
 
         if has_application_ui(original_page):
             page = original_page
@@ -1548,8 +1727,29 @@ def open_easy_apply(job):
             print(f"Current page URL after click: {page.url}")
             print("The automation will NOT process this page.")
             print("No form navigation or submission will be performed.")
+            write_diagnostic({
+                "event": "easy_apply_modal_detection",
+                "detected": False,
+                "job_id": str(job_id),
+                "page": page_diagnostic(page, include_page_count=True),
+                "elapsed_seconds": round(
+                    time.perf_counter() - click_started, 3
+                ),
+                "candidate_pages": modal_probe,
+            })
             save_diagnostic_screenshot(original_page)
             return False
+
+        write_diagnostic({
+            "event": "easy_apply_modal_detection",
+            "detected": True,
+            "job_id": str(job_id),
+            "page": page_diagnostic(page, include_page_count=True),
+            "elapsed_seconds": round(
+                time.perf_counter() - click_started, 3
+            ),
+            "candidate_pages": modal_probe,
+        })
 
         print()
         print("=" * 70)
