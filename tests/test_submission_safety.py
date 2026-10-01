@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import application_form
@@ -216,7 +217,7 @@ class ApplicationRecordSafetyTests(unittest.TestCase):
 
 
 class OpenFormPersistenceTests(unittest.TestCase):
-    def _run_open_form(self, application_result):
+    def _run_open_form(self, application_result, detection_result=None):
         page = FakePage()
         context = MagicMock()
         context.pages = [page]
@@ -228,6 +229,17 @@ class OpenFormPersistenceTests(unittest.TestCase):
         manager.__enter__.return_value = playwright
         manager.__exit__.return_value = False
         record_status = MagicMock(return_value=True)
+        prepare_form = MagicMock(return_value=application_result)
+        diagnostic_writer = MagicMock()
+        detector_patch = (
+            patch.object(
+                easy_apply,
+                "_detect_easy_apply_container",
+                return_value=detection_result,
+            )
+            if detection_result is not None
+            else nullcontext()
+        )
         job = {
             "Title": "Backend Developer",
             "Company": "Example Co",
@@ -245,18 +257,20 @@ class OpenFormPersistenceTests(unittest.TestCase):
             patch.object(easy_apply, "is_current_job_already_applied", return_value=False),
             patch.object(easy_apply, "check_external_eligibility", return_value="UNKNOWN"),
             patch.object(easy_apply, "find_easy_apply_button", return_value=FakeApplyButton()),
-            patch.object(easy_apply, "inspect_and_prepare_form", return_value=application_result),
+            detector_patch,
+            patch.object(easy_apply, "inspect_and_prepare_form", prepare_form),
             patch.object(easy_apply, "record_application_status", record_status),
             patch.object(easy_apply, "save_diagnostic_screenshot"),
+            patch.object(easy_apply, "write_diagnostic", diagnostic_writer),
         ):
             result = easy_apply.open_easy_apply(job)
 
-        return result, record_status, job
+        return result, record_status, job, prepare_form, diagnostic_writer
 
     def test_open_or_blocked_form_does_not_record_applied(self):
         for application_result in ("READY_FOR_REVIEW", "FAILED"):
             with self.subTest(application_result=application_result):
-                _, record_status, job = self._run_open_form(application_result)
+                _, record_status, job, _, _ = self._run_open_form(application_result)
                 calls = record_status.call_args_list
                 self.assertFalse(
                     any(call.args[1] in {"APPLIED", "SUBMITTED"} for call in calls)
@@ -266,8 +280,37 @@ class OpenFormPersistenceTests(unittest.TestCase):
                 else:
                     record_status.assert_not_called()
 
+    def test_visible_sdui_detection_reaches_existing_form_inspection(self):
+        sdui_diagnostics = {
+            "selector": easy_apply.EASY_APPLY_SDUI_SELECTOR,
+            "match_count": 1,
+            "visible_match_count": 1,
+            "candidates": [{"class": "auygt0 auymt3", "text_preview": "Contact info"}],
+        }
+        detection_result = {
+            "detected": True,
+            "source": "sdui",
+            "sdui_diagnostics": sdui_diagnostics,
+        }
+
+        _, _, _, prepare_form, diagnostic_writer = self._run_open_form(
+            "FAILED",
+            detection_result=detection_result,
+        )
+
+        prepare_form.assert_called_once()
+        sdui_event = next(
+            call.args[0]
+            for call in diagnostic_writer.call_args_list
+            if call.args[0].get("event") == "easy_apply_sdui_container_detected"
+        )
+        self.assertEqual(sdui_event["selector"], sdui_diagnostics["selector"])
+        self.assertEqual(sdui_event["match_count"], 1)
+        self.assertEqual(sdui_event["visible_match_count"], 1)
+        self.assertEqual(sdui_event["candidates"][0]["class"], "auygt0 auymt3")
+
     def test_confirmed_submitted_result_is_the_applied_recording_path(self):
-        result, record_status, job = self._run_open_form("SUBMITTED")
+        result, record_status, job, _, _ = self._run_open_form("SUBMITTED")
 
         self.assertTrue(result)
         record_status.assert_called_once_with(
