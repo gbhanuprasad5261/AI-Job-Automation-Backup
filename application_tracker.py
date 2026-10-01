@@ -20,6 +20,7 @@ STATUSES = [
 # Technical/automation states.
 TECHNICAL_STATUSES = [
     "READY_FOR_REVIEW",
+    "FORM_NOT_FOUND",
     "LOGIN_REQUIRED",
     "FAILED",
 ]
