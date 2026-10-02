@@ -771,6 +771,10 @@ def fill_phone(container):
 
 def upload_resume(container):
 
+    if not config.AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: resume upload skipped.")
+        return False
+
     print()
     print("Checking resume upload...")
 
@@ -3076,7 +3080,12 @@ def prepare_current_page(page: Page):
         print("Stopping before inspecting or clicking page controls.")
         return -1
     print_application_status(page)
-    fill_education_editor(page); fill_name(container); fill_email(container); fill_phone(container); upload_resume(container); fill_common_text_fields(container)
+    fill_education_editor(page); fill_name(container); fill_email(container); fill_phone(container)
+    if config.AUTO_SUBMIT:
+        upload_resume(container)
+    else:
+        print("AUTO_SUBMIT disabled: resume upload skipped.")
+    fill_common_text_fields(container)
     unresolved_radios=inspect_radio_buttons(container); inspect_checkboxes(container); inspect_selects(container); unanswered=inspect_required_fields(container)
     unknown_optional_text, unknown_required_text = _unanswered_unknown_text_questions(container)
     if unknown_required_text:

@@ -994,7 +994,11 @@ def _prepare_google_form(
     print(f"Google Form confirmed answers selected: {confirmed_answers}")
 
     configured_resume = resume_path or RESUME_PATH
-    uploaded = _upload_google_forms_resume(page, configured_resume)
+    if config.AUTO_SUBMIT:
+        uploaded = _upload_google_forms_resume(page, configured_resume)
+    else:
+        uploaded = False
+        print("AUTO_SUBMIT disabled: Google Forms resume upload skipped.")
     print(
         f"Resume uploaded: {'Yes' if uploaded else 'No / upload not verified'}"
     )
@@ -1129,6 +1133,10 @@ def _upload_google_forms_resume(page: Page, resume_path: str) -> bool:
     a Windows path into the web page is not reliable and is intentionally not
     used here.
     """
+    if not config.AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: Google Forms resume upload skipped.")
+        return False
+
     resolved_path = _resolve_resume_path(resume_path)
     if not resolved_path:
         print(f"Resume file not found: {resume_path or '(empty path)'}")
@@ -1354,6 +1362,10 @@ def _upload_resume(page: Page, resume_path: str) -> bool:
     Only real file inputs or clearly labeled upload controls are used. No
     unrelated buttons are clicked and no application is submitted here.
     """
+    if not config.AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: external ATS resume upload skipped.")
+        return False
+
     resolved_path = _resolve_resume_path(resume_path or RESUME_PATH)
     if not resolved_path:
         print(f"Resume file not found: {resume_path or RESUME_PATH}")
@@ -2564,7 +2576,11 @@ def prepare_external_application_page(
     )
     print(f"Known contact fields filled: {filled}")
 
-    uploaded = _upload_resume(page, resume_path)
+    if config.AUTO_SUBMIT:
+        uploaded = _upload_resume(page, resume_path)
+    else:
+        uploaded = False
+        print("AUTO_SUBMIT disabled: external ATS resume upload skipped.")
     print(f"Resume uploaded: {'Yes' if uploaded else 'No / not required yet'}")
 
     profile_links_filled = _fill_known_profile_links(page)
