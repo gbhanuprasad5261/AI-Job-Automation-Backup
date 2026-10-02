@@ -1941,6 +1941,13 @@ def _prepare_successfactors_account(page: Page) -> str:
     selected only when India/+91 is an available option. Unknown required
     fields are never guessed.
     """
+    if not config.AUTO_SUBMIT:
+        print(
+            "SuccessFactors account registration disabled because "
+            "AUTO_SUBMIT=False; manual review required."
+        )
+        return "READY_FOR_REVIEW"
+
     password = SUCCESSFACTORS_PASSWORD.strip()
     if not password:
         print("SuccessFactors password is not configured; stopping safely.")
