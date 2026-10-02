@@ -1688,7 +1688,6 @@ def _click_external_application_start(page: Page):
         "apply online",
         "start application",
         "begin application",
-        "submit application",
         "continue application",
         "apply to this job",
     )
