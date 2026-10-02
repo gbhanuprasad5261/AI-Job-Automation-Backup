@@ -94,8 +94,25 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
         self.assertEqual(result, "FORM_NOT_FOUND")
         submit.click.assert_not_called()
 
-    def test_legitimate_apply_now_start_control_still_clicks(self):
-        apply = FakeControl("Apply now")
+    def test_detector_missed_apply_now_is_not_clicked_before_gate(self):
+        apply_now = FakeControl("Apply now")
+        page = FakePage([apply_now])
+
+        with (
+            patch.object(external_app, "detect_ats", return_value="UNKNOWN"),
+            patch.object(external_app, "_text", return_value="Company careers"),
+            patch.object(external_app, "_external_page_has_error", return_value=False),
+            patch.object(external_app, "_wait_for_manual_consent", return_value=True),
+            patch.object(external_app, "_looks_like_application_form", return_value=False),
+            patch.object(external_app, "_all_application_pages", return_value=[page]),
+        ):
+            result = external_app.prepare_external_application_page(page)
+
+        self.assertEqual(result, "FORM_NOT_FOUND")
+        apply_now.click.assert_not_called()
+
+    def test_clearly_safe_apply_start_control_still_clicks(self):
+        apply = FakeControl("Apply")
         page = FakePage([apply])
 
         with ExitStack() as stack:
@@ -105,6 +122,21 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
 
         self.assertIs(result, page)
         apply.click.assert_called_once_with(timeout=5000)
+
+    def test_apply_now_remains_a_final_submit_control_and_is_gated(self):
+        apply_now = FakeControl("Apply now")
+        page = FakePage([apply_now])
+
+        self.assertIs(external_app._find_final_submit_control(page), apply_now)
+
+        with (
+            patch.object(config, "AUTO_SUBMIT", False),
+            patch.object(external_app, "UNKNOWN_QUESTIONS_POLICY", "SKIP"),
+        ):
+            result = external_app._auto_submit_external_application(page)
+
+        self.assertEqual(result, "READY_FOR_REVIEW")
+        apply_now.click.assert_not_called()
 
     def test_final_submit_routine_can_click_submit_when_enabled(self):
         submit = FakeControl("Submit application")

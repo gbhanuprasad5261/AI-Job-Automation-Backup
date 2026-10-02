@@ -151,8 +151,8 @@ class RuntimeDiagnosticTests(unittest.TestCase):
     def test_click_exception_is_logged_without_changing_application_status(self):
         control = FakeElement(
             "button",
-            {"aria-label": "Apply now", "id": "apply-control"},
-            "Apply now",
+            {"id": "apply-control"},
+            "Apply",
             click_error=TimeoutError("control blocked"),
         )
         overlay = FakeElement(

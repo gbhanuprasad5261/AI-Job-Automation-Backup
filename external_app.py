@@ -1693,7 +1693,6 @@ def _click_external_application_start(page: Page):
         return page
 
     allowed_terms = (
-        "apply now",
         "apply",
         "apply for this job",
         "apply for this position",
@@ -1729,7 +1728,7 @@ def _click_external_application_start(page: Page):
         normalized = " ".join(label.lower().split())
 
         if not any(
-            term == normalized or term in normalized
+            term == normalized or (term != "apply" and term in normalized)
             for term in allowed_terms
         ):
             continue
