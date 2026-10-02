@@ -2128,12 +2128,13 @@ def _select_known_dropdowns(page: Page) -> int:
     return count
 
 
-def _check_known_terms_consent(page: Page) -> int:
+def _check_known_terms_consent(page: Page) -> int | None:
     """Check the clearly identified data/privacy terms checkbox.
 
     This is limited to a checkbox whose associated visible text explicitly
     describes agreement to the website's data/privacy storage or handling.
-    Unknown checkboxes are never selected.
+    Unknown checkboxes are never selected. Returns None when manual consent
+    is required because AUTO_SUBMIT is disabled.
     """
     count = 0
     checkboxes = page.locator("input[type='checkbox']")
@@ -2185,6 +2186,13 @@ def _check_known_terms_consent(page: Page) -> int:
 
         if not has_data_terms:
             continue
+
+        if not config.AUTO_SUBMIT:
+            print(
+                "External ATS terms/privacy consent was not selected because "
+                "AUTO_SUBMIT=False; manual review required."
+            )
+            return None
 
         try:
             checkbox.check()
@@ -2389,6 +2397,13 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout
     while time.time() < deadline:
         control = find_consent_control()
         if control is not None:
+            if not config.AUTO_SUBMIT:
+                print(
+                    "Cookie/privacy consent was not accepted because "
+                    "AUTO_SUBMIT=False; manual review required."
+                )
+                return False
+
             print()
             print("=" * 70)
             print("PRIVACY / COOKIE CONSENT DETECTED")
@@ -2598,6 +2613,8 @@ def prepare_external_application_page(
         print(f"Known dropdowns filled: {dropdowns_filled}")
 
     terms_checked = _check_known_terms_consent(page)
+    if terms_checked is None:
+        return "READY_FOR_REVIEW"
     print(f"Known terms/privacy checkboxes checked: {terms_checked}")
 
     required = _required_empty_count(page)
