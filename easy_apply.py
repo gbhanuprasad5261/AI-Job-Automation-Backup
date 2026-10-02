@@ -28,7 +28,6 @@ ANALYSIS_FILE = "data/job_analysis.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
-MAX_APPLICATIONS_PER_RUN = 15
 MAX_CANDIDATE_JOBS_PER_RUN = 30
 
 ALLOWED_LOCATION_KEYWORDS = (
@@ -1541,7 +1540,10 @@ def open_easy_apply(job):
                             print("Confirmed external submission: tracker marked APPLIED.")
                             return True
                         print("External submission was confirmed, but application tracking failed.")
-                        return False
+                        # Submission confirmation is the countable event. Do
+                        # not let a later tracker/history write failure cause
+                        # the active runner to attempt another application.
+                        return True
 
                     if result == "LOGIN_REQUIRED":
                         print()
@@ -1849,7 +1851,9 @@ def open_easy_apply(job):
                 print(
                     "\nSubmission was reported, but application tracking failed."
                 )
-                return False
+                # The submission itself is confirmed even though persistence
+                # failed. Return success so main() consumes the daily slot.
+                return True
 
             elif application_result == "READY_FOR_REVIEW":
                 print()
@@ -1899,7 +1903,8 @@ def main():
     jobs = get_recommended_jobs()
 
     today_applied = get_today_applied_count()
-    daily_remaining = MAX_APPLICATIONS_PER_RUN - today_applied
+    daily_limit = config.DAILY_APPLICATION_LIMIT
+    daily_remaining = daily_limit - today_applied
 
     print()
     print(
@@ -1907,7 +1912,7 @@ def main():
     )
     print(
         f"Applications already submitted today: "
-        f"{today_applied}/{MAX_APPLICATIONS_PER_RUN}"
+        f"{today_applied}/{daily_limit}"
     )
 
     if daily_remaining <= 0:
@@ -1917,7 +1922,7 @@ def main():
         print("=" * 70)
         print(
             f"Confirmed applications today: "
-            f"{today_applied}/{MAX_APPLICATIONS_PER_RUN}"
+            f"{today_applied}/{daily_limit}"
         )
         return
 
@@ -1989,7 +1994,7 @@ def main():
             print("=" * 70)
             print(
                 f"Confirmed applications today: "
-                f"{today_applied + applications_this_run}/{MAX_APPLICATIONS_PER_RUN}"
+                f"{today_applied + applications_this_run}/{daily_limit}"
             )
 
             if applications_this_run >= daily_remaining:

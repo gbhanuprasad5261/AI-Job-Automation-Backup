@@ -217,7 +217,12 @@ class ApplicationRecordSafetyTests(unittest.TestCase):
 
 
 class OpenFormPersistenceTests(unittest.TestCase):
-    def _run_open_form(self, application_result, detection_result=None):
+    def _run_open_form(
+        self,
+        application_result,
+        detection_result=None,
+        record_status_result=True,
+    ):
         page = FakePage()
         context = MagicMock()
         context.pages = [page]
@@ -228,7 +233,7 @@ class OpenFormPersistenceTests(unittest.TestCase):
         manager = MagicMock()
         manager.__enter__.return_value = playwright
         manager.__exit__.return_value = False
-        record_status = MagicMock(return_value=True)
+        record_status = MagicMock(return_value=record_status_result)
         prepare_form = MagicMock(return_value=application_result)
         diagnostic_writer = MagicMock()
         detector_patch = (
@@ -311,6 +316,60 @@ class OpenFormPersistenceTests(unittest.TestCase):
 
     def test_confirmed_submitted_result_is_the_applied_recording_path(self):
         result, record_status, job, _, _ = self._run_open_form("SUBMITTED")
+
+        self.assertTrue(result)
+        record_status.assert_called_once_with(
+            job,
+            "APPLIED",
+            submission_confirmed=True,
+        )
+
+    def test_confirmed_linkedin_submission_counts_when_tracking_fails(self):
+        result, record_status, job, _, _ = self._run_open_form(
+            "SUBMITTED",
+            record_status_result=False,
+        )
+
+        self.assertTrue(result)
+        record_status.assert_called_once_with(
+            job,
+            "APPLIED",
+            submission_confirmed=True,
+        )
+
+    def test_confirmed_external_submission_counts_when_tracking_fails(self):
+        page = FakePage()
+        context = MagicMock()
+        context.pages = [page]
+        browser = MagicMock()
+        browser.contexts = [context]
+        playwright = MagicMock()
+        playwright.chromium.connect_over_cdp.return_value = browser
+        manager = MagicMock()
+        manager.__enter__.return_value = playwright
+        manager.__exit__.return_value = False
+        job = {
+            "Title": "Backend Developer",
+            "Company": "Example Co",
+            "Location": "Chennai",
+            "Match Score": "90%",
+            "Link": page.url,
+        }
+
+        with (
+            patch.object(easy_apply, "sync_playwright", return_value=manager),
+            patch.object(easy_apply, "get_application_status", return_value="NOT APPLIED"),
+            patch.object(easy_apply, "convert_to_job_url", side_effect=lambda url: url),
+            patch.object(easy_apply, "navigate_page", return_value=True),
+            patch.object(easy_apply, "is_job_closed", return_value=False),
+            patch.object(easy_apply, "is_current_job_already_applied", return_value=False),
+            patch.object(easy_apply, "check_external_eligibility", return_value="UNKNOWN"),
+            patch.object(easy_apply, "find_easy_apply_button", return_value=None),
+            patch.object(easy_apply, "find_external_apply_link", return_value="https://careers.example.test/apply"),
+            patch.object(easy_apply, "prepare_external_application_page", return_value="SUBMITTED"),
+            patch.object(easy_apply, "record_application_status", return_value=False) as record_status,
+        ):
+            result = easy_apply.open_easy_apply(job)
 
         self.assertTrue(result)
         record_status.assert_called_once_with(
