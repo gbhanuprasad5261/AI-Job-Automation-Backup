@@ -68,6 +68,7 @@ class MatchThresholdConfigurationTests(unittest.TestCase):
 
         with (
             patch.object(easy_apply, "load_csv", side_effect=load_csv),
+            patch.object(easy_apply, "_analysis_matches_details", return_value=True),
             patch.object(easy_apply, "_load_application_history", return_value=[]),
         ):
             return easy_apply.get_recommended_jobs()

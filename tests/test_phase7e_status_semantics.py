@@ -192,6 +192,7 @@ class FormNotFoundPersistenceTests(unittest.TestCase):
 
         with (
             patch.object(easy_apply, "load_csv", side_effect=fake_load_csv),
+            patch.object(easy_apply, "_analysis_matches_details", return_value=True),
             patch.object(easy_apply, "_load_application_history", return_value=[]),
         ):
             self.assertEqual(easy_apply.get_application_status(JOB), "NOT APPLIED")

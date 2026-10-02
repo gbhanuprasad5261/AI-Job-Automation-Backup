@@ -89,7 +89,8 @@ class ApplicationIdentityTests(unittest.TestCase):
                 "easy_apply._load_application_history",
                 return_value=history or [],
             ):
-                return easy_apply.get_recommended_jobs()
+                with patch("easy_apply._analysis_matches_details", return_value=True):
+                    return easy_apply.get_recommended_jobs()
 
     def _eligible_job(self, **overrides):
         job = {
