@@ -126,6 +126,11 @@ class ApplicationIdentityTests(unittest.TestCase):
 
         self.assertEqual(self._select_jobs(job), [])
 
+    def test_insufficient_data_status_is_excluded(self):
+        job = self._eligible_job(**{"Data Status": "INSUFFICIENT_DATA"})
+
+        self.assertEqual(self._select_jobs(job), [])
+
     def test_missing_data_status_remains_compatible(self):
         job = self._eligible_job()
         del job["Data Status"]

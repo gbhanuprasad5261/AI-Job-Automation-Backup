@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 
 import config
 from skill_matcher import match_resume
@@ -27,6 +28,53 @@ try:
     )
 except (TypeError, ValueError):
     CANDIDATE_EXPERIENCE_YEARS = 0
+
+
+DESCRIPTION_MIN_NONWHITESPACE_CHARS = 200
+DESCRIPTION_MIN_WORD_TOKENS = 30
+DESCRIPTION_PLACEHOLDERS = {
+    "n a",
+    "na",
+    "none",
+    "null",
+    "tbd",
+    "to be determined",
+    "no description",
+    "no description provided",
+    "no description available",
+    "job description unavailable",
+    "job description not available",
+    "description not provided",
+    "description unavailable",
+    "lorem ipsum",
+}
+
+
+def is_description_adequate(description):
+    """Return whether extracted text has enough substance to analyze."""
+    if not description or not description.strip():
+        return False
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", description.casefold()).strip()
+    tokens = normalized.split()
+    placeholder_sequences = [phrase.split() for phrase in DESCRIPTION_PLACEHOLDERS]
+    placeholder_prefixes = {0}
+    for start in range(len(tokens)):
+        if start not in placeholder_prefixes:
+            continue
+        for phrase_tokens in placeholder_sequences:
+            end = start + len(phrase_tokens)
+            if tokens[start:end] == phrase_tokens:
+                placeholder_prefixes.add(end)
+    if len(tokens) in placeholder_prefixes:
+        return False
+
+    nonwhitespace_chars = sum(not character.isspace() for character in description)
+    word_tokens = re.findall(r"\b\w+\b", description, flags=re.UNICODE)
+    return (
+        nonwhitespace_chars >= DESCRIPTION_MIN_NONWHITESPACE_CHARS
+        and len(word_tokens) >= DESCRIPTION_MIN_WORD_TOKENS
+    )
 
 
 # ================================================================
@@ -348,7 +396,7 @@ def analyze_jobs():
         # DATA QUALITY CHECK
         # --------------------------------------------------------
 
-        if not description:
+        if not is_description_adequate(description):
 
             score = 0
 

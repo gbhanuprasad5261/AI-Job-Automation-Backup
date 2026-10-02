@@ -31,7 +31,7 @@ class MatchThresholdConfigurationTests(unittest.TestCase):
                     "Location": "Bengaluru",
                     "Easy Apply": "Yes",
                     "Link": "https://www.linkedin.com/jobs/view/1234567890/",
-                    "Description": "Java backend engineer role",
+                    "Description": "Java backend engineer role. " * 12,
                 })
 
             with (
