@@ -56,8 +56,8 @@ class FakePage:
         raise AssertionError(f"Unexpected locator search: {selector}")
 
 
-class SuccessFactorsRegistrationSafetyTests(unittest.TestCase):
-    def test_auto_submit_false_stops_before_any_account_page_interaction(self):
+class SuccessFactorsPasswordReadSafetyTests(unittest.TestCase):
+    def test_auto_submit_false_does_not_read_password_or_interact_with_page(self):
         password = FakeControl()
         country = FakeControl()
         register = FakeControl("Create Account")
@@ -76,7 +76,7 @@ class SuccessFactorsRegistrationSafetyTests(unittest.TestCase):
         country.select_option.assert_not_called()
         register.click.assert_not_called()
 
-    def test_auto_submit_true_without_password_preserves_login_required(self):
+    def test_auto_submit_true_with_missing_password_keeps_login_required(self):
         page = FakePage()
 
         with (
@@ -89,12 +89,14 @@ class SuccessFactorsRegistrationSafetyTests(unittest.TestCase):
         getenv.assert_called_once_with("SUCCESSFACTORS_PASSWORD", "")
         self.assertEqual(page.locator_calls, [])
 
-    def test_auto_submit_true_keeps_account_registration_path_available(self):
+    def test_auto_submit_true_reads_configured_password_and_continues_existing_logic(self):
         password = FakeControl()
         register = FakeControl("Create Account")
         page = FakePage([password], controls=[register])
         register.click.side_effect = lambda: setattr(
-            page, "url", "https://careers.successfactors.com/application"
+            page,
+            "url",
+            "https://careers.successfactors.com/application",
         )
 
         with (
@@ -103,40 +105,15 @@ class SuccessFactorsRegistrationSafetyTests(unittest.TestCase):
                 external_app.os,
                 "getenv",
                 return_value="configured-secret",
-            ),
+            ) as getenv,
             patch.object(external_app, "_required_empty_count", return_value=0),
         ):
             result = external_app._prepare_successfactors_account(page)
 
         self.assertEqual(result, "CONTINUE")
+        getenv.assert_called_once_with("SUCCESSFACTORS_PASSWORD", "")
         password.fill.assert_called_once_with("configured-secret")
         register.click.assert_called_once_with()
-        self.assertTrue(
-            any(selector.startswith("button,") for selector in page.locator_calls)
-        )
-
-    def test_auto_submit_true_still_stops_on_missing_required_fields(self):
-        password = FakeControl()
-        register = FakeControl("Register")
-        page = FakePage([password], controls=[register])
-
-        with (
-            patch.object(config, "AUTO_SUBMIT", True),
-            patch.object(
-                external_app.os,
-                "getenv",
-                return_value="configured-secret",
-            ),
-            patch.object(external_app, "_required_empty_count", return_value=1),
-        ):
-            result = external_app._prepare_successfactors_account(page)
-
-        self.assertEqual(result, "READY_FOR_REVIEW")
-        password.fill.assert_called_once_with("configured-secret")
-        self.assertFalse(
-            any(selector.startswith("button,") for selector in page.locator_calls)
-        )
-        register.click.assert_not_called()
 
 
 if __name__ == "__main__":

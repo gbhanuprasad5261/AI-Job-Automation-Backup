@@ -32,7 +32,6 @@ CURRENT_CTC = "0"
 EXPECTED_CTC = "5,00,000"
 GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/gbhanuprasad5261")
 RESUME_PATH = os.getenv("RESUME_PATH", "resume/resume.pdf")
-SUCCESSFACTORS_PASSWORD = os.getenv("SUCCESSFACTORS_PASSWORD", "").strip()
 AUTO_SUBMIT = config.AUTO_SUBMIT
 
 
@@ -1948,7 +1947,7 @@ def _prepare_successfactors_account(page: Page) -> str:
         )
         return "READY_FOR_REVIEW"
 
-    password = SUCCESSFACTORS_PASSWORD.strip()
+    password = os.getenv("SUCCESSFACTORS_PASSWORD", "").strip()
     if not password:
         print("SuccessFactors password is not configured; stopping safely.")
         return "LOGIN_REQUIRED"
