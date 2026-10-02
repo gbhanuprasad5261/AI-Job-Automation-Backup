@@ -76,6 +76,46 @@ class FakeControl:
         self.click_count += 1
 
 
+class FakeDomElement:
+    def __init__(self, tag, text="", attributes=None, visible=True, enabled=True):
+        self.tag = tag
+        self.text = text
+        self.attributes = attributes or {}
+        self.visible = visible
+        self.enabled = enabled
+
+    def inner_text(self, *args, **kwargs):
+        return self.text
+
+    def get_attribute(self, name):
+        return self.attributes.get(name)
+
+    def is_visible(self):
+        return self.visible
+
+    def is_enabled(self):
+        return self.enabled
+
+
+class FakeReviewRoot:
+    def __init__(self, *, headings=(), page_labels=(), progressbars=(), buttons=()):
+        self.headings = list(headings)
+        self.page_labels = list(page_labels)
+        self.progressbars = list(progressbars)
+        self.buttons = list(buttons)
+
+    def locator(self, selector):
+        if selector == "h1, h2, h3, h4, h5, h6, [role='heading']":
+            return FakeLocator(self.headings)
+        if selector == "p, span, div":
+            return FakeLocator(self.page_labels)
+        if selector == '[role="progressbar"]':
+            return FakeLocator(self.progressbars)
+        if selector == "button, [role='button']":
+            return FakeLocator(self.buttons)
+        return FakeLocator([])
+
+
 class FinalPageSafetyCases(unittest.TestCase):
     def _run_inspector(self, page, container, submit_button, *, next_button=None):
         with (
@@ -148,7 +188,7 @@ class FinalPageSafetyCases(unittest.TestCase):
         self.assertIn("Final application page detected.", output.getvalue())
         self.assertIn("Final review verification failed.", output.getvalue())
 
-    def test_engineering_square_style_review_with_zero_answer_pairs_fails(self):
+    def test_engineering_square_style_review_with_zero_answer_pairs_passes_structurally(self):
         text = (
             "4/4 pages. Review your application. Contact info. Resume. "
             "Work authorization. Submit application."
@@ -156,19 +196,194 @@ class FinalPageSafetyCases(unittest.TestCase):
         page = FakePage(text)
         submit = FakeControl("Submit application")
         page.buttons = [submit]
+        root = FakeReviewRoot(
+            headings=[FakeDomElement("h3", "Review your application")],
+            page_labels=[FakeDomElement("p", "4/4 pages")],
+            progressbars=[
+                FakeDomElement(
+                    "svg",
+                    attributes={
+                        "role": "progressbar",
+                        "aria-valuemin": "0",
+                        "aria-valuemax": "100",
+                        "aria-valuenow": "100",
+                    },
+                )
+            ],
+            buttons=[submit],
+        )
 
         with (
             patch.object(config, "AUTO_SUBMIT", False),
+            patch.object(application_form, "get_application_container", return_value=root),
             patch.object(application_form, "find_submit_button", return_value=submit) as find_submit,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             verifier_result = application_form.verify_final_review_page(page)
             result = application_form.handle_final_submission(page)
 
-        self.assertFalse(verifier_result)
-        self.assertEqual(result, "FAILED")
+        self.assertTrue(verifier_result)
+        self.assertEqual(result, "READY_FOR_REVIEW")
         self.assertEqual(submit.click_count, 0)
         find_submit.assert_not_called()
+
+    def test_terminal_page_counter_and_review_heading_are_sufficient(self):
+        text = "4/4 pages. Review your application. Resume. Submit application."
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(
+            headings=[FakeDomElement("h3", "Review your application")],
+            page_labels=[FakeDomElement("p", "4/4 pages")],
+            buttons=[submit],
+        )
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertTrue(result)
+        self.assertEqual(submit.click_count, 0)
+
+    def test_terminal_aria_progressbar_and_review_heading_are_sufficient(self):
+        text = "Review your application. Resume. Submit application."
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(
+            headings=[FakeDomElement("h3", "Review your application")],
+            progressbars=[
+                FakeDomElement(
+                    "svg",
+                    attributes={
+                        "role": "progressbar",
+                        "aria-valuemin": "0",
+                        "aria-valuemax": "100",
+                        "aria-valuenow": "100",
+                    },
+                )
+            ],
+            buttons=[submit],
+        )
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertTrue(result)
+        self.assertEqual(submit.click_count, 0)
+
+    def test_tcs_submit_only_screen_still_fails_with_zero_answer_pairs(self):
+        text = "Contact info. Resume. Submit application."
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(buttons=[submit])
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
+        self.assertEqual(submit.click_count, 0)
+
+    def test_submit_without_review_or_progress_fails(self):
+        text = "Application. Resume. Submit application."
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(buttons=[submit])
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
+
+    def test_review_terminal_progress_without_enabled_submit_fails(self):
+        answer_text = (
+            "How many years of work experience do you have with .NET Core? 0. "
+        )
+        for submit in (None, FakeControl("Submit application", enabled=False)):
+            with self.subTest(submit=submit):
+                text = (
+                    "Review your application. 4/4 pages. Resume. "
+                    + answer_text
+                    + "Submit application."
+                )
+                page = FakePage(text)
+                root = FakeReviewRoot(
+                    headings=[FakeDomElement("h3", "Review your application")],
+                    page_labels=[FakeDomElement("p", "4/4 pages")],
+                    buttons=[submit] if submit is not None else [],
+                )
+                with (
+                    patch.object(application_form, "get_application_container", return_value=root),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    result = application_form.verify_final_review_page(page)
+                self.assertFalse(result)
+                if submit is not None:
+                    self.assertEqual(submit.click_count, 0)
+
+    def test_blocking_phrase_overrides_structural_review_evidence(self):
+        text = (
+            "Review your application. 4/4 pages. Submit application. "
+            "Please correct the errors."
+        )
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(
+            headings=[FakeDomElement("h3", "Review your application")],
+            page_labels=[FakeDomElement("p", "4/4 pages")],
+            buttons=[submit],
+        )
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
+        self.assertEqual(submit.click_count, 0)
+
+    def test_review_with_nonterminal_quarter_progress_fails(self):
+        text = (
+            "Review your application. 1/4 pages. 25 percent complete. "
+            "Submit application. "
+            "How many years of work experience do you have with .NET Core? 0."
+        )
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(
+            headings=[FakeDomElement("h3", "Review your application")],
+            page_labels=[FakeDomElement("p", "1/4 pages")],
+            progressbars=[
+                FakeDomElement(
+                    "svg",
+                    attributes={
+                        "role": "progressbar",
+                        "aria-valuemin": "0",
+                        "aria-valuemax": "100",
+                        "aria-valuenow": "25",
+                    },
+                )
+            ],
+            buttons=[submit],
+        )
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
+        self.assertEqual(submit.click_count, 0)
+
+    def test_ambiguous_non_review_screen_with_zero_answer_pairs_remains_false(self):
+        text = "Contact info. Resume. Submit application."
+        page = FakePage(text)
+        root = FakeReviewRoot(buttons=[FakeControl("Submit application")])
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
 
     def test_review_evidence_and_one_answer_pass_but_auto_submit_stays_off(self):
         text = (

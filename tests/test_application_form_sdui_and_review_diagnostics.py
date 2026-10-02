@@ -54,6 +54,8 @@ class FakeApplicationPage:
     def __init__(self, *, sdui=None, legacy=None):
         self.sdui = sdui
         self.legacy = legacy
+        self.elapsed = 0.0
+        self.sdui_reveal_at = None
 
     def locator(self, selector):
         if selector == SDUI_SELECTOR:
@@ -61,6 +63,11 @@ class FakeApplicationPage:
         if selector == ".jobs-easy-apply-modal":
             return FakeLocator([self.legacy] if self.legacy is not None else [])
         return FakeLocator()
+
+    def wait_for_timeout(self, milliseconds):
+        self.elapsed += milliseconds / 1000
+        if self.sdui_reveal_at is not None and self.elapsed >= self.sdui_reveal_at:
+            self.sdui = FakeContainer(visible=True)
 
 
 class FakeReviewButton:
@@ -116,6 +123,27 @@ class EasyApplyContainerTests(unittest.TestCase):
         page = FakeApplicationPage(sdui=screen)
 
         self.assertIsNone(application_form.get_application_container(page, wait_seconds=0))
+
+    def test_delayed_sdui_root_is_accepted_within_bounded_wait(self):
+        page = FakeApplicationPage()
+        page.sdui_reveal_at = 0.6
+
+        with patch.object(application_form.time, "time", side_effect=lambda: page.elapsed):
+            container = application_form.get_application_container(page, wait_seconds=1.2)
+
+        self.assertIs(container, page.sdui)
+        self.assertGreaterEqual(page.elapsed, page.sdui_reveal_at)
+        self.assertLessEqual(page.elapsed, 1.2)
+
+    def test_missing_container_fails_when_bounded_wait_expires(self):
+        page = FakeApplicationPage()
+
+        with patch.object(application_form.time, "time", side_effect=lambda: page.elapsed):
+            container = application_form.get_application_container(page, wait_seconds=0.6)
+
+        self.assertIsNone(container)
+        self.assertGreaterEqual(page.elapsed, 0.6)
+        self.assertLessEqual(page.elapsed, 0.9)
 
     def test_legacy_selector_remains_supported(self):
         legacy = FakeContainer(

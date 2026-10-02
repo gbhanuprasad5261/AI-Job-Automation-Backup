@@ -3305,9 +3305,10 @@ def verify_final_review_page(page: Page, container=None) -> bool:
     """Perform a conservative read-only verification of LinkedIn's final review.
 
     This function never clicks controls. It confirms that the visible page
-    looks like the Easy Apply review stage, contains the configured answers
-    that can be verified from page text, and has no obvious required-field
-    validation errors before AUTO_SUBMIT is allowed to proceed.
+    looks like the Easy Apply review stage and has no obvious required-field
+    validation errors before AUTO_SUBMIT is allowed to proceed. A narrowly
+    scoped Review heading plus terminal progress and an enabled Submit control
+    can verify the captured SDUI layout without relying on question text.
     """
     print()
     print("=" * 70)
@@ -3341,6 +3342,114 @@ def verify_final_review_page(page: Page, container=None) -> bool:
         print("Blocking validation message detected:")
         for item in blocking:
             print(f"  - {item}")
+        print("Final review verification FAILED.")
+        return False
+
+    # Phase 7Y captured this SDUI Review layout with an explicit heading,
+    # terminal 4/4 / 100% progress, and an enabled Submit application control.
+    # Keep this evidence scoped to the application container and do not infer
+    # Review from Submit alone or from arbitrary number/number text (which can
+    # occur in dates such as 9/28/2026).
+    structural_container = container
+    if structural_container is None:
+        try:
+            structural_container = get_application_container(page, wait_seconds=0)
+        except Exception:
+            structural_container = None
+
+    explicit_review_heading = False
+    terminal_progress = False
+    observed_progress = False
+    nonterminal_or_unverified_progress = False
+    enabled_submit_application = False
+
+    if structural_container is not None:
+        try:
+            headings = structural_container.locator(
+                "h1, h2, h3, h4, h5, h6, [role='heading']"
+            )
+            for i in range(headings.count()):
+                heading = headings.nth(i)
+                if not heading.is_visible():
+                    continue
+                heading_text = re.sub(r"\s+", " ", safe_text(heading)).strip()
+                if re.fullmatch(r"review your application", heading_text, re.I):
+                    explicit_review_heading = True
+                    break
+        except Exception:
+            pass
+
+        try:
+            # The captured page counter is a standalone "4/4 pages" element.
+            # Only accept that explicit form; do not parse arbitrary fractions.
+            page_labels = structural_container.locator("p, span, div")
+            for i in range(page_labels.count()):
+                label = page_labels.nth(i)
+                if not label.is_visible():
+                    continue
+                label_text = re.sub(r"\s+", " ", safe_text(label)).strip()
+                match = re.fullmatch(r"(\d+)\s*/\s*(\d+)\s+pages?", label_text, re.I)
+                if not match:
+                    continue
+                observed_progress = True
+                if match.groups() == ("4", "4"):
+                    terminal_progress = True
+                else:
+                    nonterminal_or_unverified_progress = True
+        except Exception:
+            pass
+
+        try:
+            progressbars = structural_container.locator('[role="progressbar"]')
+            for i in range(progressbars.count()):
+                progressbar = progressbars.nth(i)
+                if not progressbar.is_visible():
+                    continue
+                value = safe_attribute(progressbar, "aria-valuenow").strip()
+                maximum = safe_attribute(progressbar, "aria-valuemax").strip()
+                if not value:
+                    continue
+                observed_progress = True
+                try:
+                    current_value = float(value)
+                    maximum_value = float(maximum)
+                except (TypeError, ValueError):
+                    nonterminal_or_unverified_progress = True
+                    continue
+                if current_value == 100 and maximum_value == 100:
+                    terminal_progress = True
+                else:
+                    nonterminal_or_unverified_progress = True
+        except Exception:
+            pass
+
+        try:
+            controls = structural_container.locator("button, [role='button']")
+            for i in range(controls.count()):
+                control = controls.nth(i)
+                if not control.is_visible():
+                    continue
+                if not re.search(r"\bsubmit\s+application\b", _control_text(control), re.I):
+                    continue
+                try:
+                    if control.is_enabled():
+                        enabled_submit_application = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if explicit_review_heading and observed_progress:
+        if (
+            terminal_progress
+            and not nonterminal_or_unverified_progress
+            and enabled_submit_application
+        ):
+            print("Structural final Review evidence detected: terminal progress and enabled Submit application.")
+            return True
+
+        print("Review/progress evidence is incomplete, non-terminal, or lacks enabled Submit application.")
         print("Final review verification FAILED.")
         return False
 

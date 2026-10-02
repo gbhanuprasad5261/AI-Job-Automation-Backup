@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 import config
-from application_form import inspect_and_prepare_form
+from application_form import get_application_container, inspect_and_prepare_form
 from external_app import (
     find_external_apply_link,
     check_external_eligibility,
@@ -111,9 +111,11 @@ def _detect_easy_apply_container(candidate_page):
                 except Exception:
                     class_name = ""
                 if any(token in text for token in (
-                    "application", "resume", "contact info",
-                    "work experience", "education", "submit application",
-                    "review application", "continue to next step",
+                    "resume", "contact info",
+                    "contact information", "work experience", "education",
+                    "review your application", "review application",
+                    "continue to next step", "application questions",
+                    "application form",
                 )) or "jobs-easy-apply" in class_name:
                     return {
                         "detected": True,
@@ -135,6 +137,62 @@ def _detect_easy_apply_container(candidate_page):
         "source": None,
         "sdui_diagnostics": sdui_diagnostics,
     }
+
+
+def _has_specific_application_container_signal(container):
+    """Reject generic Submit-only wrappers returned by broad container scans."""
+    try:
+        if not container.is_visible():
+            return False
+
+        attrs = " ".join(
+            (container.get_attribute(name) or "")
+            for name in ("class", "id", "aria-label", "data-test-modal", "role")
+        ).lower()
+        if any(marker in attrs for marker in (
+            "jobs-easy-apply", "easy-apply", "easyapply",
+        )):
+            return True
+
+        text = " ".join((container.inner_text() or "").lower().split())
+        return any(signal in text for signal in (
+            "contact info", "contact information", "resume", "work experience",
+            "education", "review your application", "review application",
+            "continue to next step", "application questions", "application form",
+            "phone number", "cover letter", "additional questions",
+            "screening questions",
+        ))
+    except Exception:
+        return False
+
+
+def _eligible_easy_apply_pages(original_page, pages):
+    """Keep detection on the clicked page and LinkedIn popup pages only."""
+    candidates = [original_page]
+    for candidate_page in pages:
+        if candidate_page is original_page:
+            continue
+        try:
+            if "linkedin.com" in (candidate_page.url or "").lower():
+                candidates.append(candidate_page)
+        except Exception:
+            continue
+    return candidates
+
+
+def _find_validated_application_container(candidate_pages, wait_seconds=12):
+    """Wait for a validated application container on the eligible pages."""
+    for candidate_page in candidate_pages:
+        try:
+            container = get_application_container(
+                candidate_page,
+                wait_seconds=wait_seconds,
+            )
+        except Exception:
+            continue
+        if container is not None and _has_specific_application_container_signal(container):
+            return candidate_page, container
+    return None, None
 
 # ---------------------------------------
 # Navigation helper
@@ -1658,15 +1716,10 @@ def open_easy_apply(job):
         modal_selectors = EASY_APPLY_MODAL_SELECTORS
 
         modal_probe = []
-        diagnostic_pages = [original_page]
-        for candidate_page in context.pages:
-            if candidate_page is original_page:
-                continue
-            try:
-                if "linkedin.com" in (candidate_page.url or "").lower():
-                    diagnostic_pages.append(candidate_page)
-            except Exception:
-                continue
+        diagnostic_pages = _eligible_easy_apply_pages(
+            original_page,
+            context.pages,
+        )
 
         for candidate_page in diagnostic_pages:
             modal_probe.append({
@@ -1702,26 +1755,39 @@ def open_easy_apply(job):
                 })
             return detection["detected"]
 
+        application_ui_found = False
         if has_application_ui(original_page):
             page = original_page
+            application_ui_found = True
             print("Easy Apply modal detected on the original LinkedIn job page.")
         else:
             # Check actual popups/new tabs only. Never switch to an arbitrary
             # LinkedIn page such as a company-home tab.
-            for candidate_page in context.pages:
-                if candidate_page is original_page:
-                    continue
-                try:
-                    if "linkedin.com" not in (candidate_page.url or "").lower():
-                        continue
-                    if has_application_ui(candidate_page):
-                        page = candidate_page
-                        print("Easy Apply modal detected on an additional LinkedIn page.")
-                        break
-                except Exception:
-                    continue
+            for candidate_page in diagnostic_pages[1:]:
+                if has_application_ui(candidate_page):
+                    page = candidate_page
+                    application_ui_found = True
+                    print("Easy Apply modal detected on an additional LinkedIn page.")
+                    break
 
-        if not has_application_ui(page):
+        if not application_ui_found:
+            # Keep the current immediate checks as a fast path. If they miss a
+            # delayed SDUI/modal render, reuse the form processor's bounded,
+            # signal-validated detector on only the clicked page and eligible
+            # LinkedIn popup pages.
+            validated_page, validated_container = _find_validated_application_container(
+                diagnostic_pages,
+                wait_seconds=12,
+            )
+            if validated_container is not None:
+                page = validated_page
+                application_ui_found = True
+                print("Easy Apply container detected by the bounded application-form check.")
+                # Emit SDUI diagnostics if the exact visible SDUI root was the
+                # signal that became available during the bounded wait.
+                has_application_ui(page)
+
+        if not application_ui_found:
             print()
             print("EASY APPLY MODAL NOT DETECTED")
             print(f"Current page URL after click: {page.url}")

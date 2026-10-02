@@ -110,6 +110,18 @@ class EasyApplySduiDetectionTests(unittest.TestCase):
 
         self.assertFalse(result["detected"])
 
+    def test_submit_only_modal_is_not_an_application_container(self):
+        page = FakePage({
+            "[role='dialog']": [FakeElement(
+                attributes={"role": "dialog"},
+                text="Submit application",
+            )]
+        })
+
+        result = easy_apply._detect_easy_apply_container(page)
+
+        self.assertFalse(result["detected"])
+
     def test_url_change_alone_is_not_an_application_container(self):
         page = FakePage(
             url=("https://www.linkedin.com/jobs/view/123/"
@@ -119,6 +131,43 @@ class EasyApplySduiDetectionTests(unittest.TestCase):
         result = easy_apply._detect_easy_apply_container(page)
 
         self.assertFalse(result["detected"])
+
+    def test_eligible_pages_are_clicked_page_and_linkedin_popups_only(self):
+        clicked_page = FakePage(url="https://www.linkedin.com/jobs/view/123/")
+        linkedin_popup = FakePage(url="https://www.linkedin.com/jobs/view/123/?apply=1")
+        unrelated_page = FakePage(url="https://example.com/apply")
+
+        candidates = easy_apply._eligible_easy_apply_pages(
+            clicked_page,
+            [clicked_page, linkedin_popup, unrelated_page],
+        )
+
+        self.assertEqual(candidates, [clicked_page, linkedin_popup])
+
+    def test_validated_container_requires_application_context_not_submit_alone(self):
+        class Container:
+            def __init__(self, text):
+                self.text = text
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, name):
+                return ""
+
+            def inner_text(self):
+                return self.text
+
+        self.assertFalse(
+            easy_apply._has_specific_application_container_signal(
+                Container("Submit application")
+            )
+        )
+        self.assertTrue(
+            easy_apply._has_specific_application_container_signal(
+                Container("Contact info Resume Submit application")
+            )
+        )
 
 
 if __name__ == "__main__":
