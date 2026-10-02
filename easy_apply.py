@@ -25,6 +25,7 @@ from runtime_diagnostics import (
 # ---------------------------------------
 
 ANALYSIS_FILE = "data/job_analysis.csv"
+DETAILS_FILE = "data/job_details.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
@@ -522,7 +523,46 @@ def is_allowed_location(location):
 # Select Recommended Jobs
 # ---------------------------------------
 
+def _analysis_matches_details():
+    """Fail closed when saved analysis predates its source details CSV."""
+    if not os.path.exists(ANALYSIS_FILE):
+        print(
+            f"Analysis file not found: {ANALYSIS_FILE}. "
+            "Run job_analyzer.py before selecting application candidates."
+        )
+        return False
+
+    if not os.path.exists(DETAILS_FILE):
+        print(
+            f"Details file not found: {DETAILS_FILE}; cannot verify analysis "
+            "freshness. No application candidates selected."
+        )
+        return False
+
+    try:
+        details_mtime = os.path.getmtime(DETAILS_FILE)
+        analysis_mtime = os.path.getmtime(ANALYSIS_FILE)
+    except OSError as exc:
+        print(
+            f"Could not verify details/analysis timestamps ({exc}); "
+            "no application candidates selected."
+        )
+        return False
+
+    if details_mtime > analysis_mtime:
+        print(
+            f"{DETAILS_FILE} is newer than {ANALYSIS_FILE}; "
+            "rerun job_analyzer.py before selecting application candidates."
+        )
+        return False
+
+    return True
+
+
 def get_recommended_jobs():
+    if not _analysis_matches_details():
+        return []
+
     jobs = load_csv(ANALYSIS_FILE)
 
     if not jobs:
