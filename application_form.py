@@ -476,15 +476,29 @@ def _valid_application_step(current, total):
     return 1 <= current <= total
 
 
+def _parse_application_step(body):
+    patterns = (
+        r"Application\s+page\s*:?[ \t]*(\d+)\s*/\s*(\d+)",
+        r"Page\s+(\d+)\s+of\s+(\d+)",
+        r"Step\s+(\d+)\s+of\s+(\d+)",
+        r"(?<![\d/])(\d+)\s*/\s*(\d+)(?![\d/])\s+pages?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, body, re.I)
+        if match:
+            current, total = int(match.group(1)), int(match.group(2))
+            if _valid_application_step(current, total):
+                return current, total
+    return None
+
+
 def print_application_status(page: Page):
     try:
         container=get_application_container(page,wait_seconds=0)
         if container is None: print("Application page: unknown"); return
-        body=safe_text(container)
-        for pattern in (r"Application\s+page\s*:?[ \t]*(\d+)\s*/\s*(\d+)",r"Page\s+(\d+)\s+of\s+(\d+)",r"Step\s+(\d+)\s+of\s+(\d+)",r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)"):
-            m=re.search(pattern,body,re.I)
-            if m and _valid_application_step(int(m.group(1)),int(m.group(2))):
-                print(f"Application page: {int(m.group(1))}/{int(m.group(2))}"); return
+        step = _parse_application_step(safe_text(container))
+        if step:
+            print(f"Application page: {step[0]}/{step[1]}"); return
     except Exception: pass
     print("Application page: unknown")
 
@@ -492,15 +506,7 @@ def get_application_step(page: Page):
     try:
         container=get_application_container(page,wait_seconds=0)
         if container is None: return None
-        body=safe_text(container)
-        for pattern in (r"Application\s+page\s*:?[ \t]*(\d+)\s*/\s*(\d+)",r"Page\s+(\d+)\s+of\s+(\d+)",r"Step\s+(\d+)\s+of\s+(\d+)"):
-            m=re.search(pattern,body,re.I)
-            if m:
-                cur,total=int(m.group(1)),int(m.group(2))
-                if _valid_application_step(cur,total): return cur,total
-        for m in re.finditer(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)",body):
-            cur,total=int(m.group(1)),int(m.group(2))
-            if _valid_application_step(cur,total): return cur,total
+        return _parse_application_step(safe_text(container))
     except Exception: pass
     return None
 
