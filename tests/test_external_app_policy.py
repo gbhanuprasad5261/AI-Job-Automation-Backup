@@ -9,7 +9,7 @@ class FakePage:
 
 
 class ExternalApplicationPolicyTests(unittest.TestCase):
-    def _prepare(self, policy, required=0):
+    def _prepare(self, policy, required=0, auto_submit=False):
         page = FakePage()
         submit_gate = Mock(return_value="READY_FOR_REVIEW")
         with (
@@ -27,6 +27,7 @@ class ExternalApplicationPolicyTests(unittest.TestCase):
             patch.object(external_app, "_check_known_terms_consent", return_value=0),
             patch.object(external_app, "_required_empty_count", return_value=required),
             patch.object(external_app, "_auto_submit_external_application", submit_gate),
+            patch("config.AUTO_SUBMIT", auto_submit),
         ):
             result = external_app.prepare_external_application_page(page)
         return result, submit_gate
@@ -37,7 +38,7 @@ class ExternalApplicationPolicyTests(unittest.TestCase):
         submit_gate.assert_not_called()
 
     def test_skip_policy_keeps_existing_external_submit_gate_path(self):
-        result, submit_gate = self._prepare("SKIP")
+        result, submit_gate = self._prepare("SKIP", auto_submit=True)
         self.assertEqual(result, "READY_FOR_REVIEW")
         submit_gate.assert_called_once()
 
