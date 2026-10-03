@@ -3469,6 +3469,13 @@ def verify_final_review_page(page: Page, container=None) -> bool:
         return False
 
     # LinkedIn's review page should expose at least one strong review signal.
+    # Legacy text-only layouts must still state the specific Review heading;
+    # generic Resume/Application text also appears on earlier form pages.
+    if "review your application" not in normalized:
+        print("No explicit legacy Review text signal was found.")
+        print("Final review verification FAILED.")
+        return False
+
     review_signals = (
         "review your application",
         "additional questions",

@@ -284,6 +284,22 @@ class FinalPageSafetyCases(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(submit.click_count, 0)
 
+    def test_generic_resume_application_and_matching_answer_without_review_fails(self):
+        text = (
+            "Contact info. Resume. Submit application. "
+            "How many years of work experience do you have with .NET Core? 0."
+        )
+        submit = FakeControl("Submit application")
+        page = FakePage(text)
+        root = FakeReviewRoot(buttons=[submit])
+        with (
+            patch.object(application_form, "get_application_container", return_value=root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = application_form.verify_final_review_page(page)
+        self.assertFalse(result)
+        self.assertEqual(submit.click_count, 0)
+
     def test_submit_without_review_or_progress_fails(self):
         text = "Application. Resume. Submit application."
         submit = FakeControl("Submit application")
