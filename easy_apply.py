@@ -2,6 +2,7 @@ import csv
 import os
 import re
 import time
+from collections import Counter
 from datetime import datetime
 
 import config
@@ -27,6 +28,7 @@ from runtime_diagnostics import (
 
 ANALYSIS_FILE = "data/job_analysis.csv"
 DETAILS_FILE = "data/job_details.csv"
+JOBS_FILE = "jobs.csv"
 TRACKER_FILE = "data/application_tracker.csv"
 APPLICATION_HISTORY_FILE = "data/application_history.csv"
 
@@ -536,35 +538,131 @@ def is_allowed_location(location):
 # Select Recommended Jobs
 # ---------------------------------------
 
-def _analysis_matches_details():
-    """Fail closed when saved analysis predates its source details CSV."""
-    if not os.path.exists(ANALYSIS_FILE):
-        print(
-            f"Analysis file not found: {ANALYSIS_FILE}. "
-            "Run job_analyzer.py before selecting application candidates."
-        )
-        return False
+def _read_job_identities(file_path):
+    """Read order-independent job identities from a pipeline-stage CSV."""
+    try:
+        with open(file_path, "r", encoding="utf-8", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            fieldnames = reader.fieldnames or []
+            columns = {name.strip().casefold(): name for name in fieldnames}
+            url_column = columns.get("link") or columns.get("url")
+            if not url_column:
+                print(
+                    f"Cannot verify job identity in {file_path}: missing "
+                    "Link/URL column. No application candidates selected."
+                )
+                return None
 
-    if not os.path.exists(DETAILS_FILE):
+            id_column = next(
+                (
+                    columns[name]
+                    for name in ("job id", "jobid", "job_id")
+                    if name in columns
+                ),
+                None,
+            )
+            identities = Counter()
+            for row in reader:
+                raw_url = (row.get(url_column) or "").strip()
+                normalized_url = _normalize_url(convert_to_job_url(raw_url))
+                raw_id = (row.get(id_column) or "").strip() if id_column else ""
+                url_id = re.search(r"/jobs/view/(\d+)(?:/|$)", normalized_url)
+                if raw_id and url_id and raw_id != url_id.group(1):
+                    print(
+                        f"Cannot verify job identity in {file_path}: a job ID "
+                        "does not match its URL. No application candidates selected."
+                    )
+                    return None
+                job_id = raw_id or (url_id.group(1) if url_id else "")
+
+                if job_id:
+                    identities[("job_id", job_id)] += 1
+                elif normalized_url:
+                    identities[("url", normalized_url)] += 1
+                else:
+                    print(
+                        f"Cannot verify job identity in {file_path}: a row has "
+                        "no usable job URL or ID. No application candidates selected."
+                    )
+                    return None
+
+            if not identities:
+                print(
+                    f"Cannot verify job identity in {file_path}: no job rows "
+                    "were found. No application candidates selected."
+                )
+                return None
+            return identities
+    except (OSError, csv.Error, UnicodeError) as exc:
         print(
-            f"Details file not found: {DETAILS_FILE}; cannot verify analysis "
-            "freshness. No application candidates selected."
+            f"Could not read job identities from {file_path} ({exc}); "
+            "no application candidates selected."
         )
-        return False
+        return None
+
+
+def _analysis_matches_details():
+    """Fail closed unless jobs, details, and analysis are consistent stages."""
+    paths = (JOBS_FILE, DETAILS_FILE, ANALYSIS_FILE)
+    labels = {
+        JOBS_FILE: "Source jobs file",
+        DETAILS_FILE: "Details file",
+        ANALYSIS_FILE: "Analysis file",
+    }
+    for file_path in paths:
+        if not os.path.exists(file_path):
+            print(
+                f"{labels[file_path]} not found: {file_path}; "
+                "cannot verify source-stage consistency. No application "
+                "candidates selected."
+            )
+            return False
 
     try:
+        jobs_mtime = os.path.getmtime(JOBS_FILE)
         details_mtime = os.path.getmtime(DETAILS_FILE)
         analysis_mtime = os.path.getmtime(ANALYSIS_FILE)
     except OSError as exc:
         print(
-            f"Could not verify details/analysis timestamps ({exc}); "
+            f"Could not verify source-stage timestamps ({exc}); "
             "no application candidates selected."
+        )
+        return False
+
+    if jobs_mtime > details_mtime:
+        print(
+            f"{JOBS_FILE} is newer than {DETAILS_FILE}; rerun job_details.py "
+            "before selecting application candidates."
         )
         return False
 
     if details_mtime > analysis_mtime:
         print(
             f"{DETAILS_FILE} is newer than {ANALYSIS_FILE}; "
+            "rerun job_analyzer.py before selecting application candidates."
+        )
+        return False
+
+    jobs_identities = _read_job_identities(JOBS_FILE)
+    details_identities = _read_job_identities(DETAILS_FILE)
+    analysis_identities = _read_job_identities(ANALYSIS_FILE)
+    if any(identities is None for identities in (
+        jobs_identities,
+        details_identities,
+        analysis_identities,
+    )):
+        return False
+
+    if jobs_identities != details_identities:
+        print(
+            f"Job identities in {JOBS_FILE} do not match {DETAILS_FILE}; "
+            "rerun job_details.py before selecting application candidates."
+        )
+        return False
+
+    if details_identities != analysis_identities:
+        print(
+            f"Job identities in {DETAILS_FILE} do not match {ANALYSIS_FILE}; "
             "rerun job_analyzer.py before selecting application candidates."
         )
         return False
