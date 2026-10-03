@@ -192,11 +192,13 @@ class ResumeUploadSafetyTests(unittest.TestCase):
 
         google_page = MagicMock()
         google_output = StringIO()
+        google_fields = MagicMock()
+        google_radios = MagicMock()
         with (
             redirect_stdout(google_output),
             patch.object(config, "AUTO_SUBMIT", False),
-            patch.object(external_app, "_fill_google_forms_known_fields", return_value=0),
-            patch.object(external_app, "_google_forms_confirmed_radio_answers", return_value=0),
+            patch.object(external_app, "_fill_google_forms_known_fields", google_fields),
+            patch.object(external_app, "_google_forms_confirmed_radio_answers", google_radios),
             patch.object(external_app, "_upload_google_forms_resume") as google_upload,
             patch.object(external_app, "_google_forms_required_empty_count", return_value=1),
             patch.object(external_app, "_auto_submit_google_form", return_value="READY_FOR_REVIEW"),
@@ -209,11 +211,17 @@ class ResumeUploadSafetyTests(unittest.TestCase):
             )
 
         google_upload.assert_not_called()
-        self.assertIn("manual review is required", google_output.getvalue())
+        google_fields.assert_not_called()
+        google_radios.assert_not_called()
+        self.assertIn("manual review required", google_output.getvalue())
 
         ats_page = MagicMock()
         ats_page.url = "https://careers.example.test/application"
         ats_output = StringIO()
+        ats_application_fields = MagicMock(return_value=0)
+        ats_fields = MagicMock(return_value=0)
+        ats_profile_links = MagicMock(return_value=0)
+        ats_dropdowns = MagicMock(return_value=0)
         with (
             redirect_stdout(ats_output),
             patch.object(config, "AUTO_SUBMIT", False),
@@ -223,11 +231,11 @@ class ResumeUploadSafetyTests(unittest.TestCase):
             patch.object(external_app, "_wait_for_manual_consent", return_value=True),
             patch.object(external_app, "_click_external_application_start", return_value=ats_page),
             patch.object(external_app, "_looks_like_application_form", return_value=True),
-            patch.object(external_app, "_fill_known_application_fields", return_value=0),
-            patch.object(external_app, "_fill_known_fields", return_value=0),
+            patch.object(external_app, "_fill_known_application_fields", ats_application_fields),
+            patch.object(external_app, "_fill_known_fields", ats_fields),
             patch.object(external_app, "_upload_resume") as ats_upload,
-            patch.object(external_app, "_fill_known_profile_links", return_value=0),
-            patch.object(external_app, "_select_known_dropdowns", return_value=0),
+            patch.object(external_app, "_fill_known_profile_links", ats_profile_links),
+            patch.object(external_app, "_select_known_dropdowns", ats_dropdowns),
             patch.object(external_app, "_check_known_terms_consent", return_value=0),
             patch.object(external_app, "_required_empty_count", return_value=1),
         ):
@@ -237,7 +245,11 @@ class ResumeUploadSafetyTests(unittest.TestCase):
             )
 
         ats_upload.assert_not_called()
-        self.assertIn("Required fields remain empty", ats_output.getvalue())
+        ats_application_fields.assert_not_called()
+        ats_fields.assert_not_called()
+        ats_profile_links.assert_not_called()
+        ats_dropdowns.assert_not_called()
+        self.assertIn("fields were not modified", ats_output.getvalue())
 
     def test_auto_submit_false_preserves_final_submit_safety_gates(self):
         with (
