@@ -2,6 +2,7 @@ import os
 import re
 import time
 import config
+from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
 
@@ -776,6 +777,10 @@ def fill_phone(container):
 # ============================================================
 
 def upload_resume(container):
+
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: LinkedIn resume upload skipped.")
+        return False
 
     if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT disabled: resume upload skipped.")
@@ -3075,6 +3080,9 @@ def job_is_closed(page):
 # ============================================================
 
 def prepare_current_page(page: Page):
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: LinkedIn application page preparation skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
     print(); print("="*70); print("PREPARING APPLICATION PAGE"); print("="*70)
     try:
         print(f"Easy Apply URL detected: {'applicantTrackingSystemName=LinkedIn' in page.url}")
@@ -3172,6 +3180,9 @@ def _form_fingerprint(page):
 
 def move_to_next_page(page: Page):
     """Click application navigation once and verify a real transition."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: LinkedIn application navigation skipped.")
+        return False
     container = get_application_container(page)
     before = get_application_step(page)
 
@@ -3564,6 +3575,10 @@ def handle_final_submission(page: Page):
     application submission button, and success is returned only after a
     post-click confirmation is detected.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: LinkedIn final review/submission inspection skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     print()
     print("=" * 70)
     print("FINAL APPLICATION PAGE DETECTED")
@@ -3638,6 +3653,10 @@ def handle_final_submission(page: Page):
 def inspect_and_prepare_form(
     page: Page
 ):
+
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: LinkedIn application preparation skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
 
     print()
     print(

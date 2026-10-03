@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 
 import config
+from execution_policy import EXECUTION_POLICY
 from application_form import get_application_container, inspect_and_prepare_form
 from external_app import (
     find_external_apply_link,
@@ -200,6 +201,10 @@ def _find_validated_application_container(candidate_pages, wait_seconds=12):
 
 def navigate_page(page, url, timeout=30000, settle_ms=5000, required_url_fragment=None):
     """Navigate while tolerating slow post-navigation page loading."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: browser navigation skipped.")
+        return False
+
     last_error = None
 
     for attempt in range(2):
@@ -338,6 +343,10 @@ def _history_status_for_job(job):
 
 def _record_application_history(job, status, submission_confirmed=False):
     """Persist confirmed application status in one shared history CSV."""
+    if not EXECUTION_POLICY.allows_persistence():
+        print("DRY_RUN: application history write skipped.")
+        return False
+
     if status != "APPLIED":
         return True
     if not submission_confirmed:
@@ -395,6 +404,10 @@ def _record_application_history(job, status, submission_confirmed=False):
 
 
 def _write_application_history(rows, fields):
+    if not EXECUTION_POLICY.allows_persistence():
+        print("DRY_RUN: application history write skipped.")
+        return False
+
     try:
         with open(
             APPLICATION_HISTORY_FILE,
@@ -1078,6 +1091,9 @@ def print_application_controls(page):
 # ---------------------------------------
 
 def save_diagnostic_screenshot(page):
+    if not EXECUTION_POLICY.allows_diagnostic_artifacts():
+        print("DRY_RUN: diagnostic screenshot write skipped.")
+        return False
 
     try:
 
@@ -1147,6 +1163,10 @@ def record_application_status(job, status, submission_confirmed=False):
     A confirmed APPLIED result is also written to the general application
     history so future runs skip the job even if tracker rows are regenerated.
     """
+    if not EXECUTION_POLICY.allows_persistence():
+        print("DRY_RUN: application tracker/history write skipped.")
+        return False
+
     status = str(status or "").strip().upper()
     if status in {"APPLIED", "SUBMITTED"} and not submission_confirmed:
         print("Application status write blocked: submission is not confirmed.")
@@ -1262,6 +1282,9 @@ def record_application_status(job, status, submission_confirmed=False):
 # ---------------------------------------
 
 def open_easy_apply(job):
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: browser execution intentionally skipped for selected job.")
+        return EXECUTION_POLICY.dry_run_result(job)
 
     link = job.get(
         "Link",
@@ -1941,6 +1964,18 @@ def main():
     # ---------------------------------------
 
     jobs = get_recommended_jobs()
+
+    if EXECUTION_POLICY.dry_run:
+        results = [EXECUTION_POLICY.dry_run_result(job) for job in jobs]
+        print(f"DRY_RUN: selected jobs: {len(jobs)}")
+        for result in results:
+            route = result["route_hint"] or "No saved routing hint"
+            print(
+                "DRY_RUN_SKIPPED_BROWSER: "
+                f"{result['job_title']} | {result['company']} | "
+                f"score={result['match_score']} | route hint={route}"
+            )
+        return results
 
     today_applied = get_today_applied_count()
     daily_limit = config.DAILY_APPLICATION_LIMIT

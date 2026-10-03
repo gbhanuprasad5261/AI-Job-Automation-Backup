@@ -11,6 +11,7 @@ import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 import config
+from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
 from runtime_diagnostics import (
@@ -977,6 +978,10 @@ def _prepare_google_form(
     Unknown questions are left untouched. Submission occurs only when no
     required question remains unanswered and AUTO_SUBMIT is enabled.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: Google Forms preparation skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if not config.AUTO_SUBMIT:
         print(
             "AUTO_SUBMIT disabled: Google Form answers were not modified; "
@@ -1033,6 +1038,10 @@ def _prepare_google_form(
 
 def _auto_submit_google_form(page: Page) -> str:
     """Submit Google Forms only after required-question verification."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: Google Forms submission skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
         print("UNKNOWN_QUESTIONS_POLICY=REVIEW: Google Form submission stopped for manual review.")
         return "READY_FOR_REVIEW"
@@ -1139,6 +1148,10 @@ def _upload_google_forms_resume(page: Page, resume_path: str) -> bool:
     a Windows path into the web page is not reliable and is intentionally not
     used here.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: Google Forms resume upload skipped.")
+        return False
+
     if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT disabled: Google Forms resume upload skipped.")
         return False
@@ -1368,6 +1381,10 @@ def _upload_resume(page: Page, resume_path: str) -> bool:
     Only real file inputs or clearly labeled upload controls are used. No
     unrelated buttons are clicked and no application is submitted here.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external ATS resume upload skipped.")
+        return False
+
     if not config.AUTO_SUBMIT:
         print("AUTO_SUBMIT disabled: external ATS resume upload skipped.")
         return False
@@ -1694,6 +1711,10 @@ def _click_external_application_start(page: Page):
     Handles same-tab navigation, popup/new-tab application flows,
     delayed JavaScript navigation, and broader company-site Apply labels.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external application start-control inspection/click skipped.")
+        return page
+
     if _looks_like_application_form(page):
         return page
 
@@ -1898,6 +1919,10 @@ def _external_submission_verified(page: Page, previous_url: str) -> bool:
 
 def _auto_submit_external_application(page: Page) -> str:
     """Submit only a fully populated external application when AUTO_SUBMIT is enabled."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external application submission skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
         print("UNKNOWN_QUESTIONS_POLICY=REVIEW: external submission stopped for manual review.")
         return "READY_FOR_REVIEW"
@@ -1946,6 +1971,10 @@ def _prepare_successfactors_account(page: Page) -> str:
     selected only when India/+91 is an available option. Unknown required
     fields are never guessed.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: SuccessFactors account preparation skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if not config.AUTO_SUBMIT:
         print(
             "SuccessFactors account registration disabled because "
@@ -2141,6 +2170,10 @@ def _check_known_terms_consent(page: Page) -> int | None:
     Unknown checkboxes are never selected. Returns None when manual consent
     is required because AUTO_SUBMIT is disabled.
     """
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: terms/privacy consent inspection skipped.")
+        return None
+
     count = 0
     checkboxes = page.locator("input[type='checkbox']")
 
@@ -2317,6 +2350,10 @@ def _wait_for_manual_consent(page: Page, detection_timeout_ms=5000, wait_timeout
     unknown checkboxes/buttons.
     """
 
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: cookie/privacy consent inspection skipped.")
+        return False
+
     consent_phrases = (
         "data privacy agreement",
         "privacy agreement",
@@ -2487,6 +2524,10 @@ def prepare_external_application_page(
     current_company: str = CURRENT_COMPANY,
 ):
     """Handle an external ATS page without guessing unknown questions."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external application preparation skipped before page interaction.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     body = _text(page)
     ats = detect_ats(page.url, body)
     print(f"External ATS detected: {ats}")

@@ -28,6 +28,7 @@ SEARCH_KEYWORDS = (
 EASY_APPLY_FILTER = False
 
 AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # SKIP leaves the job without submission; REVIEW leaves the form for manual completion.
 UNKNOWN_QUESTIONS_POLICY = os.getenv("UNKNOWN_QUESTIONS_POLICY", "SKIP").strip().upper()

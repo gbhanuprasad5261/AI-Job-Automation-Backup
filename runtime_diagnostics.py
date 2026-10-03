@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import json
 import os
+from execution_policy import EXECUTION_POLICY
 
 
 DIAGNOSTIC_FILE = os.path.join("screenshots", "phase7g_diagnostics.jsonl")
@@ -139,6 +140,8 @@ def overlay_diagnostics(page, candidate_limit=25):
 
 def write_diagnostic(event, path=None):
     """Append one bounded JSONL record; logging failures never escape."""
+    if not EXECUTION_POLICY.allows_diagnostic_artifacts():
+        return False
     try:
         record = dict(event)
         record.setdefault(
