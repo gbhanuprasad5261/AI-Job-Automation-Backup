@@ -977,6 +977,13 @@ def _prepare_google_form(
     Unknown questions are left untouched. Submission occurs only when no
     required question remains unanswered and AUTO_SUBMIT is enabled.
     """
+    if not config.AUTO_SUBMIT:
+        print(
+            "AUTO_SUBMIT disabled: Google Form answers were not modified; "
+            "manual review required."
+        )
+        return "READY_FOR_REVIEW"
+
     print("Google Form detected: using safe known-field handling.")
 
     filled = _fill_google_forms_known_fields(
@@ -2580,6 +2587,13 @@ def prepare_external_application_page(
         print("No recognizable external application form was reached.")
         print("No external submission was performed.")
         return "FORM_NOT_FOUND"
+
+    if not config.AUTO_SUBMIT:
+        print(
+            "AUTO_SUBMIT disabled: external application fields were not "
+            "modified; manual review required."
+        )
+        return "READY_FOR_REVIEW"
 
     special_fields = _fill_known_application_fields(page, name)
     if special_fields:
