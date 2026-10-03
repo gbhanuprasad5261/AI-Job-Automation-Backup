@@ -1544,7 +1544,6 @@ def _looks_like_application_form(page: Page) -> bool:
         "complete your application",
         "candidate information",
         "candidate details",
-        "personal information",
         "contact information",
         "upload resume",
         "upload your resume",
