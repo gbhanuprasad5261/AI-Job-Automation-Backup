@@ -222,6 +222,7 @@ class OpenFormPersistenceTests(unittest.TestCase):
         application_result,
         detection_result=None,
         record_status_result=True,
+        record_status_override=None,
     ):
         page = FakePage()
         context = MagicMock()
@@ -233,7 +234,9 @@ class OpenFormPersistenceTests(unittest.TestCase):
         manager = MagicMock()
         manager.__enter__.return_value = playwright
         manager.__exit__.return_value = False
-        record_status = MagicMock(return_value=record_status_result)
+        record_status = record_status_override or MagicMock(
+            return_value=record_status_result
+        )
         prepare_form = MagicMock(return_value=application_result)
         diagnostic_writer = MagicMock()
         detector_patch = (
@@ -329,6 +332,28 @@ class OpenFormPersistenceTests(unittest.TestCase):
             "SUBMITTED",
             record_status_result=False,
         )
+
+        self.assertTrue(result)
+        record_status.assert_called_once_with(
+            job,
+            "APPLIED",
+            submission_confirmed=True,
+        )
+
+    def test_confirmed_submission_remains_countable_when_both_sinks_fail(self):
+        record_status = MagicMock(side_effect=easy_apply.record_application_status)
+        with (
+            patch.object(
+                easy_apply,
+                "_write_tracker_application_status",
+                side_effect=OSError("tracker write failed"),
+            ),
+            patch.object(easy_apply, "_record_application_history", return_value=False),
+        ):
+            result, _, job, _, _ = self._run_open_form(
+                "SUBMITTED",
+                record_status_override=record_status,
+            )
 
         self.assertTrue(result)
         record_status.assert_called_once_with(
