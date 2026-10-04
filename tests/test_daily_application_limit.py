@@ -1,5 +1,7 @@
 import contextlib
+import csv
 import io
+import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -83,19 +85,52 @@ class DailyApplicationLimitTests(unittest.TestCase):
 
     def test_only_confirmed_applied_history_counts_toward_daily_limit(self):
         today = datetime.now().strftime("%Y-%m-%d")
-        rows = [
-            {"Status": "APPLIED", "Applied Date": today},
-            {"Status": "SUBMITTED", "Applied Date": today},
-            {"Status": "READY_FOR_REVIEW", "Applied Date": today},
-            {"Status": "FORM_NOT_FOUND", "Applied Date": today},
-            {"Status": "FAILED", "Applied Date": today},
-            {"Status": "CLOSED", "Applied Date": today},
-            {"Status": "INELIGIBLE", "Applied Date": today},
-            {"Status": "APPLIED", "Applied Date": "2000-01-01"},
-        ]
+        statuses = (
+            "APPLIED",
+            "SUBMITTED",
+            "READY_FOR_REVIEW",
+            "FORM_NOT_FOUND",
+            "FAILED",
+            "CLOSED",
+            "INELIGIBLE",
+            "LOGIN_REQUIRED",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            history_path = f"{directory}/history.csv"
+            tracker_path = f"{directory}/tracker.csv"
+            with open(history_path, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=["Title", "Company", "URL", "Status", "Applied Date"],
+                )
+                writer.writeheader()
+                for index, status in enumerate(statuses):
+                    writer.writerow({
+                        "Title": f"Role {index}",
+                        "Company": "Example",
+                        "URL": f"https://www.linkedin.com/jobs/view/{1000 + index}/",
+                        "Status": status,
+                        "Applied Date": today,
+                    })
+                writer.writerow({
+                    "Title": "Old applied role",
+                    "Company": "Example",
+                    "URL": "https://www.linkedin.com/jobs/view/9999/",
+                    "Status": "APPLIED",
+                    "Applied Date": "2000-01-01",
+                })
+            with open(tracker_path, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=["Title", "Company", "Link", "Status", "Applied Date"],
+                )
+                writer.writeheader()
 
-        with patch.object(easy_apply, "_load_application_history", return_value=rows):
-            self.assertEqual(easy_apply.get_today_applied_count(), 1)
+            with (
+                patch.object(easy_apply, "APPLICATION_HISTORY_FILE", history_path),
+                patch.object(easy_apply, "TRACKER_FILE", tracker_path),
+            ):
+                self.assertEqual(easy_apply.get_today_applied_count(), 1)
 
 
 if __name__ == "__main__":
