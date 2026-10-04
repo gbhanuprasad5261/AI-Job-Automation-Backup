@@ -300,19 +300,107 @@ def _load_application_history():
         return []
 
 
+class DailyApplicationCountUnavailable(RuntimeError):
+    """Raised when both stores cannot provide a trustworthy daily count."""
+
+
+def _read_daily_limit_rows(file_path, source_name):
+    try:
+        with open(file_path, "r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+            columns = {
+                (name or "").strip().casefold(): name
+                for name in (reader.fieldnames or [])
+            }
+            fieldnames = reader.fieldnames or []
+            if (
+                not fieldnames
+                or any(not isinstance(name, str) or not name.strip() for name in fieldnames)
+                or len({name.strip().casefold() for name in fieldnames}) != len(fieldnames)
+            ):
+                raise DailyApplicationCountUnavailable(
+                    f"{source_name} has an invalid or duplicate CSV header."
+                )
+            status_columns = [
+                columns[name]
+                for name in ("status", "application status")
+                if name in columns
+            ]
+            date_column = columns.get("applied date")
+            url_columns = [
+                columns[name]
+                for name in ("url", "link")
+                if name in columns
+            ]
+            if not status_columns or not date_column or not url_columns:
+                raise DailyApplicationCountUnavailable(
+                    f"{source_name} is missing Status, Applied Date, or URL/Link columns."
+                )
+            rows = list(reader)
+            if any(
+                None in row or any(value is None for value in row.values())
+                for row in rows
+            ):
+                raise DailyApplicationCountUnavailable(
+                    f"{source_name} contains a malformed CSV row."
+                )
+            return rows, status_columns, date_column, url_columns
+    except DailyApplicationCountUnavailable:
+        raise
+    except (OSError, csv.Error, UnicodeError) as exc:
+        raise DailyApplicationCountUnavailable(
+            f"Could not read {source_name} ({exc})."
+        ) from exc
+
+
 def get_today_applied_count():
-    """Return the number of confirmed applications submitted today."""
+    """Count today's confirmed applications across tracker and history once."""
     today = datetime.now().strftime("%Y-%m-%d")
-    count = 0
+    confirmed_urls = set()
+    for file_path, source_name in (
+        (APPLICATION_HISTORY_FILE, "application history"),
+        (TRACKER_FILE, "application tracker"),
+    ):
+        rows, status_columns, date_column, url_columns = _read_daily_limit_rows(
+            file_path,
+            source_name,
+        )
+        for row in rows:
+            statuses = {
+                (row.get(column) or "").strip().upper()
+                for column in status_columns
+            }
+            # The persistence path requires submission confirmation and
+            # normalizes SUBMITTED to APPLIED before writing. A raw legacy
+            # SUBMITTED value alone is not sufficient confirmation.
+            if "APPLIED" not in statuses:
+                continue
+            applied_date = (row.get(date_column) or "").strip()
+            if not applied_date:
+                raise DailyApplicationCountUnavailable(
+                    f"A confirmed record in {source_name} has no Applied Date."
+                )
+            try:
+                datetime.strptime(applied_date, "%Y-%m-%d")
+            except ValueError as exc:
+                raise DailyApplicationCountUnavailable(
+                    f"{source_name} contains an invalid Applied Date."
+                ) from exc
+            if applied_date != today:
+                continue
 
-    for row in _load_application_history():
-        status = (row.get("Status") or "").strip().upper()
-        applied_date = (row.get("Applied Date") or "").strip()
+            job_url = _normalize_url(
+                convert_to_job_url(
+                    next((row.get(column) for column in url_columns if row.get(column)), "")
+                )
+            )
+            if not job_url:
+                raise DailyApplicationCountUnavailable(
+                    f"A confirmed today's record in {source_name} has no usable job URL."
+                )
+            confirmed_urls.add(job_url)
 
-        if status == "APPLIED" and applied_date == today:
-            count += 1
-
-    return count
+    return len(confirmed_urls)
 
 
 def _history_status_for_job(job):
@@ -1250,16 +1338,77 @@ def detect_linkedin_submission_confirmation(page):
 # Record Application Status
 # ---------------------------------------
 
+def _write_tracker_application_status(job, status):
+    if not os.path.exists(TRACKER_FILE):
+        print(f"Tracker file not found: {TRACKER_FILE}")
+        return False
+
+    with open(TRACKER_FILE, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if "Status" not in fieldnames:
+        fieldnames.append("Status")
+
+    title = _normalize_text(job.get("Title", ""))
+    company = _normalize_text(job.get("Company", ""))
+    job_url = _normalize_url(
+        convert_to_job_url(job.get("Link", "") or job.get("URL", ""))
+    )
+    updated = False
+
+    if job_url:
+        for row in rows:
+            row_url = _normalize_url(row.get("URL") or row.get("Link") or "")
+            if row_url == job_url:
+                row["Status"] = status
+                if "Application Status" in fieldnames:
+                    row["Application Status"] = status
+                if status == "APPLIED" and "Applied Date" in fieldnames:
+                    row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+                updated = True
+                break
+
+    if not updated:
+        row = _unique_title_company_match(rows, title, company, job_url)
+        if row:
+            row["Status"] = status
+            if "Application Status" in fieldnames:
+                row["Application Status"] = status
+            if status == "APPLIED" and "Applied Date" in fieldnames:
+                row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+            updated = True
+
+    if not updated:
+        new_row = {field: "" for field in fieldnames}
+        new_row["Title"] = job.get("Title", "")
+        new_row["Company"] = job.get("Company", "")
+        new_row["Location"] = job.get("Location", "")
+        new_row["Status"] = status
+        if "Application Status" in fieldnames:
+            new_row["Application Status"] = status
+        job_link = job.get("URL", "") or job.get("Link", "")
+        for link_field in ("URL", "Link"):
+            if link_field in fieldnames:
+                new_row[link_field] = job_link
+        if status == "APPLIED" and "Applied Date" in fieldnames:
+            new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
+        rows.append(new_row)
+
+    with open(TRACKER_FILE, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Application tracker updated: {status}")
+    return True
+
+
 def record_application_status(job, status, submission_confirmed=False):
     """
-    Update the tracker for the job after a confirmed application result.
-
-    Matching order:
-      1. Exact LinkedIn job URL
-      2. Unique normalized Title + Company when URLs do not conflict
-
-    A confirmed APPLIED result is also written to the general application
-    history so future runs skip the job even if tracker rows are regenerated.
+    Persist an application result to the tracker and, for confirmed APPLIED,
+    independently to history. Either sink is useful for later daily counting.
     """
     if not EXECUTION_POLICY.allows_persistence():
         print("DRY_RUN: application tracker/history write skipped.")
@@ -1273,106 +1422,33 @@ def record_application_status(job, status, submission_confirmed=False):
         status = "APPLIED"
 
     try:
-        if not os.path.exists(TRACKER_FILE):
-            print(f"Tracker file not found: {TRACKER_FILE}")
-            tracker_updated = False
-        else:
-            with open(
-                TRACKER_FILE,
-                "r",
-                encoding="utf-8",
-                newline=""
-            ) as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames or []
-                rows = list(reader)
+        tracker_updated = _write_tracker_application_status(job, status)
+    except Exception as exc:
+        print(f"Could not update application tracker: {exc}")
+        tracker_updated = False
 
-            if "Status" not in fieldnames:
-                fieldnames.append("Status")
+    if status != "APPLIED":
+        return tracker_updated
 
-            title = _normalize_text(job.get("Title", ""))
-            company = _normalize_text(job.get("Company", ""))
-            job_url = _normalize_url(
-                convert_to_job_url(job.get("Link", "") or job.get("URL", ""))
-            )
+    try:
+        history_updated = _record_application_history(
+            job,
+            "APPLIED",
+            submission_confirmed=True,
+        )
+    except Exception as exc:
+        print(f"Could not update application history: {exc}")
+        history_updated = False
 
-            updated = False
+    if not history_updated:
+        print("Warning: application history update failed.")
+    if not tracker_updated:
+        print("Warning: application tracker update failed.")
 
-            # Exact URL first.
-            if job_url:
-                for row in rows:
-                    row_url = _normalize_url(
-                        row.get("URL") or row.get("Link") or ""
-                    )
-                    if row_url == job_url:
-                        row["Status"] = status
-                        if "Application Status" in fieldnames:
-                            row["Application Status"] = status
-                        if status == "APPLIED" and "Applied Date" in fieldnames:
-                            row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
-                        updated = True
-                        break
-
-            # Fall back only when title/company resolves to one safe candidate.
-            if not updated:
-                row = _unique_title_company_match(rows, title, company, job_url)
-                if row:
-                    row["Status"] = status
-                    if "Application Status" in fieldnames:
-                        row["Application Status"] = status
-                    if status == "APPLIED" and "Applied Date" in fieldnames:
-                        row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
-                    updated = True
-
-            if not updated:
-                new_row = {field: "" for field in fieldnames}
-                new_row["Title"] = job.get("Title", "")
-                new_row["Company"] = job.get("Company", "")
-                new_row["Location"] = job.get("Location", "")
-                new_row["Status"] = status
-
-                if "Application Status" in fieldnames:
-                    new_row["Application Status"] = status
-
-                if "URL" in fieldnames:
-                    new_row["URL"] = job.get("URL", "") or job.get("Link", "")
-
-                if status == "APPLIED" and "Applied Date" in fieldnames:
-                    new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
-
-                rows.append(new_row)
-
-            with open(
-                TRACKER_FILE,
-                "w",
-                encoding="utf-8",
-                newline=""
-            ) as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=fieldnames
-                )
-                writer.writeheader()
-                writer.writerows(rows)
-
-            tracker_updated = True
-            print(f"Application tracker updated: {status}")
-
-        if status == "APPLIED":
-            history_updated = _record_application_history(
-                job,
-                "APPLIED",
-                submission_confirmed=True,
-            )
-            if not history_updated:
-                print("Warning: tracker updated but application history update failed.")
-                return False
-
-        return tracker_updated if status != "APPLIED" else (tracker_updated or history_updated)
-
-    except Exception as e:
-        print(f"Could not update application tracker: {e}")
-        return False
+    # These booleans describe persistence only. The confirmed submission is
+    # still countable by the active run even when both sinks fail; a later
+    # process cannot recover it unless at least one existing sink persisted it.
+    return tracker_updated or history_updated
 
 
 # ---------------------------------------
@@ -1589,7 +1665,10 @@ def open_easy_apply(job):
                 "APPLIED",
                 submission_confirmed=True,
             )
-            return False
+            # The live site has confirmed an existing submission, and the
+            # recorder dates this newly discovered confirmation today. Count
+            # it in this run so another job cannot consume the same daily slot.
+            return True
 
         # ---------------------------------------
         # Fresher eligibility gate
@@ -1692,13 +1771,13 @@ def open_easy_apply(job):
                     )
 
                     if result == "SUBMITTED":
-                        tracker_success = record_application_status(
+                        persistence_success = record_application_status(
                             job,
                             "APPLIED",
                             submission_confirmed=True,
                         )
-                        if tracker_success:
-                            print("Confirmed external submission: tracker marked APPLIED.")
+                        if persistence_success:
+                            print("Confirmed external submission was persisted.")
                             return True
                         print("External submission was confirmed, but application tracking failed.")
                         # Submission confirmation is the countable event. Do
@@ -1997,15 +2076,15 @@ def open_easy_apply(job):
             )
 
             if application_result == "SUBMITTED":
-                tracker_success = record_application_status(
+                persistence_success = record_application_status(
                     job,
                     "APPLIED",
                     submission_confirmed=True,
                 )
 
-                if tracker_success:
+                if persistence_success:
                     print(
-                        "\nConfirmed submission: tracker marked APPLIED."
+                        "\nConfirmed submission was persisted."
                     )
                     return True
 
@@ -2075,7 +2154,11 @@ def main():
             )
         return results
 
-    today_applied = get_today_applied_count()
+    try:
+        today_applied = get_today_applied_count()
+    except DailyApplicationCountUnavailable as exc:
+        print(f"Daily application count unavailable; stopping safely: {exc}")
+        return
     daily_limit = config.DAILY_APPLICATION_LIMIT
     daily_remaining = daily_limit - today_applied
 
