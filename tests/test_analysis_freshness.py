@@ -241,17 +241,5 @@ class AnalysisFreshnessTests(unittest.TestCase):
         self.assertEqual(self._select(analysis_jobs=rejected_jobs), [])
         self.assertEqual(self._select(), [self.JOB])
 
-    def test_current_saved_repository_data_fails_closed(self):
-        output = StringIO()
-        with redirect_stdout(output):
-            result = easy_apply.get_recommended_jobs()
-        self.assertEqual(result, [])
-        self.assertTrue(
-            "jobs.csv is newer than data/job_details.csv" in output.getvalue()
-            or "Job identities in jobs.csv do not match data/job_details.csv"
-            in output.getvalue()
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

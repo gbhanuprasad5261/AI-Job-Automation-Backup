@@ -132,25 +132,20 @@ class DescriptionQualityTests(unittest.TestCase):
         self.assertEqual(result["Data Status"], "OK")
         matcher.assert_called_once_with(description)
 
-    def test_current_tcs_description_remains_accepted(self):
-        with open("data/job_details.csv", encoding="utf-8", newline="") as file:
-            tcs_job = next(
-                row for row in csv.DictReader(file)
-                if "/jobs/view/4472304771" in row["Link"]
-            )
-
-        result, matcher = self._analyze(
-            tcs_job["Description"],
-            job_overrides={
-                "Title": tcs_job["Title"],
-                "Company": tcs_job["Company"],
-                "Location": tcs_job["Location"],
-                "Easy Apply": tcs_job["Easy Apply"],
-                "Link": tcs_job["Link"],
-            },
+    def test_tcs_description_fixture_remains_accepted(self):
+        description = (
+            "Hi Greetings From TCS!!! We have exciting opportunities with TCS for Java FSD "
+            "Professionals. If you have relevant experience in Java technologies and are "
+            "looking for a career move, please share your updated resume. Job Details "
+            "Virtual- Interview Location: Chennai/Bengaluru/Hyderabad/Mumbai/Indore/"
+            "Ahmedabad Experience Range: 5 - 10 Yrs MUST SKILLS: Java FSD Job Description "
+            "Required Technical Skill Set Java FSD with Angular. NOTE: Please only apply "
+            "if you are currently working and having 90 days of Notice period."
         )
+
+        result, matcher = self._analyze(description)
         self.assertEqual(result["Data Status"], "OK")
-        matcher.assert_called_once()
+        matcher.assert_called_once_with(description)
 
     def test_valid_long_description_preserves_match_and_experience_rules(self):
         description = ("Java backend engineer with Spring experience. " * 12) + "3 years of experience."
