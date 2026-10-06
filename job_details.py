@@ -10,6 +10,7 @@ from config import CHROME_CDP_URL
 INPUT_FILE = "jobs.csv"
 OUTPUT_FILE = "data/job_details.csv"
 DIAGNOSTICS_FILE = "data/job_details_diagnostics.json"
+SDUI_DESCRIPTION_WAIT_MS = 2000
 
 
 def extract_text(page, selectors):
@@ -305,6 +306,62 @@ def extract_location_from_header(page):
     return ""
 
 
+def _extract_sdui_description_content(locator):
+    """Read the existing paragraph/expandable-box structure without clicking it."""
+    text = ""
+    content_selector = "p"
+    ui_tail_excluded = False
+    winner_suffix = " > p"
+
+    paragraphs = locator.locator(content_selector)
+    if paragraphs.count() > 0:
+        paragraph = paragraphs.first
+        expandable_box = paragraph.locator(
+            '[data-testid="expandable-text-box"]'
+        )
+        if expandable_box.count() > 0:
+            extraction = expandable_box.first.evaluate("""element => {
+                const content = element.cloneNode(true);
+                const parent = element.parentNode;
+                if (!parent) {
+                    return {text: element.innerText.trim(), ui_tail_excluded: false};
+                }
+
+                parent.insertBefore(content, element.nextSibling);
+                try {
+                    const button = content.querySelector(
+                        '[data-testid="expandable-text-button"]'
+                    );
+
+                    if (button) {
+                        const tailNode = button.previousSibling;
+                        if (tailNode && tailNode.nodeType === Node.TEXT_NODE && tailNode.nodeValue) {
+                            tailNode.remove();
+                        }
+                        button.remove();
+                        return {
+                            text: content.innerText.trimEnd(),
+                            ui_tail_excluded: true
+                        };
+                    }
+
+                    return {text: content.innerText.trim(), ui_tail_excluded: false};
+                } finally {
+                    content.remove();
+                }
+            }""")
+            text = extraction["text"]
+            ui_tail_excluded = extraction["ui_tail_excluded"]
+            content_selector += ' > [data-testid="expandable-text-box"]'
+            winner_suffix += ' > [data-testid="expandable-text-box"]'
+            if ui_tail_excluded:
+                winner_suffix += " (before expandable-text-button tail)"
+        else:
+            text = paragraph.inner_text().strip()
+
+    return text, content_selector, ui_tail_excluded, winner_suffix
+
+
 def extract_description(page, diagnostics=None):
     description = ""
     winner = None
@@ -343,6 +400,8 @@ def extract_description(page, diagnostics=None):
     sdui_winner_suffix = " > p"
     compatibility_description = ""
     compatibility_winner = None
+    job_specific_sdui_present = False
+    job_specific_candidate_diagnostic = None
 
     for selector in selectors:
         match_count = 0
@@ -358,60 +417,23 @@ def extract_description(page, diagnostics=None):
                 locator = matches.first
                 if selector in sdui_selectors:
                     diagnostics["sdui_component_present"] = True
-                    # The observed SDUI component keeps the description in a paragraph.
-                    content_selector = "p"
-                    paragraphs = locator.locator(content_selector)
-                    if paragraphs.count() > 0:
-                        paragraph = paragraphs.first
-                        expandable_box = paragraph.locator(
-                            '[data-testid="expandable-text-box"]'
-                        )
-                        if expandable_box.count() > 0:
-                            extraction = expandable_box.first.evaluate("""element => {
-                                const content = element.cloneNode(true);
-                                const parent = element.parentNode;
-                                if (!parent) {
-                                    return {text: element.innerText.trim(), ui_tail_excluded: false};
-                                }
-
-                                parent.insertBefore(content, element.nextSibling);
-                                try {
-                                    const button = content.querySelector(
-                                        '[data-testid="expandable-text-button"]'
-                                    );
-
-                                    if (button) {
-                                        const tailNode = button.previousSibling;
-                                        if (tailNode && tailNode.nodeType === Node.TEXT_NODE && tailNode.nodeValue) {
-                                            tailNode.remove();
-                                        }
-                                        button.remove();
-                                        return {
-                                            text: content.innerText.trimEnd(),
-                                            ui_tail_excluded: true
-                                        };
-                                    }
-
-                                    return {text: content.innerText.trim(), ui_tail_excluded: false};
-                                } finally {
-                                    content.remove();
-                                }
-                            }""")
-                            text = extraction["text"]
-                            ui_tail_excluded = extraction["ui_tail_excluded"]
-                            content_selector += ' > [data-testid="expandable-text-box"]'
-                            sdui_winner_suffix += ' > [data-testid="expandable-text-box"]'
-                            if ui_tail_excluded:
-                                sdui_winner_suffix += " (before expandable-text-button tail)"
-                        else:
-                            text = paragraph.inner_text().strip()
+                    if selector == current_job_description_selector:
+                        job_specific_sdui_present = True
+                    (
+                        text,
+                        content_selector,
+                        ui_tail_excluded,
+                        candidate_winner_suffix,
+                    ) = _extract_sdui_description_content(locator)
                 else:
                     text = locator.inner_text().strip()
+                    candidate_winner_suffix = None
 
                 if text:
                     if selector in sdui_selectors and not sdui_description:
                         sdui_description = text
                         sdui_winner_selector = selector
+                        sdui_winner_suffix = candidate_winner_suffix
                     elif len(text) > len(compatibility_description):
                         compatibility_description = text
                         compatibility_winner = selector
@@ -431,6 +453,58 @@ def extract_description(page, diagnostics=None):
         if selector in sdui_selectors:
             candidate_diagnostic["ui_tail_excluded"] = ui_tail_excluded
         diagnostics["candidates"].append(candidate_diagnostic)
+        if selector == current_job_description_selector and match_count > 0:
+            job_specific_candidate_diagnostic = candidate_diagnostic
+
+    if job_specific_sdui_present:
+        if sdui_description:
+            diagnostics["sdui_wait_status"] = "available_immediately"
+        elif compatibility_description:
+            diagnostics["sdui_wait_status"] = "fallback_available_without_wait"
+        else:
+            try:
+                page.wait_for_function(
+                    """selector => {
+                        const root = document.querySelector(selector);
+                        const box = root && root.querySelector(
+                            'p [data-testid="expandable-text-box"]'
+                        );
+                        return Boolean(box && (
+                            (box.innerText || box.textContent || "").trim()
+                        ));
+                    }""",
+                    arg=current_job_description_selector,
+                    timeout=SDUI_DESCRIPTION_WAIT_MS,
+                )
+            except Exception:
+                diagnostics["sdui_wait_status"] = "wait_expired_empty"
+            else:
+                diagnostics["sdui_wait_status"] = "wait_expired_empty"
+                try:
+                    locator = page.locator(current_job_description_selector).first
+                    (
+                        text,
+                        content_selector,
+                        ui_tail_excluded,
+                        candidate_winner_suffix,
+                    ) = _extract_sdui_description_content(locator)
+                    if text:
+                        sdui_description = text
+                        sdui_winner_selector = current_job_description_selector
+                        sdui_winner_suffix = candidate_winner_suffix
+                        diagnostics["sdui_wait_status"] = "appeared_after_wait"
+                        if job_specific_candidate_diagnostic is not None:
+                            job_specific_candidate_diagnostic.update({
+                                "first_match_has_nonempty_text": True,
+                                "text_length": len(text),
+                                "text_preview": text[:150],
+                                "description_content_selector": content_selector,
+                                "ui_tail_excluded": ui_tail_excluded,
+                            })
+                    else:
+                        diagnostics["sdui_wait_status"] = "wait_completed_but_unusable"
+                except Exception:
+                    diagnostics["sdui_wait_status"] = "wait_completed_but_unusable"
 
     if sdui_description:
         description = sdui_description
