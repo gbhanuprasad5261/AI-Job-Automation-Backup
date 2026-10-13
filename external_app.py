@@ -8,7 +8,8 @@ only when AUTO_SUBMIT is enabled and a final submission can be verified.
 import os
 import re
 import time
-from urllib.parse import parse_qs, unquote, urlparse
+import unicodedata
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import config
 from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
@@ -77,6 +78,9 @@ def unwrap_linkedin_external_url(url: str) -> str:
     current = url
     for _ in range(3):
         parsed = urlparse(current)
+        hostname = (parsed.hostname or "").lower()
+        if not (hostname == "linkedin.com" or hostname.endswith(".linkedin.com")):
+            break
         query = parse_qs(parsed.query)
         candidates = query.get("url", []) + query.get("target", [])
         if not candidates:
@@ -112,50 +116,265 @@ def detect_ats(url: str, body: str = "") -> str:
     return "UNKNOWN"
 
 
-def find_external_apply_link(page: Page) -> str:
-    """Find an external application destination without guessing among unrelated links."""
-    # Prefer explicit hrefs attached to application controls.
-    selectors = [
-        "a[href]",
-        "button",
-        "[role='button']",
-        "[role='link']",
-    ]
-    for selector in selectors:
-        try:
-            elements = page.locator(selector)
-            for i in range(elements.count()):
-                element = elements.nth(i)
-                if not _visible(element):
-                    continue
-                text = (_attr(element, "aria-label") + " " + _attr(element, "title") + " " + (element.inner_text() or "")).lower()
-                href = _attr(element, "href")
-                if any(s in text for s in (
-                    "apply on company website",
-                    "apply on the company website",
-                    "apply externally",
-                )) and href:
-                    return unwrap_linkedin_external_url(href)
-        except Exception:
+def _parsed_http_url(url: str):
+    """Return a validated HTTP(S) URL parse result, or None."""
+    candidate = unwrap_linkedin_external_url((url or "").strip())
+    if not candidate or any(character.isspace() for character in candidate):
+        return None
+    try:
+        parsed = urlparse(candidate)
+        # Accessing port also rejects malformed ports.
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    return parsed
+
+
+def is_safe_external_application_url(url: str) -> bool:
+    """Accept only absolute HTTP(S) destinations without embedded credentials."""
+    return _parsed_http_url(url) is not None
+
+
+def _is_recognized_ats_destination(url: str) -> bool:
+    """Match existing ATS providers at hostname boundaries, not substrings."""
+    parsed = _parsed_http_url(url)
+    if parsed is None:
+        return False
+    hostname = parsed.hostname.lower().rstrip(".")
+    supported_hosts = (
+        "greenhouse.io",
+        "lever.co",
+        "myworkdayjobs.com",
+        "workday.com",
+        "ashbyhq.com",
+        "smartrecruiters.com",
+        "jobvite.com",
+        "cutshort.io",
+        "successfactors.eu",
+        "successfactors.com",
+    )
+    if any(hostname == host or hostname.endswith("." + host) for host in supported_hosts):
+        return True
+    if hostname == "forms.gle":
+        return True
+    return hostname == "docs.google.com" and parsed.path.lower().startswith("/forms")
+
+
+def is_safe_external_application_redirect(requested_url: str, final_url: str) -> bool:
+    """Validate a resolved URL without imposing a new provider allowlist.
+
+    Same-host redirects and cross-host redirects to providers already
+    recognized by detect_ats() are supported. Unknown cross-host redirects
+    fail closed for manual review.
+    """
+    requested = _parsed_http_url(requested_url)
+    final = _parsed_http_url(final_url)
+    if requested is None or final is None:
+        return False
+    if requested.scheme.lower() == "https" and final.scheme.lower() != "https":
+        return False
+    requested_port = requested.port or (443 if requested.scheme.lower() == "https" else 80)
+    final_port = final.port or (443 if final.scheme.lower() == "https" else 80)
+    if (
+        requested.hostname.lower() == final.hostname.lower()
+        and requested_port == final_port
+    ):
+        return True
+    return _is_recognized_ats_destination(final.geturl())
+
+
+def _association_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
+
+
+def _control_is_associated_with_job(
+    element, title: str, company: str, job_id: str
+) -> bool:
+    """Accept only a unique control in the nearest target identity region.
+
+    LinkedIn's observed job page places the target Apply control in a compact
+    title/company header and recommendations in a separate
+    ``JobDetailsSimilarJobsSlot_<job id>`` subtree. The description root is
+    intentionally not used as the application-control container.
+    """
+    normalized_title = _association_text(title)
+    normalized_company = _association_text(company)
+    if not normalized_title or not normalized_company or not job_id:
+        return False
+
+    try:
+        ancestors = element.evaluate(
+            """(el, identity) => {
+                const normalize = value => (value || '').normalize('NFKC')
+                    .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+                const appSignal = control => {
+                    const label = normalize([
+                        control.getAttribute('aria-label'), control.getAttribute('title'),
+                        control.innerText, control.value
+                    ].filter(Boolean).join(' '));
+                    const href = control.getAttribute('href') || '';
+                    return [
+                        'apply on company website',
+                        'apply on the company website',
+                        'apply externally'
+                    ].some(text => label.includes(text)) ||
+                        /greenhouse\\.io|lever\\.co|myworkdayjobs\\.com|workday\\.com|ashbyhq\\.com|smartrecruiters\\.com|jobvite\\.com|cutshort\\.io|successfactors\\.(eu|com)|docs\\.google\\.com\\/forms|forms\\.gle/i.test(href);
+                };
+                const visible = control => {
+                    const style = getComputedStyle(control);
+                    const rect = control.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' &&
+                        rect.width > 0 && rect.height > 0;
+                };
+                const similarSlotSelector = '[id^="JobDetailsSimilarJobsSlot_"]';
+                const targetSimilarSlot = document.getElementById(
+                    `JobDetailsSimilarJobsSlot_${identity.jobId}`
+                );
+                const ancestors = [];
+                let node = el;
+                for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+                    const controls = [
+                        ...(node.matches('a[href], button, [role=button], [role=link]') ? [node] : []),
+                        ...node.querySelectorAll('a[href], button, [role=button], [role=link]')
+                    ].filter(control => visible(control) && appSignal(control));
+                    const currentJobIds = [];
+                    const links = [
+                        ...(node.matches('a[href]') ? [node] : []),
+                        ...node.querySelectorAll('a[href]')
+                    ];
+                    for (const link of links) {
+                        try {
+                            const linkedJobId = new URL(link.href, location.href)
+                                .searchParams.get('currentJobId');
+                            if (linkedJobId) currentJobIds.push(linkedJobId);
+                        } catch (_) {}
+                    }
+                    ancestors.push({
+                        text: normalize(node.innerText || node.textContent),
+                        pageHasTargetSimilarJobSlot: !!targetSimilarSlot,
+                        isBroadContainer: node.tagName === 'MAIN' || node.tagName === 'BODY' ||
+                            node.getAttribute('data-testid') === 'lazy-column',
+                        insideSimilarJobSlot: !!node.closest(similarSlotSelector),
+                        containsSimilarJobSlot: node.matches(similarSlotSelector) ||
+                            !!node.querySelector(similarSlotSelector),
+                        hasOtherJobCards: currentJobIds.some(id => id !== identity.jobId),
+                        applicationControls: controls.map(control => control === el)
+                    });
+                }
+                return ancestors;
+            }""",
+            {"jobId": str(job_id)},
+        )
+    except Exception:
+        return False
+
+    if not isinstance(ancestors, list):
+        return False
+    if not ancestors or not any(
+        isinstance(ancestor, dict)
+        and ancestor.get("pageHasTargetSimilarJobSlot") is True
+        for ancestor in ancestors
+    ):
+        return False
+    for ancestor in ancestors:
+        if not isinstance(ancestor, dict):
+            return False
+        if ancestor.get("insideSimilarJobSlot"):
+            return False
+        if ancestor.get("isBroadContainer"):
+            # The observed target header appears before LinkedIn's broad
+            # lazy-column/page containers. Reaching one without identifying
+            # the target header means the relationship is ambiguous.
+            return False
+
+        text = _association_text(ancestor.get("text", ""))
+        if normalized_title not in text or normalized_company not in text:
             continue
 
-    # Inspect all hrefs for known ATS domains. This is safe because the domain
-    # itself identifies the application destination.
-    try:
-        links = page.locator("a[href]")
-        for i in range(links.count()):
-            link = links.nth(i)
-            href = unwrap_linkedin_external_url(_attr(link, "href"))
-            if any(domain in href.lower() for domain in (
-                "greenhouse.io", "lever.co", "myworkdayjobs.com",
-                "ashbyhq.com", "smartrecruiters.com", "jobvite.com",
-                "cutshort.io",
-            )):
-                return href
-    except Exception:
-        pass
+        # A broad ancestor that also contains recommendations cannot establish
+        # that this control belongs to the target job.
+        if ancestor.get("containsSimilarJobSlot") or ancestor.get("hasOtherJobCards"):
+            return False
+        controls = ancestor.get("applicationControls")
+        return (
+            isinstance(controls, list)
+            and len(controls) == 1
+            and controls[0] is True
+        )
+    return False
 
-    return ""
+
+def _job_id_from_url(url: str) -> str:
+    match = re.search(r"/jobs/view/(\d+)", url or "", re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def find_external_apply_link(page: Page, target_job=None) -> str:
+    """Find a validated destination attached to the selected LinkedIn job only."""
+    if not isinstance(target_job, dict):
+        return ""
+
+    target_url = target_job.get("Link") or target_job.get("URL") or ""
+    expected_id = _job_id_from_url(target_url)
+    current_id = _job_id_from_url(getattr(page, "url", ""))
+    if not expected_id or current_id != expected_id:
+        print("External application link skipped: selected job identity did not match the open LinkedIn page.")
+        return ""
+
+    title = str(target_job.get("Title") or "").strip()
+    company = str(target_job.get("Company") or "").strip()
+    if not title or not company:
+        print("External application link skipped: selected job title/company identity is incomplete.")
+        return ""
+
+    selectors = "a[href], button, [role='button'], [role='link']"
+    destinations = set()
+    associated_control_count = 0
+    unsafe_target_control = False
+    try:
+        controls = page.locator(selectors)
+        for i in range(controls.count()):
+            control = controls.nth(i)
+            if not _visible(control):
+                continue
+            label = " ".join((
+                _attr(control, "aria-label"),
+                _attr(control, "title"),
+                control.inner_text() or "",
+            )).lower()
+            href = _attr(control, "href")
+            if not href:
+                continue
+            is_explicit = any(text in label for text in (
+                "apply on company website",
+                "apply on the company website",
+                "apply externally",
+            ))
+            if not is_explicit and not _is_recognized_ats_destination(href):
+                continue
+            if not _control_is_associated_with_job(
+                control, title, company, expected_id
+            ):
+                continue
+            associated_control_count += 1
+            resolved_href = urljoin(getattr(page, "url", "") or "", href)
+            validated = _parsed_http_url(resolved_href)
+            if validated is None:
+                unsafe_target_control = True
+                continue
+            destinations.add(unwrap_linkedin_external_url(resolved_href))
+    except Exception:
+        return ""
+
+    if unsafe_target_control or associated_control_count != 1 or len(destinations) != 1:
+        if unsafe_target_control or len(destinations) > 1:
+            print("External application link skipped: target controls were unsafe or ambiguous.")
+        return ""
+    return next(iter(destinations))
 
 
 def check_external_eligibility(page: Page) -> str:
@@ -1715,6 +1934,10 @@ def _click_external_application_start(page: Page):
         print("DRY_RUN: external application start-control inspection/click skipped.")
         return page
 
+    if not config.AUTO_SUBMIT:
+        print("AUTO_SUBMIT disabled: external application start controls were not clicked; manual review required.")
+        return page
+
     if _looks_like_application_form(page):
         return page
 
@@ -1752,6 +1975,13 @@ def _click_external_application_start(page: Page):
             _attr(control, "value"),
         ])
         normalized = " ".join(label.lower().split())
+
+        source_url = page.url or ""
+        raw_href = _attr(control, "href")
+        requested_url = urljoin(source_url, raw_href) if raw_href else source_url
+        if raw_href and not is_safe_external_application_url(requested_url):
+            print(f"External start control skipped because its URL is unsafe: {normalized[:100]}")
+            continue
 
         if not any(
             term == normalized or (term != "apply" and term in normalized)
@@ -1802,6 +2032,10 @@ def _click_external_application_start(page: Page):
             timeout_ms=12000,
             baseline_pages=before_pages,
         )
+
+        if not is_safe_external_application_redirect(requested_url, active_page.url or ""):
+            print("External start control resolved to an unvalidated destination; stopping for manual review.")
+            return None
 
         if active_page is not page:
             try:
@@ -2544,10 +2778,22 @@ def prepare_external_application_page(
         print("No application submission was performed.")
         return "READY_FOR_REVIEW"
 
-    # On unknown company career pages, first follow an unambiguous Apply control
-    # to reach the actual application form. This is generic and not job-specific.
+    # In review mode, inspect the page but do not activate an external
+    # application-start control. Those controls can trigger remote state.
     if ats != "GOOGLE_FORMS":
+        if not config.AUTO_SUBMIT:
+            is_form = _looks_like_application_form(page)
+            page_kind = "application form" if is_form else "company/application landing page"
+            print(
+                "AUTO_SUBMIT disabled: external application fields were not modified "
+                "and the start control was not clicked "
+                f"on the detected {page_kind}; manual review required."
+            )
+            return "READY_FOR_REVIEW"
+
         page = _click_external_application_start(page)
+        if page is None:
+            return "READY_FOR_REVIEW"
         try:
             page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
