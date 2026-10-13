@@ -52,7 +52,15 @@ class FakeLocator:
 
 
 class ExternalFormStatusTests(unittest.TestCase):
-    def _prepare(self, *, recognized, required=0, ats="UNKNOWN", account_result=None):
+    def _prepare(
+        self,
+        *,
+        recognized,
+        required=0,
+        ats="UNKNOWN",
+        account_result=None,
+        auto_submit=False,
+    ):
         page = FakePage()
         patches = [
             patch.object(external_app, "detect_ats", return_value=ats),
@@ -70,15 +78,15 @@ class ExternalFormStatusTests(unittest.TestCase):
             patch.object(external_app, "_required_empty_count", return_value=required),
             patch.object(external_app, "_prepare_successfactors_account", return_value=account_result),
             patch.object(external_app, "UNKNOWN_QUESTIONS_POLICY", "SKIP"),
-            patch.object(config, "AUTO_SUBMIT", False),
+            patch.object(config, "AUTO_SUBMIT", auto_submit),
         ]
         with ExitStack() as stack, redirect_stdout(StringIO()):
             for mocked in patches:
                 stack.enter_context(mocked)
             return external_app.prepare_external_application_page(page)
 
-    def test_unrecognized_external_page_returns_form_not_found(self):
-        self.assertEqual(self._prepare(recognized=False), "FORM_NOT_FOUND")
+    def test_unrecognized_external_page_in_review_mode_returns_ready(self):
+        self.assertEqual(self._prepare(recognized=False), "READY_FOR_REVIEW")
 
     def test_recognized_form_with_required_fields_returns_ready_for_review(self):
         self.assertEqual(self._prepare(recognized=True, required=1), "READY_FOR_REVIEW")
@@ -92,6 +100,7 @@ class ExternalFormStatusTests(unittest.TestCase):
                 recognized=False,
                 ats="SUCCESSFACTORS",
                 account_result="LOGIN_REQUIRED",
+                auto_submit=True,
             ),
             "LOGIN_REQUIRED",
         )
@@ -139,6 +148,7 @@ class FormNotFoundPersistenceTests(unittest.TestCase):
             patch.object(easy_apply, "sync_playwright", return_value=manager),
             patch.object(easy_apply, "get_application_status", return_value="NOT APPLIED"),
             patch.object(easy_apply, "navigate_page", return_value=True),
+            patch.object(easy_apply, "is_safe_external_application_redirect", return_value=True),
             patch.object(easy_apply, "is_job_closed", return_value=False),
             patch.object(easy_apply, "is_current_job_already_applied", return_value=False),
             patch.object(easy_apply, "check_external_eligibility", return_value="UNKNOWN"),
