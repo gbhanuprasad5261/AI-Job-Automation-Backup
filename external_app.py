@@ -194,6 +194,12 @@ def _association_text(value: str) -> str:
 def _control_is_associated_with_job(
     element, title: str, company: str, job_id: str
 ) -> bool:
+    return _control_job_association_status(element, title, company, job_id) == "TARGET_ASSOCIATED"
+
+
+def _control_job_association_status(
+    element, title: str, company: str, job_id: str
+) -> str:
     """Accept only a unique control in the nearest target identity region.
 
     LinkedIn's observed job page places the target Apply control in a compact
@@ -204,7 +210,7 @@ def _control_is_associated_with_job(
     normalized_title = _association_text(title)
     normalized_company = _association_text(company)
     if not normalized_title or not normalized_company or not job_id:
-        return False
+        return "INSUFFICIENT_IDENTITY"
 
     try:
         ancestors = element.evaluate(
@@ -212,16 +218,23 @@ def _control_is_associated_with_job(
                 const normalize = value => (value || '').normalize('NFKC')
                     .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
                 const appSignal = control => {
-                    const label = normalize([
+                    const buttonText = normalize([
                         control.getAttribute('aria-label'), control.getAttribute('title'),
                         control.innerText, control.value
+                    ].filter(Boolean).join(' '));
+                    const label = normalize([
+                        buttonText, control.getAttribute('class')
                     ].filter(Boolean).join(' '));
                     const href = control.getAttribute('href') || '';
                     return [
                         'apply on company website',
                         'apply on the company website',
-                        'apply externally'
+                        'apply externally',
+                        'easy apply',
+                        'linkedin apply to',
                     ].some(text => label.includes(text)) ||
+                        ['apply', 'apply now'].includes(buttonText) ||
+                        label.includes('jobs-apply-button') ||
                         /greenhouse\\.io|lever\\.co|myworkdayjobs\\.com|workday\\.com|ashbyhq\\.com|smartrecruiters\\.com|jobvite\\.com|cutshort\\.io|successfactors\\.(eu|com)|docs\\.google\\.com\\/forms|forms\\.gle/i.test(href);
                 };
                 const visible = control => {
@@ -270,26 +283,26 @@ def _control_is_associated_with_job(
             {"jobId": str(job_id)},
         )
     except Exception:
-        return False
+        return "INSPECTION_ERROR"
 
     if not isinstance(ancestors, list):
-        return False
+        return "INSPECTION_ERROR"
     if not ancestors or not any(
         isinstance(ancestor, dict)
         and ancestor.get("pageHasTargetSimilarJobSlot") is True
         for ancestor in ancestors
     ):
-        return False
+        return "INSUFFICIENT_STRUCTURE"
     for ancestor in ancestors:
         if not isinstance(ancestor, dict):
-            return False
+            return "INSPECTION_ERROR"
         if ancestor.get("insideSimilarJobSlot"):
-            return False
+            return "SIMILAR_JOB"
         if ancestor.get("isBroadContainer"):
             # The observed target header appears before LinkedIn's broad
             # lazy-column/page containers. Reaching one without identifying
             # the target header means the relationship is ambiguous.
-            return False
+            return "INSUFFICIENT_STRUCTURE"
 
         text = _association_text(ancestor.get("text", ""))
         if normalized_title not in text or normalized_company not in text:
@@ -298,14 +311,14 @@ def _control_is_associated_with_job(
         # A broad ancestor that also contains recommendations cannot establish
         # that this control belongs to the target job.
         if ancestor.get("containsSimilarJobSlot") or ancestor.get("hasOtherJobCards"):
-            return False
+            return "INSUFFICIENT_STRUCTURE"
         controls = ancestor.get("applicationControls")
-        return (
-            isinstance(controls, list)
-            and len(controls) == 1
-            and controls[0] is True
-        )
-    return False
+        if not isinstance(controls, list):
+            return "INSPECTION_ERROR"
+        if len(controls) != 1:
+            return "DUPLICATE_CONTROLS"
+        return "TARGET_ASSOCIATED" if controls[0] is True else "INSUFFICIENT_STRUCTURE"
+    return "IDENTITY_REGION_NOT_FOUND"
 
 
 def _job_id_from_url(url: str) -> str:
@@ -313,28 +326,39 @@ def _job_id_from_url(url: str) -> str:
     return match.group(1) if match else ""
 
 
-def find_external_apply_link(page: Page, target_job=None) -> str:
-    """Find a validated destination attached to the selected LinkedIn job only."""
+def inspect_external_apply_link(page: Page, target_job=None) -> dict:
+    """Return structured, read-only evidence for a target-specific external route."""
+    result = {
+        "status": "NO_CANDIDATE",
+        "reason": "No target-specific external application control was found.",
+        "candidate_count": 0,
+        "target_candidate_count": 0,
+        "similar_job_candidate_count": 0,
+        "ambiguous_candidate_count": 0,
+        "duplicate_candidate_count": 0,
+        "invalid_candidate_count": 0,
+        "validated_href": "",
+        "candidates": [],
+    }
     if not isinstance(target_job, dict):
-        return ""
+        result.update(status="IDENTITY_MISMATCH", reason="Selected job identity is missing.")
+        return result
 
     target_url = target_job.get("Link") or target_job.get("URL") or ""
     expected_id = _job_id_from_url(target_url)
     current_id = _job_id_from_url(getattr(page, "url", ""))
     if not expected_id or current_id != expected_id:
-        print("External application link skipped: selected job identity did not match the open LinkedIn page.")
-        return ""
+        result.update(status="IDENTITY_MISMATCH", reason="Selected job ID does not match the open LinkedIn page.")
+        return result
 
     title = str(target_job.get("Title") or "").strip()
     company = str(target_job.get("Company") or "").strip()
     if not title or not company:
-        print("External application link skipped: selected job title/company identity is incomplete.")
-        return ""
+        result.update(status="IDENTITY_MISMATCH", reason="Selected job title or company is missing.")
+        return result
 
     selectors = "a[href], button, [role='button'], [role='link']"
     destinations = set()
-    associated_control_count = 0
-    unsafe_target_control = False
     try:
         controls = page.locator(selectors)
         for i in range(controls.count()):
@@ -354,27 +378,69 @@ def find_external_apply_link(page: Page, target_job=None) -> str:
                 "apply on the company website",
                 "apply externally",
             ))
-            if not is_explicit and not _is_recognized_ats_destination(href):
+            is_plain_apply = label.strip() in {"apply", "apply now"}
+            recognized_ats = _is_recognized_ats_destination(href)
+            if not is_explicit and not recognized_ats and not is_plain_apply:
                 continue
-            if not _control_is_associated_with_job(
+            if is_plain_apply and not is_explicit and not recognized_ats:
+                parsed_candidate = _parsed_http_url(urljoin(getattr(page, "url", "") or "", href))
+                if parsed_candidate is not None and (
+                    parsed_candidate.hostname.lower() == "linkedin.com"
+                    or parsed_candidate.hostname.lower().endswith(".linkedin.com")
+                ):
+                    continue
+            result["candidate_count"] += 1
+            association = _control_job_association_status(
                 control, title, company, expected_id
-            ):
+            )
+            evidence = {
+                "label": label[:180],
+                "href": href[:500],
+                "association": association,
+            }
+            result["candidates"].append(evidence)
+            if association == "SIMILAR_JOB":
+                result["similar_job_candidate_count"] += 1
                 continue
-            associated_control_count += 1
+            if association == "DUPLICATE_CONTROLS":
+                result["target_candidate_count"] += 1
+                result["duplicate_candidate_count"] += 1
+                continue
+            if association != "TARGET_ASSOCIATED":
+                result["ambiguous_candidate_count"] += 1
+                continue
+            result["target_candidate_count"] += 1
             resolved_href = urljoin(getattr(page, "url", "") or "", href)
             validated = _parsed_http_url(resolved_href)
             if validated is None:
-                unsafe_target_control = True
+                result["invalid_candidate_count"] += 1
                 continue
             destinations.add(unwrap_linkedin_external_url(resolved_href))
     except Exception:
-        return ""
+        result.update(status="INSPECTION_ERROR", reason="The page controls could not be inspected safely.")
+        return result
 
-    if unsafe_target_control or associated_control_count != 1 or len(destinations) != 1:
-        if unsafe_target_control or len(destinations) > 1:
-            print("External application link skipped: target controls were unsafe or ambiguous.")
-        return ""
-    return next(iter(destinations))
+    if result["invalid_candidate_count"]:
+        result.update(status="INVALID_URL", reason="A target-associated external control has an invalid URL.")
+    elif result["duplicate_candidate_count"] or result["target_candidate_count"] > 1 or len(destinations) > 1:
+        result.update(status="DUPLICATE", reason="Multiple target-associated external controls were found.")
+    elif result["ambiguous_candidate_count"]:
+        result.update(status="AMBIGUOUS", reason="At least one external control could not be uniquely associated with the target job.")
+    elif result["target_candidate_count"] == 1 and len(destinations) == 1:
+        result.update(
+            status="VALIDATED",
+            reason="One target-associated external control has a valid HTTP(S) URL.",
+            validated_href=next(iter(destinations)),
+        )
+    elif result["similar_job_candidate_count"]:
+        result["reason"] = "Only similar-job or non-target external controls were found; they were rejected."
+    return result
+
+
+def find_external_apply_link(page: Page, target_job=None) -> str:
+    """Compatibility wrapper returning only a validated target destination."""
+    result = inspect_external_apply_link(page, target_job)
+    return result["validated_href"] if result["status"] == "VALIDATED" else ""
 
 
 def check_external_eligibility(page: Page) -> str:

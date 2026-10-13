@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime
@@ -10,6 +11,8 @@ from execution_policy import EXECUTION_POLICY
 from application_form import get_application_container, inspect_and_prepare_form
 from external_app import (
     find_external_apply_link,
+    inspect_external_apply_link,
+    _control_job_association_status,
     is_safe_external_application_url,
     is_safe_external_application_redirect,
     check_external_eligibility,
@@ -45,6 +48,39 @@ ALLOWED_LOCATION_KEYWORDS = (
 )
 
 ALLOW_EXTERNAL_APPLICATIONS = True
+
+
+def _atomic_write_csv(file_path, fieldnames, rows):
+    """Write CSV rows beside the destination, then atomically replace it."""
+    directory = os.path.dirname(file_path) or "."
+    prefix = f".{os.path.basename(file_path)}."
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=directory,
+            prefix=prefix,
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, file_path)
+        temp_path = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 EASY_APPLY_MODAL_SELECTORS = (
     ".jobs-easy-apply-modal",
@@ -501,15 +537,7 @@ def _write_application_history(rows, fields):
         return False
 
     try:
-        with open(
-            APPLICATION_HISTORY_FILE,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(rows)
+        _atomic_write_csv(APPLICATION_HISTORY_FILE, fields, rows)
         return True
     except Exception as exc:
         print(f"Could not update application history: {exc}")
@@ -967,6 +995,245 @@ def is_job_closed(body_text):
     return False
 
 
+def _target_job_is_closed(page, target_job, expected_id):
+    """Detect an unavailable message only inside the verified target job card."""
+    target_url = str((target_job or {}).get("Link") or (target_job or {}).get("URL") or "")
+    target_match = re.search(r"/jobs/view/(\d+)", target_url, re.IGNORECASE)
+    current_match = re.search(r"/jobs/view/(\d+)", str(getattr(page, "url", "")), re.IGNORECASE)
+    if (
+        not expected_id
+        or not target_match
+        or not current_match
+        or target_match.group(1) != expected_id
+        or current_match.group(1) != expected_id
+    ):
+        return False
+
+    title = _normalize_text(str((target_job or {}).get("Title") or ""))
+    company = _normalize_text(str((target_job or {}).get("Company") or ""))
+    if not title or not company:
+        return False
+
+    try:
+        cards = page.locator(
+            ".jobs-details__main-content .job-details-jobs-unified-top-card"
+        )
+        if cards.count() != 1:
+            return False
+        card = cards.nth(0)
+        if not card.is_visible():
+            return False
+
+        titles = card.locator("h1.job-details-jobs-unified-top-card__job-title")
+        companies = card.locator(".job-details-jobs-unified-top-card__company-name")
+        if titles.count() != 1 or companies.count() != 1:
+            return False
+        title_node = titles.nth(0)
+        company_node = companies.nth(0)
+        if not title_node.is_visible() or not company_node.is_visible():
+            return False
+        if (
+            title not in _normalize_text(title_node.inner_text())
+            or company not in _normalize_text(company_node.inner_text())
+        ):
+            return False
+        return is_job_closed(card.inner_text() or "")
+    except Exception:
+        return False
+
+
+def inspect_easy_apply_control(page, target_job) -> dict:
+    """Return structured evidence for one target-associated Easy Apply control."""
+    target_url = str((target_job or {}).get("Link") or (target_job or {}).get("URL") or "")
+    expected_id_match = re.search(r"/jobs/view/(\d+)", target_url, re.IGNORECASE)
+    current_id_match = re.search(r"/jobs/view/(\d+)", getattr(page, "url", ""), re.IGNORECASE)
+    result = {
+        "status": "NONE",
+        "reason": "No target-specific Easy Apply control was found.",
+        "candidate_count": 0,
+        "target_candidate_count": 0,
+        "similar_job_candidate_count": 0,
+        "ambiguous_candidate_count": 0,
+        "duplicate_candidate_count": 0,
+        "control_evidence": [],
+        "control": None,
+    }
+    if not expected_id_match or not current_id_match or expected_id_match.group(1) != current_id_match.group(1):
+        result.update(status="IDENTITY_MISMATCH", reason="Selected job ID does not match the open LinkedIn page.")
+        return result
+
+    title = str((target_job or {}).get("Title") or "").strip()
+    company = str((target_job or {}).get("Company") or "").strip()
+    if not title or not company:
+        result.update(status="IDENTITY_MISMATCH", reason="Selected job title or company is missing.")
+        return result
+
+    def is_easy_apply(element):
+        try:
+            label = " ".join((
+                element.inner_text() or "",
+                element.get_attribute("aria-label") or "",
+                element.get_attribute("title") or "",
+                element.get_attribute("href") or "",
+                element.get_attribute("class") or "",
+            )).casefold()
+        except Exception:
+            return False
+        return any(signal in label for signal in (
+            "easy apply", "linkedin apply to", "opensduiapplyflow=true", "jobs-apply-button",
+        ))
+
+    try:
+        controls = page.locator("button, a, [role='button'], [role='link']")
+        for index in range(controls.count()):
+            control = controls.nth(index)
+            try:
+                if not control.is_visible() or not is_easy_apply(control):
+                    continue
+                result["candidate_count"] += 1
+                association = _control_job_association_status(
+                    control, title, company, expected_id_match.group(1)
+                )
+                evidence = {
+                    "association": association,
+                    "tag": control.evaluate("el => el.tagName.toLowerCase()"),
+                    "text": (control.inner_text() or "").strip()[:160],
+                    "aria_label": control.get_attribute("aria-label") or "",
+                    "href": control.get_attribute("href") or "",
+                }
+                result["control_evidence"].append(evidence)
+                if association == "SIMILAR_JOB":
+                    result["similar_job_candidate_count"] += 1
+                elif association == "DUPLICATE_CONTROLS":
+                    result["duplicate_candidate_count"] += 1
+                elif association == "TARGET_ASSOCIATED":
+                    result["target_candidate_count"] += 1
+                    result["control"] = control
+                else:
+                    result["ambiguous_candidate_count"] += 1
+            except Exception:
+                result["ambiguous_candidate_count"] += 1
+    except Exception as exc:
+        result.update(status="INSPECTION_ERROR", reason=f"Could not inspect page controls: {type(exc).__name__}.")
+        result["control"] = None
+        return result
+
+    if result["duplicate_candidate_count"] or result["target_candidate_count"] > 1:
+        result.update(status="DUPLICATE", reason="Multiple target-associated Easy Apply controls were found.", control=None)
+    elif result["ambiguous_candidate_count"]:
+        result.update(status="AMBIGUOUS", reason="An Easy Apply candidate could not be associated uniquely with the target job.", control=None)
+    elif result["target_candidate_count"] == 1:
+        result.update(status="VALIDATED", reason="One target-associated Easy Apply control was found.")
+    elif result["similar_job_candidate_count"]:
+        result["reason"] = "Only similar-job Easy Apply controls were found; they were rejected."
+    return result
+
+
+def inspect_application_route(page, target_job, *, navigation_succeeded=True, http_status=None) -> dict:
+    """Classify current route evidence without navigating or changing page state.
+
+    A detected control means only that a target-associated control was found;
+    it does not establish that the employer is accepting applications.
+    """
+    job = target_job if isinstance(target_job, dict) else {}
+    target_url = str(job.get("Link") or job.get("URL") or "")
+    target_match = re.search(r"/jobs/view/(\d+)", target_url, re.IGNORECASE)
+    expected_id = target_match.group(1) if target_match else ""
+    try:
+        observed_url = str(page.url or "")
+        title = str(page.title() or "")
+        body = str(page.locator("body").inner_text() or "")
+    except Exception as exc:
+        return {
+            "selected_job_id": expected_id or None,
+            "saved_easy_apply_hint": job.get("Easy Apply"),
+            "observed_page_url": str(getattr(page, "url", "") or ""),
+            "observed_page_title": "",
+            "inspection_outcome": "PAGE_READ_FAILED",
+            "classification": "INACCESSIBLE",
+            "reason": f"Page metadata or body could not be read ({type(exc).__name__}).",
+            "control_type": None,
+            "control_evidence": [],
+            "validated_external_href": None,
+        }
+
+    base = {
+        "selected_job_id": expected_id or None,
+        "saved_easy_apply_hint": job.get("Easy Apply"),
+        "observed_page_url": observed_url,
+        "observed_page_title": title,
+        "inspection_outcome": "PAGE_INSPECTED",
+        "classification": None,
+        "reason": "",
+        "control_type": None,
+        "control_evidence": [],
+        "validated_external_href": None,
+    }
+    current_match = re.search(r"/jobs/view/(\d+)", observed_url, re.IGNORECASE)
+    try:
+        status_error = http_status is not None and int(http_status) >= 400
+    except (TypeError, ValueError):
+        status_error = True
+    if not navigation_succeeded or status_error:
+        base.update(inspection_outcome="NAVIGATION_FAILED", classification="INACCESSIBLE", reason="The LinkedIn job page could not be loaded successfully.")
+        return base
+    if not current_match or not expected_id:
+        base.update(inspection_outcome="TARGET_ID_UNVERIFIED", classification="INACCESSIBLE", reason="The observed page URL does not establish the selected LinkedIn job.")
+        return base
+    if current_match.group(1) != expected_id:
+        base.update(inspection_outcome="JOB_ID_MISMATCH", classification="AMBIGUOUS", reason="The open LinkedIn job ID differs from the selected job ID.")
+        return base
+    if not title or not body.strip():
+        base.update(inspection_outcome="PAGE_CONTENT_UNAVAILABLE", classification="INACCESSIBLE", reason="The page title or visible body content is unavailable.")
+        return base
+    page_title = " ".join(title.casefold().split())
+    normalized_title = " ".join(str(job.get("Title") or "").casefold().split())
+    normalized_company = " ".join(str(job.get("Company") or "").casefold().split())
+    title_establishes_target = bool(
+        normalized_title and normalized_company
+        and normalized_title in page_title
+        and normalized_company in page_title
+    )
+    try:
+        password_count = page.locator('input[type="password"]').count()
+    except Exception:
+        password_count = 0
+    if (
+        any(token in page_title for token in ("sign in", "log in", "join linkedin"))
+        or re.search(r"/login(?:/|$)|/authwall", observed_url, re.IGNORECASE)
+        or password_count > 0
+    ):
+        base.update(inspection_outcome="AUTHENTICATION_OR_INTERSTITIAL", classification="INACCESSIBLE", reason="The page is an authentication or interstitial screen, not an inspectable job page.")
+        return base
+    if not title_establishes_target:
+        base.update(inspection_outcome="TARGET_PAGE_UNVERIFIED", classification="INACCESSIBLE", reason="The page title does not establish the selected job and company.")
+        return base
+
+    easy = inspect_easy_apply_control(page, job)
+    external = inspect_external_apply_link(page, job)
+    easy_valid = easy["status"] == "VALIDATED"
+    external_valid = external["status"] == "VALIDATED"
+    target_unavailable = _target_job_is_closed(page, job, expected_id)
+    inspection_failed = easy["status"] == "INSPECTION_ERROR" or external["status"] == "INSPECTION_ERROR"
+    problematic = easy["status"] in {"DUPLICATE", "AMBIGUOUS", "IDENTITY_MISMATCH"} or external["status"] in {"DUPLICATE", "AMBIGUOUS", "IDENTITY_MISMATCH", "INVALID_URL"}
+    any_target_route = easy_valid or external_valid
+    if inspection_failed:
+        base.update(inspection_outcome="CONTROL_INSPECTION_FAILED", classification="INACCESSIBLE", reason="The page could not be inspected reliably.")
+    elif (easy_valid and external_valid) or (target_unavailable and (any_target_route or problematic)) or problematic:
+        base.update(classification="AMBIGUOUS", reason="Route evidence conflicts, contains duplicates/invalid data, or cannot be associated uniquely with the target job.")
+    elif target_unavailable:
+        base.update(classification="EXPLICITLY_UNAVAILABLE", reason="The target page contains an explicit no-longer-accepting/unavailable message.")
+    elif easy_valid:
+        base.update(classification="LINKEDIN_EASY_APPLY_CONTROL_DETECTED", reason=easy["reason"], control_type="LINKEDIN_EASY_APPLY", control_evidence=easy["control_evidence"])
+    elif external_valid:
+        base.update(classification="EXTERNAL_APPLY_CONTROL_DETECTED_VALIDATED", reason=external["reason"], control_type="EXTERNAL_APPLY", control_evidence=external["candidates"], validated_external_href=external["validated_href"])
+    else:
+        base.update(classification="NO_TARGET_APPLICATION_CONTROL", reason="The target page was inspectable, but neither detector found a target-specific application control.")
+    base["easy_apply_inspection"] = {key: value for key, value in easy.items() if key != "control"}
+    base["external_apply_inspection"] = external
+    return base
+
+
 # ---------------------------------------
 # Find Easy Apply Button
 # ---------------------------------------
@@ -1398,10 +1665,7 @@ def _write_tracker_application_status(job, status):
             new_row["Applied Date"] = datetime.now().strftime("%Y-%m-%d")
         rows.append(new_row)
 
-    with open(TRACKER_FILE, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    _atomic_write_csv(TRACKER_FILE, fieldnames, rows)
 
     print(f"Application tracker updated: {status}")
     return True

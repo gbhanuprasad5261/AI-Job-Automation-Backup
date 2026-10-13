@@ -1,5 +1,9 @@
 import csv
+from dataclasses import dataclass
+from enum import Enum
+import os
 import re
+import tempfile
 from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright
@@ -21,6 +25,108 @@ except ImportError:
 
 SEARCH_KEYWORD = SEARCH_KEYWORDS[0]
 OUTPUT_FILE = "jobs.csv"
+
+JOB_CSV_FIELDS = (
+    "Title",
+    "Company",
+    "Location",
+    "Easy Apply",
+    "Actively Reviewing",
+    "Link",
+)
+
+
+class CollectionStatus(str, Enum):
+    COMPLETE = "COMPLETE"
+    COMPLETE_EMPTY = "COMPLETE_EMPTY"
+    INCOMPLETE = "INCOMPLETE"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class CollectionOutcome:
+    status: CollectionStatus
+    jobs: tuple
+    issues: tuple = ()
+    bounded_by_limit: bool = False
+
+
+@dataclass(frozen=True)
+class JobLinkResult:
+    links: tuple
+    errors: tuple = ()
+    bounded_by_limit: bool = False
+
+
+def _collection_outcome(jobs, issues=(), fatal=False, bounded_by_limit=False):
+    """Classify only outcomes supported by observed collection evidence."""
+    if fatal:
+        status = CollectionStatus.FAILED
+    elif issues:
+        status = CollectionStatus.INCOMPLETE
+    else:
+        # Current search pages expose no verified completion or empty-result
+        # signal. A clean navigation and parser pass therefore remains unknown.
+        status = CollectionStatus.UNKNOWN
+
+    return CollectionOutcome(
+        status=status,
+        jobs=tuple(jobs),
+        issues=tuple(issues),
+        bounded_by_limit=bounded_by_limit,
+    )
+
+
+def _record_issue(issues, message):
+    if issues is not None:
+        issues.append(message)
+
+
+def _write_jobs_csv_atomically(jobs, output_file):
+    output_file = os.path.abspath(output_file)
+    output_dir = os.path.dirname(output_file)
+    output_name = os.path.basename(output_file)
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=output_dir,
+            prefix=f".{output_name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = file.name
+            writer = csv.DictWriter(file, fieldnames=JOB_CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(jobs)
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary_path, output_file)
+        temporary_path = None
+        return True
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def publish_collection(outcome, output_file=OUTPUT_FILE):
+    """Atomically publish only explicitly verified complete outcomes."""
+    if outcome.status not in {
+        CollectionStatus.COMPLETE,
+        CollectionStatus.COMPLETE_EMPTY,
+    }:
+        return False
+
+    _write_jobs_csv_atomically(outcome.jobs, output_file)
+    return True
 
 
 # =======================================
@@ -99,7 +205,7 @@ def build_job_url(job_id):
 # Extract Company
 # =======================================
 
-def extract_company(page):
+def extract_company(page, issues=None):
 
     selectors = [
 
@@ -135,8 +241,8 @@ def extract_company(page):
             if value:
                 return value
 
-        except Exception:
-
+        except Exception as exc:
+            _record_issue(issues, f"Company parser failed for {selector!r}: {exc}")
             continue
 
     return ""
@@ -146,7 +252,7 @@ def extract_company(page):
 # Extract Location
 # =======================================
 
-def extract_location(page, body=""):
+def extract_location(page, body="", issues=None):
 
     # ---------------------------------------
     # First try known LinkedIn selectors
@@ -204,8 +310,8 @@ def extract_location(page, body=""):
                 if first_part:
                     return first_part
 
-        except Exception:
-
+        except Exception as exc:
+            _record_issue(issues, f"Location parser failed for {selector!r}: {exc}")
             continue
 
     # ---------------------------------------
@@ -251,8 +357,8 @@ def extract_location(page, body=""):
 
                         return possible_location
 
-        except Exception:
-
+        except Exception as exc:
+            _record_issue(issues, f"Location body parser failed: {exc}")
             pass
 
     return ""
@@ -262,7 +368,7 @@ def extract_location(page, body=""):
 # Extract Job Title
 # =======================================
 
-def extract_job_title(page):
+def extract_job_title(page, issues=None):
 
     # ---------------------------------------
     # Method 1: h1
@@ -302,8 +408,8 @@ def extract_job_title(page):
             if value:
                 return value
 
-        except Exception:
-
+        except Exception as exc:
+            _record_issue(issues, f"Job-title selector parser failed for {selector!r}: {exc}")
             continue
 
     # ---------------------------------------
@@ -365,8 +471,8 @@ def extract_job_title(page):
 
             return browser_title
 
-    except Exception:
-
+    except Exception as exc:
+        _record_issue(issues, f"Job-title page-title parser failed: {exc}")
         pass
 
     # ---------------------------------------
@@ -413,8 +519,8 @@ def extract_job_title(page):
 
                         return candidate
 
-    except Exception:
-
+    except Exception as exc:
+        _record_issue(issues, f"Job-title body parser failed: {exc}")
         pass
 
     return "Unknown Job"
@@ -424,7 +530,7 @@ def extract_job_title(page):
 # Detect LIVE Easy Apply
 # =======================================
 
-def detect_easy_apply(page):
+def detect_easy_apply(page, issues=None):
     """Detect a real, visible LinkedIn Easy Apply control.
 
     This intentionally does NOT treat ordinary "Apply" buttons or text in
@@ -461,7 +567,8 @@ def detect_easy_apply(page):
 
                 if "easy apply" in combined:
                     return True
-        except Exception:
+        except Exception as exc:
+            _record_issue(issues, f"Easy Apply parser failed for {selector!r}: {exc}")
             continue
 
     return False
@@ -532,6 +639,8 @@ def get_job_links(page, max_links=None):
 
     link_limit = max_links or MAX_JOBS
 
+    errors = []
+
     for selector in selectors:
 
         try:
@@ -563,6 +672,9 @@ def get_job_links(page, max_links=None):
                     )
 
                     if not job_id:
+                        errors.append(
+                            f"Result selector {selector!r} returned an unrecognized job URL."
+                        )
                         continue
 
                     if job_id in seen_ids:
@@ -583,17 +695,23 @@ def get_job_links(page, max_links=None):
                     )
 
                     if len(links) >= link_limit:
-                        return links
+                        return JobLinkResult(
+                            tuple(links),
+                            tuple(errors),
+                            bounded_by_limit=True,
+                        )
 
-                except Exception:
-
+                except Exception as exc:
+                    errors.append(
+                        f"Could not parse result {index} for selector {selector!r}: {exc}"
+                    )
                     continue
 
-        except Exception:
-
+        except Exception as exc:
+            errors.append(f"Could not inspect result selector {selector!r}: {exc}")
             continue
 
-    return links
+    return JobLinkResult(tuple(links), tuple(errors))
 
 
 # =======================================
@@ -605,7 +723,10 @@ def location_allowed(location):
     return bool(text) and any(target in text for target in TARGET_LOCATIONS)
 
 
-def search_jobs():
+def _collect_search_jobs():
+
+    issues = []
+    bounded_by_limit = False
 
     with sync_playwright() as p:
 
@@ -639,14 +760,14 @@ def search_jobs():
             print(
                 f"Error: {e}"
             )
-            return
+            return _collection_outcome([], issues, fatal=True)
 
         if not browser.contexts:
 
             print(
                 "No browser context found."
             )
-            return
+            return _collection_outcome([], issues, fatal=True)
 
         context = (
             browser.contexts[0]
@@ -800,6 +921,9 @@ def search_jobs():
                         f"Could not open search for "
                         f"'{keyword}' in '{location}': {e}"
                     )
+                    issues.append(
+                        f"Search navigation failed for {keyword!r} in {location!r}: {e}"
+                    )
                     continue
 
                 print()
@@ -839,6 +963,9 @@ def search_jobs():
                         print(
                             f"Could not reopen search: {e}"
                         )
+                        issues.append(
+                            f"Could not retry search after login for {keyword!r} in {location!r}: {e}"
+                        )
                         continue
 
                 # ---------------------------------------
@@ -867,7 +994,7 @@ def search_jobs():
                     "Finding job results..."
                 )
 
-                for _ in range(3):
+                for scroll_index in range(3):
 
                     try:
 
@@ -880,15 +1007,21 @@ def search_jobs():
                             1500
                         )
 
-                    except Exception:
-
+                    except Exception as e:
+                        issues.append(
+                            f"Scrolling failed on search {keyword!r} in {location!r} "
+                            f"(attempt {scroll_index + 1}): {e}"
+                        )
                         break
 
-                keyword_job_links = (
-                    get_job_links(
-                        page,
-                        max_links=per_search_limit
-                    )
+                link_result = get_job_links(
+                    page,
+                    max_links=per_search_limit
+                )
+                keyword_job_links = link_result.links
+                issues.extend(link_result.errors)
+                bounded_by_limit = (
+                    bounded_by_limit or link_result.bounded_by_limit
                 )
 
                 print()
@@ -932,6 +1065,7 @@ def search_jobs():
                     added += 1
 
                     if len(all_job_links) >= MAX_JOBS:
+                        bounded_by_limit = True
                         break
 
                 print(
@@ -943,6 +1077,7 @@ def search_jobs():
                 )
 
             if len(all_job_links) >= MAX_JOBS:
+                bounded_by_limit = True
                 break
 
         # ---------------------------------------
@@ -969,7 +1104,14 @@ def search_jobs():
             print(
                 "LinkedIn may have changed its page structure."
             )
-            return
+            outcome = _collection_outcome(
+                [],
+                issues,
+                bounded_by_limit=bounded_by_limit,
+            )
+            print(f"Collection outcome: {outcome.status.value}")
+            print("Existing jobs.csv was preserved.")
+            return outcome
 
         # ---------------------------------------
         # Process Jobs
@@ -1057,6 +1199,9 @@ def search_jobs():
                     print(
                         "Job ID not found."
                     )
+                    issues.append(
+                        f"Could not identify a job ID for candidate {job_link}."
+                    )
                     continue
 
                 normalized_link = (
@@ -1088,9 +1233,12 @@ def search_jobs():
                         ).inner_text()
                     )
 
-                except Exception:
+                except Exception as e:
 
                     body = ""
+                    issues.append(
+                        f"Could not read the job page body for {job_link}: {e}"
+                    )
 
                 # ---------------------------------------
                 # Closed Job
@@ -1113,9 +1261,14 @@ def search_jobs():
 
                 actual_title = (
                     extract_job_title(
-                        page
+                        page,
+                        issues=issues,
                     )
                 )
+                if actual_title == "Unknown Job":
+                    issues.append(
+                        f"Could not extract a title for candidate {job_link}."
+                    )
 
                 # ---------------------------------------
                 # Company
@@ -1123,7 +1276,8 @@ def search_jobs():
 
                 company = (
                     extract_company(
-                        page
+                        page,
+                        issues=issues,
                     )
                 )
 
@@ -1134,7 +1288,8 @@ def search_jobs():
                 extracted_location = (
                     extract_location(
                         page,
-                        body
+                        body,
+                        issues=issues,
                     )
                 )
 
@@ -1170,7 +1325,8 @@ def search_jobs():
 
                 easy_apply = (
                     detect_easy_apply(
-                        page
+                        page,
+                        issues=issues,
                     )
                 )
 
@@ -1274,6 +1430,9 @@ def search_jobs():
                 print(
                     f"Skipped job: {e}"
                 )
+                issues.append(
+                    f"Candidate-page processing failed for {job_link}: {e}"
+                )
                 # Keep the run alive if a job navigation closes the current tab.
                 try:
                     if browser.is_connected() and (page.is_closed() or not context.pages):
@@ -1281,34 +1440,12 @@ def search_jobs():
                 except Exception:
                     pass
 
-        # ---------------------------------------
-        # Save CSV
-        # ---------------------------------------
-
-        with open(
-            OUTPUT_FILE,
-            "w",
-            newline="",
-            encoding="utf-8"
-        ) as file:
-
-            writer = csv.DictWriter(
-                file,
-                fieldnames=[
-                    "Title",
-                    "Company",
-                    "Location",
-                    "Easy Apply",
-                    "Actively Reviewing",
-                    "Link"
-                ]
-            )
-
-            writer.writeheader()
-
-            writer.writerows(
-                jobs
-            )
+        outcome = _collection_outcome(
+            jobs,
+            issues,
+            bounded_by_limit=bounded_by_limit,
+        )
+        published = publish_collection(outcome, OUTPUT_FILE)
 
         # ---------------------------------------
         # Summary
@@ -1326,7 +1463,7 @@ def search_jobs():
         )
 
         print(
-            "JOB SEARCH COMPLETED"
+            f"JOB SEARCH OUTCOME: {outcome.status.value}"
         )
 
         print(
@@ -1344,8 +1481,8 @@ def search_jobs():
         )
 
         print(
-            f"Saved file          : "
-            f"{OUTPUT_FILE}"
+            f"Published           : "
+            f"{'Yes' if published else 'No; existing file preserved'}"
         )
 
         print(
@@ -1355,6 +1492,19 @@ def search_jobs():
         input(
             "\nPress ENTER to finish..."
         )
+
+        return outcome
+
+
+def search_jobs():
+    """Run collection and convert unexpected failures into FAILED outcomes."""
+    try:
+        return _collect_search_jobs()
+    except Exception as exc:
+        outcome = _collection_outcome([], [str(exc)], fatal=True)
+        print(f"Collection outcome: {outcome.status.value}: {exc}")
+        print("Existing jobs.csv was preserved.")
+        return outcome
 
 
 # =======================================

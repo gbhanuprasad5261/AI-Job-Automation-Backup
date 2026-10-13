@@ -102,7 +102,7 @@ class FakeControl(DomNode):
             for item in subtree:
                 if not isinstance(item, FakeControl) or not item.is_visible():
                     continue
-                value = f"{item.label} {item.href}".lower()
+                value = f"{item.label} {item.text} {item.href}".lower()
                 if any(term in value for term in (
                     "apply on company website",
                     "apply on the company website",
@@ -119,7 +119,7 @@ class FakeControl(DomNode):
                     "successfactors.com",
                     "docs.google.com/forms",
                     "forms.gle",
-                )):
+                )) or item.text.strip().lower() in {"apply", "apply now"}:
                     app_controls.append(item is self)
 
             records.append({
@@ -202,6 +202,11 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
         self.assertEqual(result, COGNIZANT_DESTINATION)
         self.assertTrue(page.locator_calls)
 
+        inspection = external_app.inspect_external_apply_link(page, COGNIZANT_JOB)
+        self.assertEqual(inspection["status"], "VALIDATED")
+        self.assertEqual(inspection["target_candidate_count"], 1)
+        self.assertEqual(inspection["validated_href"], COGNIZANT_DESTINATION)
+
     def test_similar_job_ats_link_is_rejected_inside_broad_target_ancestor(self):
         similar_job_link = FakeControl(
             "https://boards.greenhouse.io/other-company/jobs/1",
@@ -214,6 +219,9 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
         page.root.add(similar_slot)
         page.url = COGNIZANT_JOB["Link"]
 
+        inspection = external_app.inspect_external_apply_link(page, COGNIZANT_JOB)
+        self.assertEqual(inspection["status"], "NO_CANDIDATE")
+        self.assertEqual(inspection["similar_job_candidate_count"], 1)
         self.assertEqual(external_app.find_external_apply_link(page, COGNIZANT_JOB), "")
 
     def test_unrelated_ats_link_without_target_header_is_rejected(self):
@@ -242,6 +250,9 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
         page = FakePage([first, second], url=COGNIZANT_JOB["Link"])
         page.root.add(header, DomNode("div", "", "JobDetailsSimilarJobsSlot_4469471138"))
 
+        inspection = external_app.inspect_external_apply_link(page, COGNIZANT_JOB)
+        self.assertEqual(inspection["status"], "DUPLICATE")
+        self.assertEqual(inspection["target_candidate_count"], 2)
         self.assertEqual(external_app.find_external_apply_link(page, COGNIZANT_JOB), "")
 
     def test_similar_job_link_before_target_header_does_not_hide_target_link(self):
@@ -297,6 +308,10 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
 
         self.assertEqual(external_app.find_external_apply_link(page, TARGET_JOB), "")
         self.assertEqual(page.locator_calls, [])
+        self.assertEqual(
+            external_app.inspect_external_apply_link(page, TARGET_JOB)["status"],
+            "IDENTITY_MISMATCH",
+        )
 
     def test_unsafe_target_control_scheme_is_rejected(self):
         control = FakeControl("javascript:alert(1)")
@@ -306,7 +321,10 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
             DomNode("div", "", "JobDetailsSimilarJobsSlot_4469471138"),
         )
 
-        self.assertEqual(external_app.find_external_apply_link(page, TARGET_JOB), "")
+        inspection = external_app.inspect_external_apply_link(page, COGNIZANT_JOB)
+        self.assertEqual(inspection["status"], "INVALID_URL")
+        self.assertEqual(inspection["invalid_candidate_count"], 1)
+        self.assertEqual(external_app.find_external_apply_link(page, COGNIZANT_JOB), "")
 
     def test_known_supported_ats_destination_remains_supported(self):
         control = FakeControl(
@@ -323,6 +341,19 @@ class ExternalDestinationSafetyTests(unittest.TestCase):
             external_app.find_external_apply_link(page, TARGET_JOB),
             control.href,
         )
+
+    def test_target_specific_plain_apply_to_company_host_is_classified(self):
+        destination = "https://careers.example.test/custom-apply/123"
+        control = FakeControl(destination, label="", text="Apply")
+        page = FakePage([control], url=TARGET_JOB["Link"])
+        page.root.add(
+            DomNode("header", "Example Corp Backend Developer").add(control),
+            DomNode("div", "", "JobDetailsSimilarJobsSlot_1234567890"),
+        )
+
+        inspection = external_app.inspect_external_apply_link(page, TARGET_JOB)
+        self.assertEqual(inspection["status"], "VALIDATED")
+        self.assertEqual(inspection["validated_href"], destination)
 
     def test_url_validator_rejects_non_http_s_schemes_and_credentials(self):
         for url in (
