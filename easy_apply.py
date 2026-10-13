@@ -10,6 +10,8 @@ from execution_policy import EXECUTION_POLICY
 from application_form import get_application_container, inspect_and_prepare_form
 from external_app import (
     find_external_apply_link,
+    is_safe_external_application_url,
+    is_safe_external_application_redirect,
     check_external_eligibility,
     prepare_external_application_page,
 )
@@ -1727,9 +1729,14 @@ def open_easy_apply(job):
                 print()
                 print("Searching for external application link...")
 
-                external_link = find_external_apply_link(page)
+                external_link = find_external_apply_link(page, job)
 
                 if external_link:
+                    if not is_safe_external_application_url(external_link):
+                        print("External application URL is not a valid HTTP(S) destination; stopping for manual review.")
+                        record_application_status(job, "READY_FOR_REVIEW")
+                        return False
+
                     print()
                     print("=" * 70)
                     print("EXTERNAL APPLICATION FOUND")
@@ -1754,6 +1761,11 @@ def open_easy_apply(job):
                     ):
                         print()
                         print("Could not open the external application page.")
+                        return False
+
+                    if not is_safe_external_application_redirect(external_link, page.url or ""):
+                        print("External application redirected to an unvalidated destination; stopping for manual review.")
+                        record_application_status(job, "READY_FOR_REVIEW")
                         return False
 
                     print()
