@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import config
 import external_app
 from runtime_diagnostics import (
     element_diagnostic,
@@ -167,6 +168,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         diagnostics = []
 
         with (
+            patch.object(config, "AUTO_SUBMIT", True),
             patch.object(external_app, "write_diagnostic", side_effect=diagnostics.append),
             patch.object(external_app, "_looks_like_application_form", return_value=False),
             patch.object(external_app, "_text", return_value="Company careers"),
