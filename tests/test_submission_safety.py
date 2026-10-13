@@ -386,6 +386,7 @@ class OpenFormPersistenceTests(unittest.TestCase):
             patch.object(easy_apply, "get_application_status", return_value="NOT APPLIED"),
             patch.object(easy_apply, "convert_to_job_url", side_effect=lambda url: url),
             patch.object(easy_apply, "navigate_page", return_value=True),
+            patch.object(easy_apply, "is_safe_external_application_redirect", return_value=True),
             patch.object(easy_apply, "is_job_closed", return_value=False),
             patch.object(easy_apply, "is_current_job_already_applied", return_value=False),
             patch.object(easy_apply, "check_external_eligibility", return_value="UNKNOWN"),
