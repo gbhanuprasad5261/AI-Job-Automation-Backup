@@ -7,14 +7,17 @@ import external_app
 
 
 class FakeControl:
-    def __init__(self, label):
+    def __init__(self, label, href=None):
         self.label = label
+        self.href = href
         self.click = MagicMock()
 
     def is_visible(self):
         return True
 
     def get_attribute(self, name):
+        if name == "href":
+            return self.href
         return None
 
     def inner_text(self):
@@ -82,16 +85,17 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
         page = FakePage([submit])
 
         with (
+            patch.object(config, "AUTO_SUBMIT", False),
             patch.object(external_app, "detect_ats", return_value="UNKNOWN"),
             patch.object(external_app, "_text", return_value="Company careers"),
             patch.object(external_app, "_external_page_has_error", return_value=False),
             patch.object(external_app, "_wait_for_manual_consent", return_value=True),
-            patch.object(external_app, "_looks_like_application_form", return_value=False),
-            patch.object(external_app, "_all_application_pages", return_value=[page]),
+            patch.object(external_app, "_click_external_application_start") as start,
         ):
             result = external_app.prepare_external_application_page(page)
 
-        self.assertEqual(result, "FORM_NOT_FOUND")
+        self.assertEqual(result, "READY_FOR_REVIEW")
+        start.assert_not_called()
         submit.click.assert_not_called()
 
     def test_detector_missed_apply_now_is_not_clicked_before_gate(self):
@@ -99,6 +103,81 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
         page = FakePage([apply_now])
 
         with (
+            patch.object(config, "AUTO_SUBMIT", False),
+            patch.object(external_app, "detect_ats", return_value="UNKNOWN"),
+            patch.object(external_app, "_text", return_value="Company careers"),
+            patch.object(external_app, "_external_page_has_error", return_value=False),
+            patch.object(external_app, "_wait_for_manual_consent", return_value=True),
+            patch.object(external_app, "_click_external_application_start") as start,
+        ):
+            result = external_app.prepare_external_application_page(page)
+
+        self.assertEqual(result, "READY_FOR_REVIEW")
+        start.assert_not_called()
+        apply_now.click.assert_not_called()
+
+    def test_clearly_safe_apply_start_control_still_clicks(self):
+        apply = FakeControl("Apply")
+        page = FakePage([apply])
+
+        with ExitStack() as stack:
+            for patcher in self._start_patches(page):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(config, "AUTO_SUBMIT", True))
+            result = external_app._click_external_application_start(page)
+
+        self.assertIs(result, page)
+        apply.click.assert_called_once_with(timeout=5000)
+
+    def test_review_mode_start_helper_returns_before_control_lookup(self):
+        apply = FakeControl("Apply")
+        page = FakePage([apply])
+        page.locator = MagicMock(side_effect=AssertionError("control lookup must not run"))
+
+        with patch.object(config, "AUTO_SUBMIT", False):
+            result = external_app._click_external_application_start(page)
+
+        self.assertIs(result, page)
+        page.locator.assert_not_called()
+        apply.click.assert_not_called()
+
+    def test_auto_submit_true_still_rejects_unsafe_start_control_url(self):
+        apply = FakeControl("Apply", href="javascript:alert(1)")
+        page = FakePage([apply])
+
+        with ExitStack() as stack:
+            for patcher in self._start_patches(page):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(config, "AUTO_SUBMIT", True))
+            result = external_app._click_external_application_start(page)
+
+        self.assertIs(result, page)
+        apply.click.assert_not_called()
+
+    def test_start_control_redirect_to_unrelated_domain_fails_closed(self):
+        apply = FakeControl("Apply", href="https://careers.example.test/apply")
+        page = FakePage([apply])
+        apply.click.side_effect = lambda **_kwargs: setattr(
+            page,
+            "url",
+            "https://unrelated.example.net/login",
+        )
+
+        with ExitStack() as stack:
+            for patcher in self._start_patches(page):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(config, "AUTO_SUBMIT", True))
+            result = external_app._click_external_application_start(page)
+
+        self.assertIsNone(result)
+        apply.click.assert_called_once_with(timeout=5000)
+
+    def test_detector_missed_apply_now_is_rejected_before_gate_when_auto_submit_enabled(self):
+        apply_now = FakeControl("Apply now")
+        page = FakePage([apply_now])
+
+        with (
+            patch.object(config, "AUTO_SUBMIT", True),
             patch.object(external_app, "detect_ats", return_value="UNKNOWN"),
             patch.object(external_app, "_text", return_value="Company careers"),
             patch.object(external_app, "_external_page_has_error", return_value=False),
@@ -110,18 +189,6 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
 
         self.assertEqual(result, "FORM_NOT_FOUND")
         apply_now.click.assert_not_called()
-
-    def test_clearly_safe_apply_start_control_still_clicks(self):
-        apply = FakeControl("Apply")
-        page = FakePage([apply])
-
-        with ExitStack() as stack:
-            for patcher in self._start_patches(page):
-                stack.enter_context(patcher)
-            result = external_app._click_external_application_start(page)
-
-        self.assertIs(result, page)
-        apply.click.assert_called_once_with(timeout=5000)
 
     def test_apply_now_remains_a_final_submit_control_and_is_gated(self):
         apply_now = FakeControl("Apply now")
