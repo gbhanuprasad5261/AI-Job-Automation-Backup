@@ -21,12 +21,16 @@ JOB = {
 
 
 class FakeRequest:
-    def __init__(self, url, page):
+    def __init__(self, url, page, *, method="GET", resource_type="document",
+                 is_navigation=True, frame=None):
         self.url = url
-        self.frame = page.main_frame
+        self.method = method
+        self.resource_type = resource_type
+        self._is_navigation = is_navigation
+        self.frame = frame or page.main_frame
 
     def is_navigation_request(self):
-        return True
+        return self._is_navigation
 
 
 class FakeRoute:
@@ -34,12 +38,16 @@ class FakeRoute:
         self.request = request
         self.aborted = False
         self.continued = False
+        self.fulfilled = False
 
     def abort(self):
         self.aborted = True
 
     def continue_(self):
         self.continued = True
+
+    def fulfill(self, **_kwargs):
+        self.fulfilled = True
 
 
 class FakeResponse:
@@ -104,8 +112,8 @@ class FakeContext:
     def remove_listener(self, event, handler):
         self.events[event] = [item for item in self.events.get(event, []) if item != handler]
 
-    def dispatch(self, url, page):
-        request = FakeRequest(url, page)
+    def dispatch(self, url, page, **request_kwargs):
+        request = FakeRequest(url, page, **request_kwargs)
         route = FakeRoute(request)
         for _pattern, handler in list(self.handlers):
             handler(route)
@@ -367,7 +375,6 @@ class RouteAuditRunnerTests(unittest.TestCase):
         handler, _record_blocked = route_audit._install_test_navigation_guard(
             self.context,
             approved_url=approved_url,
-            preexisting_pages=set(),
             page_ref=page_ref,
             initial_navigation_pending=initial_navigation_pending,
             blocked=blocked,
@@ -399,7 +406,6 @@ class RouteAuditRunnerTests(unittest.TestCase):
         handler, _record_blocked = route_audit._install_test_navigation_guard(
             self.context,
             approved_url=approved_url,
-            preexisting_pages=set(),
             page_ref=page_ref,
             initial_navigation_pending=initial_navigation_pending,
             blocked=blocked,
@@ -476,7 +482,112 @@ class RouteAuditRunnerTests(unittest.TestCase):
             request.url == "https://careers.example.test/apply" and route.aborted
             for request, route in self.context.dispatched
         ))
+        self.assertTrue(self.context.pages[-1].close.called)
         inspect.assert_not_called()
+
+    def test_request_guard_rejects_non_get_methods(self):
+        page_ref = {"value": self.page}
+        blocked = []
+        handler, _record_blocked = route_audit._install_test_navigation_guard(
+            self.context,
+            approved_url="http://127.0.0.1:43127/approved",
+            page_ref=page_ref,
+            initial_navigation_pending={"value": True},
+            blocked=blocked,
+        )
+
+        for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+            with self.subTest(method=method):
+                route = FakeRoute(FakeRequest(
+                    "http://127.0.0.1:43127/approved", self.page, method=method,
+                ))
+                handler(route)
+                self.assertTrue(route.aborted)
+                self.assertFalse(route.continued)
+
+        self.assertEqual([item["source"] for item in blocked], ["request-method"] * 6)
+
+    def test_request_guard_allows_only_exact_origin_and_path(self):
+        for url in (
+            "http://127.0.0.2:43127/approved",
+            "http://127.0.0.1:43127/other",
+        ):
+            with self.subTest(url=url):
+                page_ref = {"value": self.page}
+                blocked = []
+                handler, _record_blocked = route_audit._install_test_navigation_guard(
+                    self.context,
+                    approved_url="http://127.0.0.1:43127/approved",
+                    page_ref=page_ref,
+                    initial_navigation_pending={"value": True},
+                    blocked=blocked,
+                )
+                route = FakeRoute(FakeRequest(url, self.page))
+                handler(route)
+                self.assertTrue(route.aborted)
+                self.assertFalse(route.continued)
+                self.assertEqual(blocked[0]["source"], "audit-page-navigation")
+
+    def test_request_guard_blocks_all_subresources(self):
+        page_ref = {"value": self.page}
+        blocked = []
+        handler, _record_blocked = route_audit._install_test_navigation_guard(
+            self.context,
+            approved_url="http://127.0.0.1:43127/approved",
+            page_ref=page_ref,
+            initial_navigation_pending={"value": True},
+            blocked=blocked,
+        )
+        subresource = FakeRoute(FakeRequest(
+            "http://127.0.0.1:43127/resource", self.page,
+            method="GET", resource_type="script", is_navigation=False,
+        ))
+        handler(subresource)
+        self.assertTrue(subresource.aborted)
+        self.assertFalse(subresource.continued)
+        self.assertEqual(blocked[0]["source"], "request-resource-type")
+
+    def test_request_guard_blocks_requests_from_preexisting_unowned_pages(self):
+        page_ref = {"value": self.page}
+        blocked = []
+        handler, _record_blocked = route_audit._install_test_navigation_guard(
+            self.context,
+            approved_url="http://127.0.0.1:43127/approved",
+            page_ref=page_ref,
+            initial_navigation_pending={"value": True},
+            blocked=blocked,
+        )
+        preexisting_page = FakePage(context=self.context)
+        route = FakeRoute(FakeRequest(
+            "http://127.0.0.1:43127/approved", preexisting_page,
+        ))
+        handler(route)
+        self.assertTrue(route.aborted)
+        self.assertFalse(route.continued)
+        self.assertEqual(blocked, [{
+            "url": "http://127.0.0.1:43127/approved",
+            "source": "unowned-page",
+        }])
+
+    def test_request_guard_fails_closed_when_policy_classification_raises(self):
+        page_ref = {"value": self.page}
+        blocked = []
+        handler, _record_blocked = route_audit._install_test_navigation_guard(
+            self.context,
+            approved_url="http://127.0.0.1:43127/approved",
+            page_ref=page_ref,
+            initial_navigation_pending={"value": True},
+            blocked=blocked,
+        )
+        request = FakeRequest("http://127.0.0.1:43127/approved", self.page)
+        request.method = type("BrokenMethod", (), {
+            "upper": lambda _self: (_ for _ in ()).throw(RuntimeError("method unavailable")),
+        })()
+        route = FakeRoute(request)
+        handler(route)
+        self.assertTrue(route.aborted)
+        self.assertFalse(route.continued)
+        self.assertEqual(blocked[0]["source"], "route-guard-error")
 
     def test_invalid_selected_url_fails_closed_without_browser(self):
         bad = {**JOB, "Link": "https://linkedin.com.evil.example/jobs/view/1234567890/"}
