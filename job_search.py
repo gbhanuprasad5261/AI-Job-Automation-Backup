@@ -4,7 +4,7 @@ from enum import Enum
 import os
 import re
 import tempfile
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -50,6 +50,26 @@ class CollectionOutcome:
     jobs: tuple
     issues: tuple = ()
     bounded_by_limit: bool = False
+    search_diagnostics: tuple = ()
+
+
+@dataclass(frozen=True)
+class CollectionEvidence:
+    """Explicit evidence supplied to the offline collection contract classifier."""
+
+    fatal_failure: bool
+    unresolved_error_count: int
+    requested_scope_verified: bool | None = None
+    expected_search_state_verified: bool | None = None
+    results_settled: bool | None = None
+    exhaustion_verified: bool | None = None
+    required_processing_succeeded: bool | None = None
+    filters_applied: bool | None = None
+    cap_reached: bool | None = None
+    cap_stopped_before_exhaustion: bool | None = None
+    candidate_count: int | None = None
+    processed_candidate_count: int | None = None
+    qualifying_job_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -57,9 +77,187 @@ class JobLinkResult:
     links: tuple
     errors: tuple = ()
     bounded_by_limit: bool = False
+    selector_error_count: int = 0
+    parser_error_count: int = 0
 
 
-def _collection_outcome(jobs, issues=(), fatal=False, bounded_by_limit=False):
+@dataclass(frozen=True)
+class SearchDiagnostic:
+    """Observed facts for one keyword/location search, not a completion claim."""
+
+    keyword: str
+    location: str
+    navigation_response_statuses: tuple = ()
+    final_url_origin: str = None
+    extracted_link_count: int = 0
+    selector_error_count: int = 0
+    parser_error_count: int = 0
+    navigation_failure_count: int = 0
+    scroll_attempts: int = 0
+    scroll_failures: int = 0
+    per_search_cap_reached: bool = False
+    global_cap_reached: bool = False
+    candidate_page_failure_count: int = 0
+    collection_outcome: CollectionStatus = None
+
+
+def _diagnostic_response_status(response):
+    """Read a response status when available without making it a requirement."""
+    try:
+        status = getattr(response, "status", None)
+    except Exception:
+        return None
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _diagnostic_page_url(page):
+    """Return only the final HTTP(S) origin to avoid recording URL secrets."""
+    try:
+        raw_url = str(getattr(page, "url", "") or "")
+        if raw_url == "about:blank":
+            return raw_url
+        parsed = urlsplit(raw_url)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+            return None
+        hostname = parsed.hostname
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return f"{parsed.scheme}://{netloc}"
+    except Exception:
+        return None
+
+
+def _freeze_search_diagnostics(records, outcome_status):
+    return tuple(
+        SearchDiagnostic(
+            **{
+                **record,
+                "navigation_response_statuses": tuple(
+                    record["navigation_response_statuses"]
+                ),
+            },
+            collection_outcome=outcome_status,
+        )
+        for record in records
+    )
+
+
+def classify_collection_evidence(evidence):
+    """Classify explicit evidence without inspecting pages or creating signals.
+
+    Missing, malformed, or contradictory evidence stays UNKNOWN. This helper is
+    deliberately separate from the production collector's status generation.
+    """
+    if not isinstance(evidence, CollectionEvidence):
+        return CollectionStatus.UNKNOWN
+
+    if evidence.fatal_failure is True:
+        return CollectionStatus.FAILED
+    if not isinstance(evidence.fatal_failure, bool):
+        return CollectionStatus.UNKNOWN
+
+    error_count = evidence.unresolved_error_count
+    if (
+        not isinstance(error_count, int)
+        or isinstance(error_count, bool)
+        or error_count < 0
+    ):
+        return CollectionStatus.UNKNOWN
+    if error_count > 0:
+        return CollectionStatus.INCOMPLETE
+
+    cap_reached = evidence.cap_reached
+    cap_stopped = evidence.cap_stopped_before_exhaustion
+    exhaustion_verified = evidence.exhaustion_verified
+
+    optional_booleans = (
+        evidence.requested_scope_verified,
+        evidence.expected_search_state_verified,
+        evidence.results_settled,
+        exhaustion_verified,
+        evidence.required_processing_succeeded,
+        evidence.filters_applied,
+        cap_reached,
+        cap_stopped,
+    )
+    if any(
+        value is not None and not isinstance(value, bool)
+        for value in optional_booleans
+    ):
+        return CollectionStatus.UNKNOWN
+
+    if cap_stopped is True:
+        if cap_reached is False or exhaustion_verified is True:
+            return CollectionStatus.UNKNOWN
+        return CollectionStatus.INCOMPLETE
+
+    counts = (
+        evidence.candidate_count,
+        evidence.processed_candidate_count,
+        evidence.qualifying_job_count,
+    )
+    if any(
+        value is not None
+        and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        )
+        for value in counts
+    ):
+        return CollectionStatus.UNKNOWN
+
+    candidate_count, processed_count, qualifying_count = counts
+    if (
+        candidate_count is not None
+        and processed_count is not None
+        and processed_count > candidate_count
+    ):
+        return CollectionStatus.UNKNOWN
+    if (
+        processed_count is not None
+        and qualifying_count is not None
+        and qualifying_count > processed_count
+    ):
+        return CollectionStatus.UNKNOWN
+    if (
+        candidate_count is not None
+        and processed_count is not None
+        and processed_count < candidate_count
+    ):
+        return CollectionStatus.INCOMPLETE
+
+    required_true = (
+        evidence.requested_scope_verified,
+        evidence.expected_search_state_verified,
+        evidence.results_settled,
+        evidence.exhaustion_verified,
+        evidence.required_processing_succeeded,
+        evidence.filters_applied,
+    )
+    if any(value is False for value in required_true):
+        return CollectionStatus.INCOMPLETE
+    if (
+        any(value is not True for value in required_true)
+        or cap_reached is None
+        or cap_stopped is not False
+        or candidate_count is None
+        or processed_count is None
+        or qualifying_count is None
+        or processed_count != candidate_count
+    ):
+        return CollectionStatus.UNKNOWN
+
+    if qualifying_count == 0:
+        return CollectionStatus.COMPLETE_EMPTY
+    return CollectionStatus.COMPLETE
+
+
+def _collection_outcome(jobs, issues=(), fatal=False, bounded_by_limit=False,
+                         search_diagnostics=()):
     """Classify only outcomes supported by observed collection evidence."""
     if fatal:
         status = CollectionStatus.FAILED
@@ -75,6 +273,7 @@ def _collection_outcome(jobs, issues=(), fatal=False, bounded_by_limit=False):
         jobs=tuple(jobs),
         issues=tuple(issues),
         bounded_by_limit=bounded_by_limit,
+        search_diagnostics=_freeze_search_diagnostics(search_diagnostics, status),
     )
 
 
@@ -640,6 +839,8 @@ def get_job_links(page, max_links=None):
     link_limit = max_links or MAX_JOBS
 
     errors = []
+    selector_error_count = 0
+    parser_error_count = 0
 
     for selector in selectors:
 
@@ -672,6 +873,7 @@ def get_job_links(page, max_links=None):
                     )
 
                     if not job_id:
+                        parser_error_count += 1
                         errors.append(
                             f"Result selector {selector!r} returned an unrecognized job URL."
                         )
@@ -699,19 +901,28 @@ def get_job_links(page, max_links=None):
                             tuple(links),
                             tuple(errors),
                             bounded_by_limit=True,
+                            selector_error_count=selector_error_count,
+                            parser_error_count=parser_error_count,
                         )
 
                 except Exception as exc:
+                    parser_error_count += 1
                     errors.append(
                         f"Could not parse result {index} for selector {selector!r}: {exc}"
                     )
                     continue
 
         except Exception as exc:
+            selector_error_count += 1
             errors.append(f"Could not inspect result selector {selector!r}: {exc}")
             continue
 
-    return JobLinkResult(tuple(links), tuple(errors))
+    return JobLinkResult(
+        tuple(links),
+        tuple(errors),
+        selector_error_count=selector_error_count,
+        parser_error_count=parser_error_count,
+    )
 
 
 # =======================================
@@ -807,6 +1018,8 @@ def _collect_search_jobs():
         all_job_links = []
         seen_job_ids = set()
         job_search_locations = {}
+        search_diagnostic_records = []
+        diagnostic_by_job_link = {}
 
         keywords = SEARCH_KEYWORDS or (
             SEARCH_KEYWORD,
@@ -865,6 +1078,22 @@ def _collect_search_jobs():
                     break
 
                 search_counter += 1
+                search_diagnostic = {
+                    "keyword": str(keyword),
+                    "location": str(location),
+                    "navigation_response_statuses": [],
+                    "final_url_origin": None,
+                    "extracted_link_count": 0,
+                    "selector_error_count": 0,
+                    "parser_error_count": 0,
+                    "navigation_failure_count": 0,
+                    "scroll_attempts": 0,
+                    "scroll_failures": 0,
+                    "per_search_cap_reached": False,
+                    "global_cap_reached": False,
+                    "candidate_page_failure_count": 0,
+                }
+                search_diagnostic_records.append(search_diagnostic)
 
                 print()
                 print("=" * 70)
@@ -904,17 +1133,23 @@ def _collect_search_jobs():
 
                 try:
 
-                    page.goto(
+                    response = page.goto(
                         search_url,
                         wait_until="domcontentloaded",
                         timeout=30000
                     )
+                    search_diagnostic["navigation_response_statuses"].append(
+                        _diagnostic_response_status(response)
+                    )
+                    search_diagnostic["final_url_origin"] = _diagnostic_page_url(page)
 
                     page.wait_for_timeout(
                         5000
                     )
 
                 except Exception as e:
+                    search_diagnostic["navigation_failure_count"] += 1
+                    search_diagnostic["final_url_origin"] = _diagnostic_page_url(page)
 
                     print()
                     print(
@@ -948,17 +1183,23 @@ def _collect_search_jobs():
 
                     try:
 
-                        page.goto(
+                        response = page.goto(
                             search_url,
                             wait_until="domcontentloaded",
                             timeout=30000
                         )
+                        search_diagnostic["navigation_response_statuses"].append(
+                            _diagnostic_response_status(response)
+                        )
+                        search_diagnostic["final_url_origin"] = _diagnostic_page_url(page)
 
                         page.wait_for_timeout(
                             4000
                         )
 
                     except Exception as e:
+                        search_diagnostic["navigation_failure_count"] += 1
+                        search_diagnostic["final_url_origin"] = _diagnostic_page_url(page)
 
                         print(
                             f"Could not reopen search: {e}"
@@ -995,6 +1236,7 @@ def _collect_search_jobs():
                 )
 
                 for scroll_index in range(3):
+                    search_diagnostic["scroll_attempts"] += 1
 
                     try:
 
@@ -1008,6 +1250,7 @@ def _collect_search_jobs():
                         )
 
                     except Exception as e:
+                        search_diagnostic["scroll_failures"] += 1
                         issues.append(
                             f"Scrolling failed on search {keyword!r} in {location!r} "
                             f"(attempt {scroll_index + 1}): {e}"
@@ -1019,6 +1262,16 @@ def _collect_search_jobs():
                     max_links=per_search_limit
                 )
                 keyword_job_links = link_result.links
+                search_diagnostic["extracted_link_count"] = len(keyword_job_links)
+                search_diagnostic["selector_error_count"] = (
+                    link_result.selector_error_count
+                )
+                search_diagnostic["parser_error_count"] = (
+                    link_result.parser_error_count
+                )
+                search_diagnostic["per_search_cap_reached"] = (
+                    link_result.bounded_by_limit
+                )
                 issues.extend(link_result.errors)
                 bounded_by_limit = (
                     bounded_by_limit or link_result.bounded_by_limit
@@ -1061,11 +1314,13 @@ def _collect_search_jobs():
                     # job. LinkedIn sometimes hides the location on the detail
                     # page, so this is used as a reliable fallback.
                     job_search_locations[normalized_job_url] = location
+                    diagnostic_by_job_link[normalized_job_url] = search_diagnostic
 
                     added += 1
 
                     if len(all_job_links) >= MAX_JOBS:
                         bounded_by_limit = True
+                        search_diagnostic["global_cap_reached"] = True
                         break
 
                 print(
@@ -1108,6 +1363,7 @@ def _collect_search_jobs():
                 [],
                 issues,
                 bounded_by_limit=bounded_by_limit,
+                search_diagnostics=search_diagnostic_records,
             )
             print(f"Collection outcome: {outcome.status.value}")
             print("Existing jobs.csv was preserved.")
@@ -1433,6 +1689,9 @@ def _collect_search_jobs():
                 issues.append(
                     f"Candidate-page processing failed for {job_link}: {e}"
                 )
+                source_diagnostic = diagnostic_by_job_link.get(job_link)
+                if source_diagnostic is not None:
+                    source_diagnostic["candidate_page_failure_count"] += 1
                 # Keep the run alive if a job navigation closes the current tab.
                 try:
                     if browser.is_connected() and (page.is_closed() or not context.pages):
@@ -1444,6 +1703,7 @@ def _collect_search_jobs():
             jobs,
             issues,
             bounded_by_limit=bounded_by_limit,
+            search_diagnostics=search_diagnostic_records,
         )
         published = publish_collection(outcome, OUTPUT_FILE)
 
