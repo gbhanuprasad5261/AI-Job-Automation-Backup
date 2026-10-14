@@ -131,11 +131,10 @@ def classify_scope_evidence(evidence):
 
     if evidence.fatal_failure is True:
         return CollectionStatus.FAILED
-    if not isinstance(evidence.fatal_failure, bool):
-        return CollectionStatus.UNKNOWN
-
     if _known_scope_incomplete(evidence):
         return CollectionStatus.INCOMPLETE
+    if not isinstance(evidence.fatal_failure, bool):
+        return CollectionStatus.UNKNOWN
 
     if not _valid_scope(evidence.scope):
         return CollectionStatus.UNKNOWN

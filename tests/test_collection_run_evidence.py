@@ -70,6 +70,36 @@ class ScopeClassificationTests(unittest.TestCase):
         )
         self.assertEqual(classify_scope_evidence(evidence), CollectionStatus.FAILED)
 
+    def test_malformed_fatal_flag_is_unknown_without_known_incompleteness(self):
+        for fatal_failure in (1, "true", None):
+            with self.subTest(fatal_failure=fatal_failure):
+                evidence = ScopeEvidence(
+                    **{**complete_scope().__dict__, "fatal_failure": fatal_failure}
+                )
+                self.assertEqual(classify_scope_evidence(evidence), CollectionStatus.UNKNOWN)
+
+    def test_malformed_fatal_flag_preserves_known_incomplete_precedence(self):
+        for fatal_failure in (1, "true", None):
+            for known_incomplete in (
+                {"unresolved_error_count": 1},
+                {"exhaustion_verified": False},
+            ):
+                with self.subTest(
+                    fatal_failure=fatal_failure,
+                    known_incomplete=known_incomplete,
+                ):
+                    evidence = ScopeEvidence(
+                        **{
+                            **complete_scope().__dict__,
+                            "fatal_failure": fatal_failure,
+                            **known_incomplete,
+                        }
+                    )
+                    self.assertEqual(
+                        classify_scope_evidence(evidence),
+                        CollectionStatus.INCOMPLETE,
+                    )
+
     def test_known_errors_and_unprocessed_candidates_are_incomplete(self):
         with_error = complete_scope()
         with_error = ScopeEvidence(**{**with_error.__dict__, "unresolved_error_count": 1})
