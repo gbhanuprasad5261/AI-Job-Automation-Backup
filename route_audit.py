@@ -73,8 +73,8 @@ def _create_isolated_browser_context(playwright):
     return browser, context
 
 
-def _install_navigation_guard(context, *, approved_url, preexisting_pages,
-                              page_ref, initial_navigation_pending, blocked,
+def _install_navigation_guard(context, *, approved_url, page_ref,
+                              initial_navigation_pending, blocked,
                               is_approved_destination):
     """Install the shared context request guard and return its callbacks.
 
@@ -85,65 +85,83 @@ def _install_navigation_guard(context, *, approved_url, preexisting_pages,
     def record_blocked(url, source):
         blocked.append({"url": str(url or ""), "source": source})
 
-    def constrain_context_requests(route):
+    def abort_blocked(route, url, source):
         try:
-            request = route.request
-            request_page = request.frame.page
-            is_navigation = request.is_navigation_request()
-
-            # Do not interfere with any page that existed before the audit.
-            if request_page in preexisting_pages:
-                route.continue_()
-                return
-
-            # new_page() may issue this local initialization request before
-            # the audit page has been assigned to page_ref.
-            if page_ref["value"] is None:
-                if is_navigation and request.url == "about:blank":
-                    route.continue_()
-                else:
-                    record_blocked(request.url, "unassigned-page")
-                    route.abort()
-                return
-
-            # Allow resources for the audit page, but only the one approved
-            # top-level document navigation.
-            if request_page is page_ref["value"]:
-                if not is_navigation:
-                    route.continue_()
-                elif (request.frame == request_page.main_frame
-                      and initial_navigation_pending["value"]
-                      and is_approved_destination(request.url, approved_url)):
-                    initial_navigation_pending["value"] = False
-                    route.continue_()
-                else:
-                    record_blocked(request.url, "audit-page-navigation")
-                    route.abort()
-                return
-
-            # Any newly created page, including a popup, is outside the
-            # approved target and all of its requests are blocked.
-            record_blocked(request.url, "unexpected-page")
+            record_blocked(url, source)
+        except Exception:
+            pass
+        try:
             route.abort()
         except Exception:
+            # A failed abort must never fall through to continue_(). A local
+            # response is the last available fail-closed resolution attempt.
             try:
-                record_blocked(route.request.url, "route-guard-error")
+                route.fulfill(status=403, body="Blocked by route-audit policy")
             except Exception:
-                record_blocked("", "route-guard-error")
-            route.abort()
+                pass
+
+    def constrain_context_requests(route):
+        request_url = ""
+        try:
+            request = route.request
+            request_url = request.url
+            request_page = request.frame.page
+            method = request.method.upper()
+            resource_type = request.resource_type
+            is_navigation = request.is_navigation_request()
+
+            # new_page() may issue this local initialization request before
+            # the audit page has been assigned to page_ref. No request is
+            # allowed until ownership and policy can be established.
+            if page_ref["value"] is None:
+                abort_blocked(route, request_url, "unassigned-page")
+                return
+
+            audit_page = page_ref["value"]
+            if request_page is not audit_page:
+                abort_blocked(route, request_url, "unowned-page")
+                return
+
+            # No subresource destination has been established as necessary or
+            # safe. Permit only one initial, exact-target main-frame GET
+            # document request; block every other method/resource/destination.
+            if method != "GET":
+                abort_blocked(route, request_url, "request-method")
+                return
+            if not is_navigation or resource_type != "document":
+                abort_blocked(route, request_url, "request-resource-type")
+                return
+            if request.frame != audit_page.main_frame:
+                abort_blocked(route, request_url, "non-main-frame-navigation")
+                return
+            if not initial_navigation_pending["value"]:
+                abort_blocked(route, request_url, "audit-page-navigation")
+                return
+            if not is_approved_destination(request_url, approved_url):
+                abort_blocked(route, request_url, "audit-page-navigation")
+                return
+
+            initial_navigation_pending["value"] = False
+            route.continue_()
+        except Exception:
+            try:
+                if not request_url:
+                    request_url = route.request.url
+            except Exception:
+                pass
+            abort_blocked(route, request_url, "route-guard-error")
 
     context.route(_CONTEXT_ROUTE_PATTERN, constrain_context_requests)
     return constrain_context_requests, record_blocked
 
 
 def _install_production_navigation_guard(context, *, approved_url,
-                                         preexisting_pages, page_ref,
+                                         page_ref,
                                          initial_navigation_pending, blocked):
     """Install the production guard with strict canonical LinkedIn matching."""
     return _install_navigation_guard(
         context,
         approved_url=approved_url,
-        preexisting_pages=preexisting_pages,
         page_ref=page_ref,
         initial_navigation_pending=initial_navigation_pending,
         blocked=blocked,
@@ -154,7 +172,7 @@ def _install_production_navigation_guard(context, *, approved_url,
 
 
 def _install_test_navigation_guard(context, *, approved_url,
-                                   preexisting_pages, page_ref,
+                                   page_ref,
                                    initial_navigation_pending, blocked):
     """Install a test-only guard for one exact local URL.
 
@@ -163,7 +181,6 @@ def _install_test_navigation_guard(context, *, approved_url,
     return _install_navigation_guard(
         context,
         approved_url=approved_url,
-        preexisting_pages=preexisting_pages,
         page_ref=page_ref,
         initial_navigation_pending=initial_navigation_pending,
         blocked=blocked,
@@ -244,7 +261,6 @@ def audit_recommended_jobs(recommendations=None):
         playwright_manager = sync_playwright()
         playwright = playwright_manager.start()
         browser, context = _create_isolated_browser_context(playwright)
-        preexisting_pages = set(context.pages)
         page_ref = {"value": None}
         approved_url = {"value": None}
         initial_navigation_pending = {"value": False}
@@ -254,7 +270,6 @@ def audit_recommended_jobs(recommendations=None):
         context_route_handler, record_blocked = _install_production_navigation_guard(
             context,
             approved_url=approved_url,
-            preexisting_pages=preexisting_pages,
             page_ref=page_ref,
             initial_navigation_pending=initial_navigation_pending,
             blocked=blocked,
@@ -263,9 +278,16 @@ def audit_recommended_jobs(recommendations=None):
         page_ref["value"] = page
 
         def reject_unexpected_page(new_page):
-            if new_page is page or new_page in preexisting_pages:
+            if new_page is page:
                 return
-            record_blocked(getattr(new_page, "url", ""), "unexpected-page-event")
+            try:
+                record_blocked(getattr(new_page, "url", ""), "unexpected-page-event")
+            except Exception:
+                pass
+            try:
+                new_page.close()
+            except Exception:
+                pass
 
         page_event_handler = reject_unexpected_page
         context.on("page", page_event_handler)
