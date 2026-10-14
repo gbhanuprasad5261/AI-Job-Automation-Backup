@@ -246,6 +246,20 @@ class CollectionRunAggregationTests(unittest.TestCase):
             CollectionStatus.FAILED,
         )
 
+    def test_malformed_run_fatal_flag_cannot_produce_complete(self):
+        scope = complete_scope()
+        malformed = complete_run(scope, fatal_failure=1)
+        malformed_with_error = complete_run(
+            scope,
+            fatal_failure=1,
+            unresolved_error_count=1,
+        )
+        self.assertEqual(classify_collection_run(malformed), CollectionStatus.UNKNOWN)
+        self.assertEqual(
+            classify_collection_run(malformed_with_error),
+            CollectionStatus.INCOMPLETE,
+        )
+
     def test_errors_and_known_incomplete_precede_unknown_evidence(self):
         complete = complete_scope()
         unknown = ScopeEvidence(scope=SearchScope("developer", "Bengaluru"))
