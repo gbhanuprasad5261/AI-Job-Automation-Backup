@@ -42,11 +42,27 @@ The offline multi-scope model applies these structural rules:
   candidate IDs within a scope, malformed dispositions, and contradictory
   candidate counts are UNKNOWN unless a higher-precedence known failure or
   incomplete condition is present.
+- Candidate IDs are unique within each scope's occurrence ledger. The same ID
+  may appear once in each of multiple scopes; each such record is a distinct
+  scope occurrence and must be accounted for in that scope. This classifier
+  does not compute a globally unique-job count or deduplicate combined output.
+  Any output-level deduplication must be an explicit downstream policy and
+  must not erase the per-scope evidence.
 - A discovered-candidate count larger than the disposition ledger is
   INCOMPLETE. A smaller count contradicts the supplied ledger and is UNKNOWN.
 - Every candidate must be explicitly QUALIFYING or FILTERED, and the scope
   must affirm that intended filters were applied. UNPROCESSED is INCOMPLETE;
   missing or unknown disposition evidence is UNKNOWN.
+
+`filters_applied` is a scope-level assertion: `True` asserts that the producer
+accounted for all intended filters for that scope; `False` establishes that
+filter work remains and is INCOMPLETE; missing or malformed evidence is
+UNKNOWN. The current model does not name individual filters, verify their
+execution, record which filter caused a candidate to be FILTERED, or represent
+separate contradictory filter observations. `FILTERED` records disposition
+only, not a filter reason. A per-filter or candidate-level audit ledger would
+require a separately defined filter vocabulary and policy; it is not implied
+by this model.
 
 An observed cap is not automatically incomplete if exhaustion was
 independently verified before the cap prevented any required work. If the cap

@@ -173,6 +173,14 @@ class ScopeClassificationTests(unittest.TestCase):
         self.assertEqual(classify_scope_evidence(unfiltered), CollectionStatus.INCOMPLETE)
         self.assertEqual(classify_scope_evidence(filtered_empty), CollectionStatus.COMPLETE_EMPTY)
 
+    def test_missing_or_malformed_filter_assertion_is_unknown(self):
+        for filter_evidence in (None, 1, "true"):
+            with self.subTest(filter_evidence=filter_evidence):
+                evidence = ScopeEvidence(
+                    **{**complete_scope().__dict__, "filters_applied": filter_evidence}
+                )
+                self.assertEqual(classify_scope_evidence(evidence), CollectionStatus.UNKNOWN)
+
     def test_cap_and_exhaustion_contradiction_is_unknown(self):
         evidence = ScopeEvidence(
             **{
@@ -206,6 +214,23 @@ class CollectionRunAggregationTests(unittest.TestCase):
         empty = complete_scope("developer", "Bengaluru", candidates=())
         self.assertEqual(
             classify_collection_run(complete_run(populated, empty)),
+            CollectionStatus.COMPLETE,
+        )
+
+    def test_same_candidate_id_is_accounted_per_scope_without_global_deduplication(self):
+        first = complete_scope("engineer", "remote", candidates=(
+            CandidateEvidence("shared-job", CandidateDisposition.QUALIFYING),
+        ))
+        second = complete_scope("developer", "Bengaluru", candidates=(
+            CandidateEvidence("shared-job", CandidateDisposition.QUALIFYING),
+        ))
+
+        self.assertEqual(classify_scope_evidence(first), CollectionStatus.COMPLETE)
+        self.assertEqual(classify_scope_evidence(second), CollectionStatus.COMPLETE)
+        self.assertEqual(first.discovered_candidate_count, 1)
+        self.assertEqual(second.discovered_candidate_count, 1)
+        self.assertEqual(
+            classify_collection_run(complete_run(first, second)),
             CollectionStatus.COMPLETE,
         )
 

@@ -1,7 +1,6 @@
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 from pathlib import Path
-import csv
 import os
 import re
 
@@ -280,7 +279,10 @@ def scrape_jobs(
     output_file=INPUT_OUTPUT_FILE,
 ):
     """
-    Connect to an existing Chrome session and scrape LinkedIn jobs.
+    Inspect an already-open LinkedIn Jobs page and return candidate rows.
+
+    This scraper cannot verify that results have settled or been exhausted,
+    so it does not publish its unverified candidates to ``output_file``.
 
     IMPORTANT:
     Chrome is connected ONLY when this function is called.
@@ -527,40 +529,18 @@ def scrape_jobs(
             pass
 
     # ========================================================
-    # SAVE CSV
-    # ========================================================
-
-    with open(
-        output_file,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-
-        writer = csv.writer(file)
-
-        writer.writerow([
-            "Title",
-            "Company",
-            "Location",
-            "Easy Apply",
-            "Link",
-        ])
-
-        writer.writerows(jobs)
-
-    # ========================================================
     # SUMMARY
     # ========================================================
 
     print()
     print("=" * 60)
-    print("JOB SCRAPING COMPLETED")
+    print("JOB PAGE SCAN FINISHED; COLLECTION COMPLETENESS UNKNOWN")
     print("=" * 60)
 
     print(f"Jobs collected : {len(jobs)}")
     print(f"Unique job IDs : {len(seen_job_ids)}")
-    print(f"Saved file     : {output_file}")
+    print("No CSV was written; output path was left unchanged:")
+    print(f"  {output_file}")
 
     print()
     print("Target locations:")
