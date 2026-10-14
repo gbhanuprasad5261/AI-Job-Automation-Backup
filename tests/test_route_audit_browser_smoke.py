@@ -61,7 +61,6 @@ class IsolatedRouteGuardBrowserSmokeTests(unittest.TestCase):
                     body = (
                         "<!doctype html><meta charset='utf-8'>"
                         "<title>local route guard test</title>"
-                        "<script>setTimeout(() => location.assign('/unapproved'), 50)</script>"
                     ).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -95,11 +94,9 @@ class IsolatedRouteGuardBrowserSmokeTests(unittest.TestCase):
             browser, context = _launch_test_browser_context(playwright)
             page_ref = {"value": None}
             initial_navigation_pending = {"value": True}
-            preexisting_pages = set(context.pages)
             guard_handler, _record_blocked = route_audit._install_test_navigation_guard(
                 context,
                 approved_url=approved_url,
-                preexisting_pages=preexisting_pages,
                 page_ref=page_ref,
                 initial_navigation_pending=initial_navigation_pending,
                 blocked=blocked,
@@ -109,6 +106,11 @@ class IsolatedRouteGuardBrowserSmokeTests(unittest.TestCase):
 
             response = page.goto(approved_url, wait_until="domcontentloaded", timeout=5000)
             self.assertEqual(response.status, 200)
+
+            try:
+                page.goto(f"{base_url}/unapproved", wait_until="domcontentloaded", timeout=5000)
+            except Exception:
+                pass
 
             for _ in range(60):
                 if blocked:
