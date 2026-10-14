@@ -48,15 +48,21 @@ class FakeMouse:
             raise RuntimeError("scroll failed")
 
 
+class FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+
 class FakePage:
     def __init__(self, links=(), fail_search=(), fail_jobs=(), scroll_fails=False,
-                 parser_error=False):
+                 parser_error=False, navigation_response_status=200):
         self.links = tuple(links)
         self.fail_search = set(fail_search)
         self.fail_jobs = set(fail_jobs)
         self.parser_error = parser_error
         self.mouse = FakeMouse(scroll_fails)
         self.url = "about:blank"
+        self.navigation_response_status = navigation_response_status
 
     def goto(self, url, **_kwargs):
         if "/jobs/search/" in url:
@@ -68,6 +74,9 @@ class FakePage:
                 if f"/jobs/view/{job_id}/" in url:
                     raise RuntimeError("candidate navigation failed")
         self.url = url
+        if "/jobs/search/" in url and self.navigation_response_status is not None:
+            return FakeResponse(self.navigation_response_status)
+        return None
 
     def wait_for_timeout(self, *_args):
         return None
@@ -168,6 +177,38 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
         self.assertEqual(len(outcome.jobs), 1)
         self.assertFalse(outcome.issues)
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.keyword, "backend")
+        self.assertEqual(diagnostic.location, "Bengaluru")
+        self.assertEqual(diagnostic.navigation_response_statuses, (200,))
+        self.assertEqual(diagnostic.extracted_link_count, 1)
+        self.assertEqual(diagnostic.scroll_attempts, 3)
+        self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.UNKNOWN)
+
+    def test_missing_navigation_response_data_is_recorded_as_unknown(self):
+        outcome = self.run_collector(
+            FakePage(navigation_response_status=None)
+        )
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.navigation_response_statuses, (None,))
+        self.assertEqual(diagnostic.navigation_failure_count, 0)
+        self.assertEqual(diagnostic.final_url_origin, "https://www.linkedin.com")
+
+    def test_final_url_diagnostic_records_only_origin(self):
+        page = FakePage()
+        original_goto = page.goto
+
+        def goto_with_sensitive_url(url, **kwargs):
+            response = original_goto(url, **kwargs)
+            page.url = "https://user:secret@www.linkedin.com/jobs/search/?token=secret#fragment"
+            return response
+
+        page.goto = goto_with_sensitive_url
+        outcome = self.run_collector(page)
+        self.assertEqual(
+            outcome.search_diagnostics[0].final_url_origin,
+            "https://www.linkedin.com",
+        )
 
     def test_browser_connection_failure_is_failed(self):
         outcome = self.run_collector(
@@ -189,6 +230,9 @@ class CollectionRunTests(unittest.TestCase):
         outcome = self.run_collector(FakePage(fail_search=("backend",)))
         self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
         self.assertTrue(any("Search navigation failed" in item for item in outcome.issues))
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.navigation_failure_count, 1)
+        self.assertEqual(diagnostic.navigation_response_statuses, ())
 
     def test_mixed_success_and_failed_search_does_not_publish_subset(self):
         outcome = self.run_collector(
@@ -202,21 +246,49 @@ class CollectionRunTests(unittest.TestCase):
         outcome = self.run_collector(FakePage(links=("101",), fail_jobs=("101",)))
         self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
         self.assertTrue(any("Candidate-page processing failed" in item for item in outcome.issues))
+        self.assertEqual(outcome.search_diagnostics[0].candidate_page_failure_count, 1)
 
     def test_scroll_failure_is_recorded(self):
         outcome = self.run_collector(FakePage(links=("101",), scroll_fails=True))
         self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
         self.assertTrue(any("Scrolling failed" in item for item in outcome.issues))
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.scroll_attempts, 1)
+        self.assertEqual(diagnostic.scroll_failures, 1)
 
     def test_result_parser_failure_is_recorded(self):
         outcome = self.run_collector(FakePage(parser_error=True))
         self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
         self.assertTrue(any("selector" in item for item in outcome.issues))
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.selector_error_count, 2)
+        self.assertEqual(diagnostic.parser_error_count, 0)
 
     def test_configured_global_cap_is_reported_as_bounded_unknown(self):
         outcome = self.run_collector(FakePage(links=("101", "102")), max_jobs=1)
         self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
         self.assertTrue(outcome.bounded_by_limit)
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertTrue(diagnostic.global_cap_reached)
+        self.assertFalse(diagnostic.per_search_cap_reached)
+        self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.UNKNOWN)
+
+    def test_per_search_cap_is_recorded_without_proving_completion(self):
+        outcome = self.run_collector(
+            FakePage(links=tuple(str(job_id) for job_id in range(1, 9))),
+            max_jobs=30,
+        )
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertTrue(diagnostic.per_search_cap_reached)
+        self.assertFalse(diagnostic.global_cap_reached)
+        self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
+
+    def test_empty_links_remain_unknown_and_are_observed_as_zero(self):
+        outcome = self.run_collector(FakePage())
+        self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
+        diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.extracted_link_count, 0)
+        self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.UNKNOWN)
 
     def test_duplicate_ids_are_deduplicated(self):
         page = FakePage(links=("101", "101"))
@@ -231,6 +303,16 @@ class CollectionRunTests(unittest.TestCase):
         result = job_search.get_job_links(page, max_links=5)
         self.assertEqual(result.links, ())
         self.assertTrue(result.errors)
+        self.assertEqual(result.selector_error_count, 2)
+        self.assertEqual(result.parser_error_count, 0)
+
+    def test_link_parser_counts_unrecognized_job_urls(self):
+        page = FakePage(links=("not-a-job-id",))
+        page.url = "https://www.linkedin.com/jobs/search/"
+        result = job_search.get_job_links(page, max_links=5)
+        self.assertTrue(result.errors)
+        self.assertEqual(result.selector_error_count, 0)
+        self.assertEqual(result.parser_error_count, 2)
 
     def test_per_search_cap_is_reported_as_bounded_sampling(self):
         page = FakePage(links=("1", "2", "3"))
@@ -263,6 +345,158 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
         self.assertFalse(outcome.jobs)
         self.assertFalse(outcome.issues)
+
+
+class CollectionEvidenceClassifierTests(unittest.TestCase):
+    def evidence(self, **overrides):
+        values = {
+            "fatal_failure": False,
+            "unresolved_error_count": 0,
+            "requested_scope_verified": True,
+            "expected_search_state_verified": True,
+            "results_settled": True,
+            "exhaustion_verified": True,
+            "required_processing_succeeded": True,
+            "filters_applied": True,
+            "cap_reached": False,
+            "cap_stopped_before_exhaustion": False,
+            "candidate_count": 2,
+            "processed_candidate_count": 2,
+            "qualifying_job_count": 1,
+        }
+        values.update(overrides)
+        return job_search.CollectionEvidence(**values)
+
+    def classify(self, **overrides):
+        return job_search.classify_collection_evidence(self.evidence(**overrides))
+
+    def test_fatal_failure_has_precedence(self):
+        self.assertEqual(
+            self.classify(fatal_failure=True, unresolved_error_count=3,
+                          requested_scope_verified=None),
+            job_search.CollectionStatus.FAILED,
+        )
+
+    def test_recorded_unresolved_errors_are_incomplete(self):
+        self.assertEqual(
+            self.classify(unresolved_error_count=1),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_missing_required_evidence_is_unknown(self):
+        self.assertEqual(
+            self.classify(requested_scope_verified=None),
+            job_search.CollectionStatus.UNKNOWN,
+        )
+
+    def test_unverified_search_identity_is_unknown(self):
+        self.assertEqual(
+            self.classify(expected_search_state_verified=None),
+            job_search.CollectionStatus.UNKNOWN,
+        )
+
+    def test_verified_wrong_search_state_is_incomplete(self):
+        self.assertEqual(
+            self.classify(expected_search_state_verified=False),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_unsettled_results_are_incomplete(self):
+        self.assertEqual(
+            self.classify(results_settled=False),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_unverified_exhaustion_is_unknown(self):
+        self.assertEqual(
+            self.classify(exhaustion_verified=None),
+            job_search.CollectionStatus.UNKNOWN,
+        )
+
+    def test_verified_nonexhaustion_is_incomplete(self):
+        self.assertEqual(
+            self.classify(exhaustion_verified=False),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_cap_stopping_before_exhaustion_is_incomplete(self):
+        self.assertEqual(
+            self.classify(
+                cap_reached=True,
+                cap_stopped_before_exhaustion=True,
+                exhaustion_verified=False,
+            ),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_complete_populated_collection(self):
+        self.assertEqual(
+            self.classify(),
+            job_search.CollectionStatus.COMPLETE,
+        )
+
+    def test_complete_empty_collection_after_filters(self):
+        self.assertEqual(
+            self.classify(
+                candidate_count=2,
+                processed_candidate_count=2,
+                qualifying_job_count=0,
+                filters_applied=True,
+            ),
+            job_search.CollectionStatus.COMPLETE_EMPTY,
+        )
+
+    def test_unprocessed_candidates_are_incomplete_even_with_jobs(self):
+        self.assertEqual(
+            self.classify(
+                candidate_count=2,
+                processed_candidate_count=1,
+                qualifying_job_count=1,
+                required_processing_succeeded=False,
+            ),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_filters_must_be_applied_before_classifying_empty(self):
+        self.assertEqual(
+            self.classify(
+                candidate_count=2,
+                processed_candidate_count=2,
+                qualifying_job_count=0,
+                filters_applied=False,
+            ),
+            job_search.CollectionStatus.INCOMPLETE,
+        )
+
+    def test_invalid_or_contradictory_evidence_is_unknown(self):
+        invalid_cases = (
+            {"unresolved_error_count": -1},
+            {"candidate_count": -1},
+            {"candidate_count": 1, "processed_candidate_count": 2},
+            {"processed_candidate_count": 1, "qualifying_job_count": 2},
+            {
+                "cap_reached": False,
+                "cap_stopped_before_exhaustion": True,
+                "exhaustion_verified": False,
+            },
+            {
+                "cap_reached": True,
+                "cap_stopped_before_exhaustion": True,
+                "exhaustion_verified": True,
+            },
+            {
+                "cap_reached": 1,
+                "cap_stopped_before_exhaustion": True,
+                "exhaustion_verified": False,
+            },
+            {"filters_applied": 1},
+        )
+        for case in invalid_cases:
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.classify(**case),
+                    job_search.CollectionStatus.UNKNOWN,
+                )
 
 
 class PublicationTests(unittest.TestCase):
@@ -298,6 +532,27 @@ class PublicationTests(unittest.TestCase):
                 outcome = job_search.CollectionOutcome(status, ())
                 self.assertFalse(job_search.publish_collection(outcome, self.output))
                 self.assertEqual(self.output.read_bytes(), self.original)
+
+    def test_only_complete_statuses_are_publishable(self):
+        outcomes = (
+            job_search.CollectionOutcome(
+                job_search.CollectionStatus.COMPLETE,
+                (self.sample_row,),
+            ),
+            job_search.CollectionOutcome(
+                job_search.CollectionStatus.COMPLETE_EMPTY,
+                (),
+            ),
+        )
+        for outcome in outcomes:
+            with self.subTest(status=outcome.status):
+                self.output.write_bytes(self.original)
+                self.assertTrue(job_search.publish_collection(outcome, self.output))
+                with self.output.open(newline="", encoding="utf-8") as file:
+                    self.assertEqual(
+                        tuple(csv.DictReader(file).fieldnames),
+                        job_search.JOB_CSV_FIELDS,
+                    )
 
     def test_serialization_failure_preserves_destination_and_cleans_temp(self):
         writer = mock.Mock()
