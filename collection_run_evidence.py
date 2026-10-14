@@ -261,6 +261,9 @@ def classify_collection_run(evidence):
         if set(evidence.requested_scopes) - valid_observed_scopes:
             return CollectionStatus.INCOMPLETE
 
+    if not isinstance(evidence.fatal_failure, bool):
+        return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
+
     if not _nonnegative_integer(evidence.unresolved_error_count):
         return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
     if not isinstance(evidence.scopes, tuple) or any(
