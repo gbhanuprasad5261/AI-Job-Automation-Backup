@@ -33,6 +33,21 @@ INCOMPLETE. If none is known incomplete but any scope is unclassifiable, the
 overall result is UNKNOWN. Only all-verified scopes can yield COMPLETE or
 COMPLETE_EMPTY.
 
+The offline multi-scope model applies these structural rules:
+
+- An empty requested-scope set is UNKNOWN; it is not vacuously complete.
+- A requested scope with no evidence record is INCOMPLETE because required
+  work is unaccounted for.
+- Duplicate requested scopes, duplicate or unexpected scope records, duplicate
+  candidate IDs within a scope, malformed dispositions, and contradictory
+  candidate counts are UNKNOWN unless a higher-precedence known failure or
+  incomplete condition is present.
+- A discovered-candidate count larger than the disposition ledger is
+  INCOMPLETE. A smaller count contradicts the supplied ledger and is UNKNOWN.
+- Every candidate must be explicitly QUALIFYING or FILTERED, and the scope
+  must affirm that intended filters were applied. UNPROCESSED is INCOMPLETE;
+  missing or unknown disposition evidence is UNKNOWN.
+
 An observed cap is not automatically incomplete if exhaustion was
 independently verified before the cap prevented any required work. If the cap
 may have truncated an unexhausted scope, classify INCOMPLETE. If cap timing or
@@ -40,21 +55,19 @@ exhaustion is unknown, classify UNKNOWN.
 
 ## Current model boundary
 
-`job_search.CollectionEvidence` represents one aggregate evidence record. It
-has aggregate counts and booleans, but no per-query/location scope records or
-per-candidate disposition ledger. Its classifier is a pure policy helper and
-is not called by the production collector. The production collector continues
-to produce UNKNOWN for clean runs and does not have evidence to prove search
-exhaustion. The offline screenshot/metadata validator always returns UNKNOWN.
+`job_search.CollectionEvidence` remains an aggregate single-record helper; it
+does not model per-query/location records or a candidate disposition ledger,
+and its classifier is not called by the production collector. The separate
+`collection_run_evidence.py` module models multi-scope evidence and candidate
+dispositions as an offline policy only. It does not establish that supplied
+assertions are true, inspect pages, or connect to production collection or
+publication. The production collector continues to produce UNKNOWN for clean
+runs because it has no evidence to prove search exhaustion. The offline
+screenshot/metadata validator always returns UNKNOWN.
 
-Consequently, this policy can be tested as a single-scope decision table using
-the current helper, but multi-scope aggregation and per-candidate completeness
-cannot safely be implemented against the current model. The smallest future
-model change is a separate offline `CollectionRunEvidence` containing required
-`ScopeEvidence` records, each with explicit verification fields, cap/exhaustion
-evidence, and candidate dispositions. Missing values must remain missing; a
-fixture label, displayed total, screenshot, nonzero link count, fixed wait, or
-absence of exceptions must never manufacture verification.
+Missing values must remain missing; a fixture label, displayed total,
+screenshot, nonzero link count, fixed wait, or absence of exceptions must never
+manufacture verification.
 
 No production collector, classifier, publisher, browser, CDP, network, or
 application workflow is connected by this specification.
