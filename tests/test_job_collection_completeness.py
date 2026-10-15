@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 import job_search
+from collection_run_evidence import CollectionStatus, classify_collection_run
+from dom_evidence_package import PackageValidation, PageEvidenceState
 
 
 class FakeAnchor:
@@ -137,7 +139,8 @@ def playwright_mock(page=None, connect_error=None, no_context=False):
 class CollectionRunTests(unittest.TestCase):
     def run_collector(self, page, keywords=("backend",), max_jobs=10,
                       connect_error=None, no_context=False,
-                      easy_apply_filter=False, extracted_location="Bengaluru"):
+                      easy_apply_filter=False, extracted_location="Bengaluru",
+                      job_title="Backend Engineer"):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "jobs.csv"
             original = b"preserve this dataset\r\n"
@@ -158,7 +161,7 @@ class CollectionRunTests(unittest.TestCase):
                         no_context=no_context,
                     ),
                 ),
-                mock.patch.object(job_search, "extract_job_title", return_value="Backend Engineer"),
+                mock.patch.object(job_search, "extract_job_title", return_value=job_title),
                 mock.patch.object(job_search, "extract_company", return_value="Example"),
                 mock.patch.object(job_search, "extract_location", return_value=extracted_location),
                 mock.patch.object(job_search, "detect_easy_apply", return_value=False),
@@ -178,6 +181,14 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(len(outcome.jobs), 1)
         self.assertFalse(outcome.issues)
         diagnostic = outcome.search_diagnostics[0]
+        self.assertEqual(diagnostic.scope_sequence, 1)
+        self.assertTrue(diagnostic.search_attempted)
+        self.assertEqual(diagnostic.candidate_ids, ("101",))
+        self.assertGreaterEqual(len(diagnostic.candidate_occurrences), 1)
+        self.assertEqual(
+            diagnostic.candidate_occurrences[0].disposition,
+            "QUALIFYING",
+        )
         self.assertEqual(diagnostic.keyword, "backend")
         self.assertEqual(diagnostic.location, "Bengaluru")
         self.assertEqual(diagnostic.navigation_response_statuses, (200,))
@@ -216,6 +227,9 @@ class CollectionRunTests(unittest.TestCase):
             connect_error=RuntimeError("not connected"),
         )
         self.assertEqual(outcome.status, job_search.CollectionStatus.FAILED)
+        self.assertEqual(len(outcome.search_diagnostics), 1)
+        self.assertFalse(outcome.search_diagnostics[0].search_attempted)
+        self.assertEqual(outcome.search_diagnostics[0].scope_sequence, 1)
 
     def test_missing_browser_context_is_failed(self):
         outcome = self.run_collector(FakePage(), no_context=True)
@@ -247,6 +261,10 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
         self.assertTrue(any("Candidate-page processing failed" in item for item in outcome.issues))
         self.assertEqual(outcome.search_diagnostics[0].candidate_page_failure_count, 1)
+        occurrence = outcome.search_diagnostics[0].candidate_occurrences[0]
+        self.assertEqual(occurrence.processing_status, "FAILED")
+        self.assertEqual(occurrence.disposition, "FAILED_PROCESSING")
+        self.assertEqual(occurrence.reason_code, "PROCESSING_ERROR")
 
     def test_scroll_failure_is_recorded(self):
         outcome = self.run_collector(FakePage(links=("101",), scroll_fails=True))
@@ -264,14 +282,90 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(diagnostic.selector_error_count, 2)
         self.assertEqual(diagnostic.parser_error_count, 0)
 
-    def test_configured_global_cap_is_reported_as_bounded_unknown(self):
+    def test_configured_global_cap_is_reported_as_incomplete(self):
         outcome = self.run_collector(FakePage(links=("101", "102")), max_jobs=1)
-        self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
+        self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
+        self.assertEqual(outcome.evidence_status, CollectionStatus.INCOMPLETE)
         self.assertTrue(outcome.bounded_by_limit)
         diagnostic = outcome.search_diagnostics[0]
         self.assertTrue(diagnostic.global_cap_reached)
         self.assertFalse(diagnostic.per_search_cap_reached)
-        self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.UNKNOWN)
+        self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.INCOMPLETE)
+
+    def test_global_cap_keeps_unattempted_requested_scopes_explicit(self):
+        outcome = self.run_collector(
+            FakePage(links=("101", "102")),
+            keywords=("first", "second"),
+            max_jobs=1,
+        )
+        self.assertEqual(outcome.status, job_search.CollectionStatus.INCOMPLETE)
+        self.assertEqual(outcome.evidence_status, CollectionStatus.INCOMPLETE)
+        self.assertEqual(len(outcome.search_diagnostics), 2)
+        first, second = outcome.search_diagnostics
+        self.assertEqual((first.scope_sequence, second.scope_sequence), (1, 2))
+        self.assertTrue(first.search_attempted)
+        self.assertEqual(first.candidate_ids, ("101", "102"))
+        self.assertFalse(second.search_attempted)
+        self.assertEqual(second.skip_reason, "GLOBAL_RESULT_CAP_REACHED")
+        self.assertTrue(second.global_cap_reached)
+
+    def test_duplicate_requested_scopes_have_distinct_diagnostic_ids(self):
+        outcome = self.run_collector(
+            FakePage(),
+            keywords=("backend", "Backend "),
+        )
+        self.assertEqual(len(outcome.search_diagnostics), 2)
+        first, second = outcome.search_diagnostics
+        self.assertEqual((first.scope_id, second.scope_id), ("scope-0001", "scope-0002"))
+        self.assertTrue(first.duplicate_scope)
+        self.assertTrue(second.duplicate_scope)
+        self.assertTrue(first.search_attempted)
+        self.assertTrue(second.search_attempted)
+
+    def test_same_candidate_in_multiple_scopes_remains_an_explicit_occurrence(self):
+        outcome = self.run_collector(
+            FakePage(links=("101",)),
+            keywords=("backend", "platform"),
+        )
+        first, second = outcome.search_diagnostics
+        self.assertEqual(first.candidate_occurrences[0].disposition, "QUALIFYING")
+        self.assertGreaterEqual(len(second.candidate_occurrences), 1)
+        duplicate = next(
+            item for item in second.candidate_occurrences
+            if item.reason_code == "DUPLICATE_ACROSS_SCOPES"
+        )
+        self.assertEqual(duplicate.candidate_id, "101")
+        self.assertEqual(duplicate.disposition, "DUPLICATE")
+        self.assertEqual(duplicate.reason_code, "DUPLICATE_ACROSS_SCOPES")
+        self.assertEqual(duplicate.duplicate_of_scope_id, first.scope_id)
+        self.assertEqual(duplicate.duplicate_of_sequence, 1)
+
+    def test_production_outcome_attaches_canonical_evidence_without_completion(self):
+        outcome = self.run_collector(
+            FakePage(links=("101",)),
+            keywords=("backend", "platform"),
+        )
+        evidence = outcome.run_evidence
+        self.assertIsNotNone(evidence)
+        self.assertEqual(len(evidence.scopes), len(outcome.search_diagnostics))
+        self.assertEqual(len(evidence.requested_scopes), 2)
+        self.assertEqual(
+            tuple(scope.keyword for scope in evidence.requested_scopes),
+            ("backend", "platform"),
+        )
+        self.assertIs(outcome.evidence_status, CollectionStatus.INCOMPLETE)
+        self.assertEqual(outcome.status.value, outcome.evidence_status.value)
+        self.assertEqual(
+            classify_collection_run(evidence),
+            CollectionStatus.INCOMPLETE,
+        )
+        self.assertTrue(
+            any(
+                candidate.reason_code == "DUPLICATE_ACROSS_SCOPES"
+                for diagnostic in outcome.search_diagnostics
+                for candidate in diagnostic.candidate_occurrences
+            )
+        )
 
     def test_per_search_cap_is_recorded_without_proving_completion(self):
         outcome = self.run_collector(
@@ -295,6 +389,16 @@ class CollectionRunTests(unittest.TestCase):
         page.url = "https://www.linkedin.com/jobs/search/"
         result = job_search.get_job_links(page, max_links=5)
         self.assertEqual(result.links, ("https://www.linkedin.com/jobs/view/101/",))
+        self.assertGreater(len(result.candidate_occurrences), 1)
+        self.assertEqual(result.candidate_occurrences[0]["processing_status"], "DISCOVERED")
+        self.assertTrue(
+            any(
+                item["disposition"] == "DUPLICATE"
+                and item["reason_code"] == "DUPLICATE_WITHIN_SCOPE"
+                and item["duplicate_of_sequence"] == 1
+                for item in result.candidate_occurrences[1:]
+            )
+        )
 
     def test_link_parser_reports_element_errors(self):
         page = FakePage()
@@ -327,6 +431,10 @@ class CollectionRunTests(unittest.TestCase):
             outcome = self.run_collector(page)
         self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
         self.assertFalse(outcome.issues)
+        self.assertEqual(
+            outcome.search_diagnostics[0].candidate_occurrences[0].reason_code,
+            "CLOSED_JOB",
+        )
 
     def test_intended_location_filter_is_not_a_processing_failure(self):
         outcome = self.run_collector(
@@ -336,6 +444,21 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(outcome.status, job_search.CollectionStatus.UNKNOWN)
         self.assertFalse(outcome.jobs)
         self.assertFalse(outcome.issues)
+        self.assertEqual(
+            outcome.search_diagnostics[0].candidate_occurrences[0].reason_code,
+            "OUTSIDE_TARGET_LOCATION",
+        )
+
+    def test_candidate_error_is_not_hidden_by_a_later_filter(self):
+        outcome = self.run_collector(
+            FakePage(links=("101",)),
+            extracted_location="London",
+            job_title="Unknown Job",
+        )
+        occurrence = outcome.search_diagnostics[0].candidate_occurrences[0]
+        self.assertEqual(occurrence.processing_status, "FAILED")
+        self.assertEqual(occurrence.disposition, "FAILED_PROCESSING")
+        self.assertEqual(occurrence.reason_code, "PROCESSING_ERROR")
 
     def test_intended_easy_apply_filter_is_not_a_processing_failure(self):
         outcome = self.run_collector(
@@ -533,7 +656,17 @@ class PublicationTests(unittest.TestCase):
                 self.assertFalse(job_search.publish_collection(outcome, self.output))
                 self.assertEqual(self.output.read_bytes(), self.original)
 
-    def test_only_complete_statuses_are_publishable(self):
+    def test_structural_dom_validation_result_cannot_authorize_publication(self):
+        package_result = PackageValidation(
+            valid=True,
+            observed_state=PageEvidenceState.POPULATED_RESULTS_SETTLED,
+        )
+        with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+            self.assertFalse(job_search.publish_collection(package_result, self.output))
+        writer.assert_not_called()
+        self.assertEqual(self.output.read_bytes(), self.original)
+
+    def test_unverified_complete_statuses_cannot_authorize_publication(self):
         outcomes = (
             job_search.CollectionOutcome(
                 job_search.CollectionStatus.COMPLETE,
@@ -547,12 +680,44 @@ class PublicationTests(unittest.TestCase):
         for outcome in outcomes:
             with self.subTest(status=outcome.status):
                 self.output.write_bytes(self.original)
-                self.assertTrue(job_search.publish_collection(outcome, self.output))
-                with self.output.open(newline="", encoding="utf-8") as file:
-                    self.assertEqual(
-                        tuple(csv.DictReader(file).fieldnames),
-                        job_search.JOB_CSV_FIELDS,
-                    )
+                with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+                    self.assertFalse(job_search.publish_collection(outcome, self.output))
+                writer.assert_not_called()
+                self.assertEqual(self.output.read_bytes(), self.original)
+
+    def test_unverified_complete_empty_does_not_create_output(self):
+        missing_output = Path(self.temp_dir.name) / "new-jobs.csv"
+        outcome = job_search.CollectionOutcome(
+            job_search.CollectionStatus.COMPLETE_EMPTY,
+            (),
+        )
+        with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+            self.assertFalse(job_search.publish_collection(outcome, missing_output))
+        writer.assert_not_called()
+        self.assertFalse(missing_output.exists())
+
+    def test_forged_outcome_attribute_cannot_authorize_publication(self):
+        outcome = job_search.CollectionOutcome(
+            job_search.CollectionStatus.COMPLETE,
+            (self.sample_row,),
+        )
+        # object.__setattr__ can bypass a frozen dataclass; publication must
+        # not trust an attachable attribute or a module-level token.
+        object.__setattr__(outcome, "_publication_authorization", object())
+
+        with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+            self.assertFalse(job_search.publish_collection(outcome, self.output))
+
+        writer.assert_not_called()
+        self.assertEqual(self.output.read_bytes(), self.original)
+
+    def test_malformed_outcomes_cannot_authorize_publication(self):
+        for outcome in (None, object(), job_search.CollectionOutcome("COMPLETE", ())):
+            with self.subTest(outcome=type(outcome).__name__):
+                with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+                    self.assertFalse(job_search.publish_collection(outcome, self.output))
+                writer.assert_not_called()
+                self.assertEqual(self.output.read_bytes(), self.original)
 
     def test_serialization_failure_preserves_destination_and_cleans_temp(self):
         writer = mock.Mock()
