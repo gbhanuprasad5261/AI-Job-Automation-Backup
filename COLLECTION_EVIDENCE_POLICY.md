@@ -39,20 +39,34 @@ The offline multi-scope model applies these structural rules:
 - A requested scope with no evidence record is INCOMPLETE because required
   work is unaccounted for.
 - Duplicate requested scopes, duplicate or unexpected scope records, duplicate
-  candidate IDs within a scope, malformed dispositions, and contradictory
-  candidate counts are UNKNOWN unless a higher-precedence known failure or
-  incomplete condition is present.
-- Candidate IDs are unique within each scope's occurrence ledger. The same ID
-  may appear once in each of multiple scopes; each such record is a distinct
-  scope occurrence and must be accounted for in that scope. This classifier
-  does not compute a globally unique-job count or deduplicate combined output.
-  Any output-level deduplication must be an explicit downstream policy and
-  must not erase the per-scope evidence.
+  candidate IDs without an explicit occurrence link, malformed dispositions,
+  and contradictory candidate counts are UNKNOWN unless a higher-precedence
+  known failure or incomplete condition is present.
+- A candidate occurrence is one ordered discovery record under one scope;
+  candidate identity is the ID used to recognize repeated jobs. A repeated
+  selector observation within a scope remains a separate ledger occurrence and
+  may be recorded as `DUPLICATE` with `DUPLICATE_WITHIN_SCOPE`, an earlier
+  sequence reference, and processing status `DUPLICATE`. This is explicit
+  duplicate accounting, not a claim that the repeated occurrence was processed
+  as a qualifying or filtered candidate.
+- The same candidate ID may appear in multiple scopes. Each record remains a
+  distinct scope occurrence. A cross-scope output-deduplication record must
+  retain its source scope, discovery sequence, and reference to the prior scope
+  occurrence in separate output-deduplication fields. Its scope disposition
+  remains UNPROCESSED. The offline run classifier treats that currently-skipped
+  cross-scope occurrence as INCOMPLETE; it does not inherit the earlier scope's
+  disposition. The same ID can be independently qualified or filtered in each
+  scope when each scope has its own explicit disposition. This classifier does
+  not compute a globally unique-job count or deduplicate combined output.
 - A discovered-candidate count larger than the disposition ledger is
   INCOMPLETE. A smaller count contradicts the supplied ledger and is UNKNOWN.
-- Every candidate must be explicitly QUALIFYING or FILTERED, and the scope
-  must affirm that intended filters were applied. UNPROCESSED is INCOMPLETE;
-  missing or unknown disposition evidence is UNKNOWN.
+- Every candidate occurrence must be explicitly accounted for. A first unique
+  occurrence must be QUALIFYING or FILTERED, and the scope must affirm that
+  intended filters were applied. An explicitly linked within-scope repeat is
+  accounted as DUPLICATE but is not counted as processed/qualifying. A skipped
+  cross-scope repeat is preserved as an output-deduplication observation and makes the run INCOMPLETE
+  until that scope has its own disposition. UNPROCESSED is INCOMPLETE; missing
+  or unknown disposition evidence is UNKNOWN.
 - FILTERED occurrences require one reason code from the shared vocabulary:
   CLOSED_JOB, OUTSIDE_TARGET_LOCATION, NOT_EASY_APPLY, or OTHER_FILTER.
   UNPROCESSED may record PROCESSING_ERROR. These codes describe supplied
@@ -136,25 +150,38 @@ batch is INCOMPLETE, an unknown cap effect is UNKNOWN, and a cap that may have
 stopped work before terminal evidence is INCOMPLETE. These are consistency
 rules for supplied observations, not validation of any live site's controls.
 
-## Future production adapter contract (not implemented)
+## Offline diagnostics adapter boundary
 
-A future adapter must consume collector-native observations per requested
-scope and preserve the run sequence, requested keyword/location, observed
-keyword/location with evidence references, identity-match state, loading
-state, page interpretation, pagination/batch observations, cap impact,
-candidate occurrences, dispositions/reason codes, and unresolved errors.
-Every requested scope must have a record, including scopes not attempted after
-a cap or fatal setup failure. Candidate IDs are scoped occurrences; output
-deduplication must not erase occurrences in other scopes.
+`collection_diagnostics_adapter.py` is a one-way offline transformation into
+the canonical model. It requires the caller to provide the requested scope set;
+it does not reconstruct that set from observed diagnostics. It preserves the
+producer's candidate occurrence order, per-scope candidate IDs, reason codes,
+processing statuses, scope sequence, duplicate links, cap observations, and error counts. A
+missing requested-scope record remains missing and classifies as INCOMPLETE.
+The adapter is not imported by `job_search.py` and does not connect to
+publication.
 
-The adapter must map absent or unsupported observations to UNKNOWN and may not
-derive identity, settled state, empty results, exhaustion, or candidate
-accounting from navigation success, fixed waits, visible counts, screenshots,
-no exceptions, or the `valid` field of `dom_evidence_package.PackageValidation`.
-That validator checks package structure only and remains disconnected from
-publication. No production adapter currently supplies the required verified
-site observations, so production collection continues to emit UNKNOWN for
-otherwise clean runs and publication remains fail-closed.
+The collector does not record observed query/location identity, settled
+loading, a verified legitimate-empty state, pagination batches or exhaustion,
+or a scope-level assertion that all intended filters were applied. The adapter
+leaves these fields absent. It may not derive them from navigation success,
+fixed waits, visible counts, screenshots, no exceptions, or the `valid` field
+of `dom_evidence_package.PackageValidation`. Candidate accounting alone
+therefore remains UNKNOWN for clean non-duplicate runs; explicit skipped work,
+recorded errors, or a validated cross-scope duplicate remains INCOMPLETE.
+Nothing in the adapter authorizes `COMPLETE`, `COMPLETE_EMPTY`, or publication.
+
+`candidate_occurrences` counts every ordered occurrence, including repeated
+selector observations. `candidate_identity_ids` separately preserves the
+producer's unique per-scope ID sequence, and its reported count must agree with
+the unique IDs derived from the occurrence ledger. The model permits the same
+candidate ID in separate scopes but validates a cross-scope duplicate link
+against an earlier occurrence in the requested run order. Output-level
+deduplication remains distinct from scope-level disposition and must not erase
+the occurrence ledger.
+
+This is not production integration. Production collection continues to emit
+UNKNOWN for otherwise clean runs and publication remains fail-closed.
 
 The artifact readers' Windows path-containment and replacement-race concerns
 remain a separate unresolved security blocker. The future adapter must not
