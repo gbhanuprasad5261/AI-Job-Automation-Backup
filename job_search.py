@@ -79,6 +79,21 @@ class JobLinkResult:
     bounded_by_limit: bool = False
     selector_error_count: int = 0
     parser_error_count: int = 0
+    candidate_occurrences: tuple = ()
+
+
+@dataclass(frozen=True)
+class CandidateOccurrenceDiagnostic:
+    """Sanitized occurrence accounting; it is diagnostic, not completion proof."""
+
+    candidate_id: str
+    discovery_sequence: int
+    selector: str
+    processing_status: str
+    disposition: str = None
+    reason_code: str = None
+    duplicate_of_scope_id: str = None
+    duplicate_of_sequence: int = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +102,13 @@ class SearchDiagnostic:
 
     keyword: str
     location: str
+    scope_id: str = None
+    scope_sequence: int = 0
+    duplicate_scope: bool = False
+    search_attempted: bool = False
+    skip_reason: str = None
+    candidate_ids: tuple = ()
+    candidate_occurrences: tuple = ()
     navigation_response_statuses: tuple = ()
     final_url_origin: str = None
     extracted_link_count: int = 0
@@ -137,6 +159,11 @@ def _freeze_search_diagnostics(records, outcome_status):
                 **record,
                 "navigation_response_statuses": tuple(
                     record["navigation_response_statuses"]
+                ),
+                "candidate_ids": tuple(record["candidate_ids"]),
+                "candidate_occurrences": tuple(
+                    CandidateOccurrenceDiagnostic(**item)
+                    for item in record["candidate_occurrences"]
                 ),
             },
             collection_outcome=outcome_status,
@@ -251,6 +278,11 @@ def classify_collection_evidence(evidence):
     ):
         return CollectionStatus.UNKNOWN
 
+    if qualifying_count == 0 and candidate_count == 0:
+        # This aggregate helper has no explicit legitimate-empty observation.
+        # Zero candidates therefore cannot distinguish a real empty result
+        # from loading, parser, or unsupported-page behavior.
+        return CollectionStatus.UNKNOWN
     if qualifying_count == 0:
         return CollectionStatus.COMPLETE_EMPTY
     return CollectionStatus.COMPLETE
@@ -317,15 +349,23 @@ def _write_jobs_csv_atomically(jobs, output_file):
 
 
 def publish_collection(outcome, output_file=OUTPUT_FILE):
-    """Atomically publish only explicitly verified complete outcomes."""
-    if outcome.status not in {
+    """Keep production publication closed until verified evidence is available.
+
+    No production evidence adapter currently verifies search identity,
+    exhaustion, and candidate accounting. Status values and offline evidence
+    models therefore cannot authorize replacing the published CSV.
+    """
+    if not isinstance(outcome, CollectionOutcome):
+        return False
+    if not isinstance(outcome.status, CollectionStatus) or outcome.status not in {
         CollectionStatus.COMPLETE,
         CollectionStatus.COMPLETE_EMPTY,
     }:
         return False
 
-    _write_jobs_csv_atomically(outcome.jobs, output_file)
-    return True
+    # There is deliberately no token or status-only bypass. Keep the atomic
+    # writer isolated until a trusted production evidence adapter exists.
+    return False
 
 
 # =======================================
@@ -841,6 +881,7 @@ def get_job_links(page, max_links=None):
     errors = []
     selector_error_count = 0
     parser_error_count = 0
+    candidate_occurrences = []
 
     for selector in selectors:
 
@@ -879,7 +920,35 @@ def get_job_links(page, max_links=None):
                         )
                         continue
 
+                    sequence = len(candidate_occurrences) + 1
+                    prior = next(
+                        (
+                            item
+                            for item in candidate_occurrences
+                            if item["candidate_id"] == job_id
+                            and item["disposition"] is None
+                        ),
+                        None,
+                    )
+                    occurrence = {
+                        "candidate_id": job_id,
+                        "discovery_sequence": sequence,
+                        "selector": selector,
+                        "processing_status": "DISCOVERED",
+                        "disposition": None,
+                        "reason_code": None,
+                        "duplicate_of_scope_id": None,
+                        "duplicate_of_sequence": None,
+                    }
+                    candidate_occurrences.append(occurrence)
+
                     if job_id in seen_ids:
+                        occurrence["processing_status"] = "DUPLICATE"
+                        occurrence["disposition"] = "DUPLICATE"
+                        occurrence["reason_code"] = "DUPLICATE_WITHIN_SCOPE"
+                        occurrence["duplicate_of_sequence"] = (
+                            prior["discovery_sequence"] if prior else None
+                        )
                         continue
 
                     seen_ids.add(
@@ -903,6 +972,7 @@ def get_job_links(page, max_links=None):
                             bounded_by_limit=True,
                             selector_error_count=selector_error_count,
                             parser_error_count=parser_error_count,
+                            candidate_occurrences=tuple(candidate_occurrences),
                         )
 
                 except Exception as exc:
@@ -922,6 +992,7 @@ def get_job_links(page, max_links=None):
         tuple(errors),
         selector_error_count=selector_error_count,
         parser_error_count=parser_error_count,
+        candidate_occurrences=tuple(candidate_occurrences),
     )
 
 
@@ -938,6 +1009,69 @@ def _collect_search_jobs():
 
     issues = []
     bounded_by_limit = False
+    search_diagnostic_records = []
+
+    keywords = SEARCH_KEYWORDS or (SEARCH_KEYWORD,)
+    search_locations = []
+    for location in TARGET_LOCATIONS:
+        location_text = str(location).strip()
+        if not location_text:
+            continue
+        lower = location_text.lower()
+        if lower in ("bengaluru", "bangalore"):
+            display_location = "Bengaluru"
+        elif lower == "hyderabad":
+            display_location = "Hyderabad"
+        elif lower == "chennai":
+            display_location = "Chennai"
+        elif "remote" in lower:
+            display_location = "Remote"
+        else:
+            display_location = location_text
+        if display_location.lower() not in [item.lower() for item in search_locations]:
+            search_locations.append(display_location)
+    if not search_locations:
+        search_locations = ["India"]
+
+    # Record every requested scope before setup/navigation so early failures and
+    # global caps cannot silently omit scopes from diagnostics.
+    scope_record_by_position = {}
+    scope_sequence = 0
+    scope_records_by_identity = {}
+    for keyword_index, keyword in enumerate(keywords, start=1):
+        for location_index, location in enumerate(search_locations, start=1):
+            scope_sequence += 1
+            record = {
+                "keyword": str(keyword),
+                "location": str(location),
+                "scope_id": f"scope-{scope_sequence:04d}",
+                "scope_sequence": scope_sequence,
+                "duplicate_scope": False,
+                "search_attempted": False,
+                "skip_reason": None,
+                "candidate_ids": [],
+                "candidate_occurrences": [],
+                "navigation_response_statuses": [],
+                "final_url_origin": None,
+                "extracted_link_count": 0,
+                "selector_error_count": 0,
+                "parser_error_count": 0,
+                "navigation_failure_count": 0,
+                "scroll_attempts": 0,
+                "scroll_failures": 0,
+                "per_search_cap_reached": False,
+                "global_cap_reached": False,
+                "candidate_page_failure_count": 0,
+            }
+            scope_identity = (str(keyword).strip().casefold(), str(location).strip().casefold())
+            prior_record = scope_records_by_identity.get(scope_identity)
+            if prior_record is not None:
+                prior_record["duplicate_scope"] = True
+                record["duplicate_scope"] = True
+            else:
+                scope_records_by_identity[scope_identity] = record
+            scope_record_by_position[(keyword_index, location_index)] = record
+            search_diagnostic_records.append(record)
 
     with sync_playwright() as p:
 
@@ -971,14 +1105,18 @@ def _collect_search_jobs():
             print(
                 f"Error: {e}"
             )
-            return _collection_outcome([], issues, fatal=True)
+            return _collection_outcome(
+                [], issues, fatal=True, search_diagnostics=search_diagnostic_records
+            )
 
         if not browser.contexts:
 
             print(
                 "No browser context found."
             )
-            return _collection_outcome([], issues, fatal=True)
+            return _collection_outcome(
+                [], issues, fatal=True, search_diagnostics=search_diagnostic_records
+            )
 
         context = (
             browser.contexts[0]
@@ -1018,42 +1156,9 @@ def _collect_search_jobs():
         all_job_links = []
         seen_job_ids = set()
         job_search_locations = {}
-        search_diagnostic_records = []
         diagnostic_by_job_link = {}
-
-        keywords = SEARCH_KEYWORDS or (
-            SEARCH_KEYWORD,
-        )
-
-        # Use clean display names for LinkedIn's location search.
-        # The final job-page location check still uses TARGET_LOCATIONS.
-        search_locations = []
-        for location in TARGET_LOCATIONS:
-            location_text = str(location).strip()
-            if not location_text:
-                continue
-
-            lower = location_text.lower()
-            if lower in ("bengaluru", "bangalore"):
-                display_location = "Bengaluru"
-            elif lower == "hyderabad":
-                display_location = "Hyderabad"
-            elif lower == "chennai":
-                display_location = "Chennai"
-            elif "remote" in lower:
-                display_location = "Remote"
-            else:
-                display_location = location_text
-
-            if display_location.lower() not in [
-                item.lower() for item in search_locations
-            ]:
-                search_locations.append(
-                    display_location
-                )
-
-        if not search_locations:
-            search_locations = ["India"]
+        occurrence_by_job_link = {}
+        first_occurrence_by_job_id = {}
 
         # A small per-search cap keeps the final pool diverse instead of
         # allowing the first keyword/location pair to consume all MAX_JOBS.
@@ -1074,26 +1179,15 @@ def _collect_search_jobs():
                 start=1
             ):
 
+                search_diagnostic = scope_record_by_position[(keyword_index, location_index)]
                 if len(all_job_links) >= MAX_JOBS:
+                    search_diagnostic["skip_reason"] = "GLOBAL_RESULT_CAP_REACHED"
+                    search_diagnostic["global_cap_reached"] = True
+                    bounded_by_limit = True
                     break
 
                 search_counter += 1
-                search_diagnostic = {
-                    "keyword": str(keyword),
-                    "location": str(location),
-                    "navigation_response_statuses": [],
-                    "final_url_origin": None,
-                    "extracted_link_count": 0,
-                    "selector_error_count": 0,
-                    "parser_error_count": 0,
-                    "navigation_failure_count": 0,
-                    "scroll_attempts": 0,
-                    "scroll_failures": 0,
-                    "per_search_cap_reached": False,
-                    "global_cap_reached": False,
-                    "candidate_page_failure_count": 0,
-                }
-                search_diagnostic_records.append(search_diagnostic)
+                search_diagnostic["search_attempted"] = True
 
                 print()
                 print("=" * 70)
@@ -1263,6 +1357,20 @@ def _collect_search_jobs():
                 )
                 keyword_job_links = link_result.links
                 search_diagnostic["extracted_link_count"] = len(keyword_job_links)
+                search_diagnostic["candidate_ids"] = [
+                    job_id
+                    for job_id in (extract_job_id(link) for link in keyword_job_links)
+                    if job_id
+                ]
+                search_diagnostic["candidate_occurrences"] = [
+                    dict(item) for item in link_result.candidate_occurrences
+                ]
+                first_scope_occurrence = {}
+                for occurrence in search_diagnostic["candidate_occurrences"]:
+                    if occurrence["processing_status"] == "DISCOVERED":
+                        first_scope_occurrence.setdefault(
+                            occurrence["candidate_id"], occurrence
+                        )
                 search_diagnostic["selector_error_count"] = (
                     link_result.selector_error_count
                 )
@@ -1300,6 +1408,16 @@ def _collect_search_jobs():
                         continue
 
                     if job_id in seen_job_ids:
+                        occurrence = first_scope_occurrence.get(job_id)
+                        prior_scope, prior_occurrence = first_occurrence_by_job_id[job_id]
+                        if occurrence is not None:
+                            occurrence.update(
+                                processing_status="DUPLICATE",
+                                disposition="DUPLICATE",
+                                reason_code="DUPLICATE_ACROSS_SCOPES",
+                                duplicate_of_scope_id=prior_scope["scope_id"],
+                                duplicate_of_sequence=prior_occurrence["discovery_sequence"],
+                            )
                         continue
 
                     seen_job_ids.add(job_id)
@@ -1315,6 +1433,14 @@ def _collect_search_jobs():
                     # page, so this is used as a reliable fallback.
                     job_search_locations[normalized_job_url] = location
                     diagnostic_by_job_link[normalized_job_url] = search_diagnostic
+                    occurrence = first_scope_occurrence.get(job_id)
+                    if occurrence is not None:
+                        occurrence["processing_status"] = "PENDING"
+                        occurrence_by_job_link[normalized_job_url] = occurrence
+                        first_occurrence_by_job_id[job_id] = (
+                            search_diagnostic,
+                            occurrence,
+                        )
 
                     added += 1
 
@@ -1334,6 +1460,14 @@ def _collect_search_jobs():
             if len(all_job_links) >= MAX_JOBS:
                 bounded_by_limit = True
                 break
+
+        if bounded_by_limit:
+            for record in search_diagnostic_records:
+                if not record["search_attempted"] and record["skip_reason"] is None:
+                    record["skip_reason"] = "GLOBAL_RESULT_CAP_REACHED"
+                    record["global_cap_reached"] = True
+                elif not record["search_attempted"]:
+                    record["global_cap_reached"] = True
 
         # ---------------------------------------
         # Final combined job links
@@ -1381,6 +1515,9 @@ def _collect_search_jobs():
             job_links,
             start=1
         ):
+
+            candidate_occurrence = occurrence_by_job_link.get(job_link)
+            candidate_issue_start = len(issues)
 
             if len(jobs) >= MAX_JOBS:
 
@@ -1458,6 +1595,12 @@ def _collect_search_jobs():
                     issues.append(
                         f"Could not identify a job ID for candidate {job_link}."
                     )
+                    if candidate_occurrence is not None:
+                        candidate_occurrence.update(
+                            processing_status="FAILED",
+                            disposition="FAILED_PROCESSING",
+                            reason_code="PROCESSING_ERROR",
+                        )
                     continue
 
                 normalized_link = (
@@ -1470,6 +1613,13 @@ def _collect_search_jobs():
                     normalized_link
                     in seen_links
                 ):
+
+                    if candidate_occurrence is not None:
+                        candidate_occurrence.update(
+                            processing_status="DUPLICATE",
+                            disposition="DUPLICATE",
+                            reason_code="DUPLICATE_ACROSS_SCOPES",
+                        )
 
                     continue
 
@@ -1509,6 +1659,19 @@ def _collect_search_jobs():
                     print(
                         "Skipping."
                     )
+                    if candidate_occurrence is not None:
+                        if len(issues) == candidate_issue_start:
+                            candidate_occurrence.update(
+                                processing_status="PROCESSED",
+                                disposition="FILTERED",
+                                reason_code="CLOSED_JOB",
+                            )
+                        else:
+                            candidate_occurrence.update(
+                                processing_status="FAILED",
+                                disposition="FAILED_PROCESSING",
+                                reason_code="PROCESSING_ERROR",
+                            )
                     continue
 
                 # ---------------------------------------
@@ -1573,6 +1736,19 @@ def _collect_search_jobs():
                         f"{location or 'Unknown'}"
                     )
                     print("Skipping.")
+                    if candidate_occurrence is not None:
+                        if len(issues) == candidate_issue_start:
+                            candidate_occurrence.update(
+                                processing_status="PROCESSED",
+                                disposition="FILTERED",
+                                reason_code="OUTSIDE_TARGET_LOCATION",
+                            )
+                        else:
+                            candidate_occurrence.update(
+                                processing_status="FAILED",
+                                disposition="FAILED_PROCESSING",
+                                reason_code="PROCESSING_ERROR",
+                            )
                     continue
 
                 # ---------------------------------------
@@ -1649,6 +1825,19 @@ def _collect_search_jobs():
                     print(
                         "Skipping."
                     )
+                    if candidate_occurrence is not None:
+                        if len(issues) == candidate_issue_start:
+                            candidate_occurrence.update(
+                                processing_status="PROCESSED",
+                                disposition="FILTERED",
+                                reason_code="NOT_EASY_APPLY",
+                            )
+                        else:
+                            candidate_occurrence.update(
+                                processing_status="FAILED",
+                                disposition="FAILED_PROCESSING",
+                                reason_code="PROCESSING_ERROR",
+                            )
                     continue
 
                 # ---------------------------------------
@@ -1680,6 +1869,19 @@ def _collect_search_jobs():
                         normalized_link
                 })
 
+                if candidate_occurrence is not None:
+                    if len(issues) == candidate_issue_start:
+                        candidate_occurrence.update(
+                            processing_status="PROCESSED",
+                            disposition="QUALIFYING",
+                        )
+                    else:
+                        candidate_occurrence.update(
+                            processing_status="FAILED",
+                            disposition="FAILED_PROCESSING",
+                            reason_code="PROCESSING_ERROR",
+                        )
+
             except Exception as e:
 
                 print()
@@ -1689,6 +1891,12 @@ def _collect_search_jobs():
                 issues.append(
                     f"Candidate-page processing failed for {job_link}: {e}"
                 )
+                if candidate_occurrence is not None:
+                    candidate_occurrence.update(
+                        processing_status="FAILED",
+                        disposition="FAILED_PROCESSING",
+                        reason_code="PROCESSING_ERROR",
+                    )
                 source_diagnostic = diagnostic_by_job_link.get(job_link)
                 if source_diagnostic is not None:
                     source_diagnostic["candidate_page_failure_count"] += 1
