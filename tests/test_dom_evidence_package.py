@@ -17,7 +17,7 @@ from dom_evidence_package import (
 def synthetic_package(state="POPULATED_RESULTS_SETTLED"):
     """Build synthetic claims only; no files or real observations are used."""
     package = {
-        "schema_version": "1.0",
+        "schema_version": "1.2",
         "package_identity": {
             "capture_id": None,
             "production_run_id": None,
@@ -102,6 +102,7 @@ def synthetic_package(state="POPULATED_RESULTS_SETTLED"):
                 },
                 "cap": {"reached": False, "prevented_exhaustion": False},
             },
+            "page_error": None,
             "interstitial": {
                 "observed": False,
                 "kind": None,
@@ -137,33 +138,33 @@ def synthetic_package(state="POPULATED_RESULTS_SETTLED"):
         package["observed_search_identity"]["match_assessment"] = {
             "value": "unverified", "basis": "unknown"
         }
-    elif state == "AUTHENTICATION_OR_INTERSTITIAL":
+    elif state in {"AUTHENTICATION_REQUIRED", "CHALLENGE_OR_INTERSTITIAL"}:
+        package["observations"]["results"]["visible_card_count"] = None
+        package["observations"]["results"]["displayed_total_text"] = None
         package["observations"]["loading"]["state"] = "unknown"
         package["observations"]["loading"]["history"] = []
         package["observations"]["interstitial"] = {
             "observed": True,
-            "kind": "synthetic authentication interstitial",
+            "kind": "authentication_required" if state == "AUTHENTICATION_REQUIRED" else "challenge",
             "basis": "direct_observation",
             "evidence_refs": ["dom_snapshot"],
         }
         package["observed_search_identity"]["match_assessment"] = {
             "value": "unverified", "basis": "unknown"
         }
-    elif state == "POPULATED_MORE_PAGINATION":
+    elif state in {"POPULATED_MORE_PAGINATION", "EXHAUSTION_REVIEW_RECORDED"}:
+        terminal = state == "EXHAUSTION_REVIEW_RECORDED"
         package["observations"]["pagination"] = {
-            "state": "more_batches_observed",
+            "state": "terminal_condition_observed" if terminal else "more_batches_observed",
             "batches": [
                 {
                     "sequence": 1,
+                    "status": "OBSERVED",
                     "observation": "Synthetic additional batch indication.",
+                    "more_indicated": not terminal,
                     "basis": "direct_observation",
                     "evidence_refs": ["dom_snapshot"],
-                },
-                {
-                    "sequence": 2,
-                    "observation": "Synthetic subsequent batch indication.",
-                    "basis": "direct_observation",
-                    "evidence_refs": ["dom_snapshot"],
+                    "terminal_evidence_refs": ["dom_snapshot"] if terminal else [],
                 },
             ],
             "exhaustion_review": {
@@ -171,21 +172,43 @@ def synthetic_package(state="POPULATED_RESULTS_SETTLED"):
             },
             "cap": {"reached": False, "prevented_exhaustion": False},
         }
-    elif state == "EXHAUSTION_REVIEW_RECORDED":
-        package["provenance"]["independent_verification"] = {
-            "status": "review_recorded",
-            "method": "Synthetic test review record.",
-            "evidence_refs": ["dom_snapshot"],
-            "reviewed_claims": ["pagination_exhaustion"],
-        }
-        package["observations"]["pagination"] = {
-            "state": "terminal_condition_observed",
-            "batches": [],
-            "exhaustion_review": {
+        if terminal:
+            package["provenance"]["independent_verification"] = {
                 "status": "review_recorded",
                 "method": "Synthetic test review record.",
                 "evidence_refs": ["dom_snapshot"],
-            },
+                "reviewed_claims": ["pagination_exhaustion"],
+            }
+            package["observations"]["pagination"]["exhaustion_review"] = {
+                "status": "review_recorded",
+                "method": "Synthetic test review record.",
+                "evidence_refs": ["dom_snapshot"],
+            }
+    elif state in {"NAVIGATION_ERROR", "PARSING_ERROR"}:
+        package["observations"]["loading"]["state"] = "unknown"
+        package["observations"]["loading"]["history"] = []
+        package["observations"]["page_error"] = {
+            "kind": "navigation" if state == "NAVIGATION_ERROR" else "parsing",
+            "description": "Synthetic offline error observation.",
+            "basis": "direct_observation",
+            "evidence_refs": ["dom_snapshot"],
+        }
+        package["observed_search_identity"]["match_assessment"] = {
+            "value": "unverified", "basis": "unknown"
+        }
+    elif state == "PAGINATION_BATCH_FAILED":
+        package["observations"]["pagination"] = {
+            "state": "failed_batch",
+            "batches": [{
+                "sequence": 1,
+                "status": "FAILED",
+                "observation": "Synthetic batch failure.",
+                "more_indicated": None,
+                "basis": "direct_observation",
+                "evidence_refs": ["dom_snapshot"],
+                "terminal_evidence_refs": [],
+            }],
+            "exhaustion_review": {"status": "not_reviewed", "method": None, "evidence_refs": []},
             "cap": {"reached": False, "prevented_exhaustion": False},
         }
     return package
@@ -197,12 +220,16 @@ class DomEvidencePackageTests(unittest.TestCase):
         self.assertEqual(result.completion_status, CompletionStatus.UNKNOWN)
         return result
 
-    def test_six_synthetic_state_shapes_are_valid_but_not_completion(self):
+    def test_synthetic_state_shapes_are_valid_but_never_completion(self):
         states = {
             "POPULATED_RESULTS_SETTLED": PageEvidenceState.POPULATED_RESULTS_SETTLED,
             "LEGITIMATE_EMPTY": PageEvidenceState.LEGITIMATE_EMPTY,
             "LOADING_OR_UNSETTLED": PageEvidenceState.LOADING_OR_UNSETTLED,
-            "AUTHENTICATION_OR_INTERSTITIAL": PageEvidenceState.AUTHENTICATION_OR_INTERSTITIAL,
+            "AUTHENTICATION_REQUIRED": PageEvidenceState.AUTHENTICATION_REQUIRED,
+            "CHALLENGE_OR_INTERSTITIAL": PageEvidenceState.CHALLENGE_OR_INTERSTITIAL,
+            "NAVIGATION_ERROR": PageEvidenceState.NAVIGATION_ERROR,
+            "PARSING_ERROR": PageEvidenceState.PARSING_ERROR,
+            "PAGINATION_BATCH_FAILED": PageEvidenceState.PAGINATION_BATCH_FAILED,
             "POPULATED_MORE_PAGINATION": PageEvidenceState.POPULATED_MORE_PAGINATION,
             "EXHAUSTION_REVIEW_RECORDED": PageEvidenceState.EXHAUSTION_REVIEW_RECORDED,
         }
@@ -323,22 +350,66 @@ class DomEvidencePackageTests(unittest.TestCase):
         ]
         self.assertFalse(self.validate(fixture).valid)
 
-    def test_interstitial_requires_specific_directly_referenced_observation(self):
-        fixture = synthetic_package("AUTHENTICATION_OR_INTERSTITIAL")
+    def test_authentication_and_challenge_states_are_distinct_and_referenced(self):
+        for label in ("AUTHENTICATION_REQUIRED", "CHALLENGE_OR_INTERSTITIAL"):
+            with self.subTest(label=label):
+                self.assertTrue(self.validate(synthetic_package(label)).valid)
+        fixture = synthetic_package("AUTHENTICATION_REQUIRED")
         fixture["observations"]["interstitial"]["kind"] = None
         self.assertFalse(self.validate(fixture).valid)
 
     def test_pagination_batches_require_contiguous_unique_sequence(self):
         fixture = synthetic_package("POPULATED_MORE_PAGINATION")
+        fixture["observations"]["pagination"]["batches"].append({
+            "sequence": 2,
+            "status": "OBSERVED",
+            "observation": "Synthetic next batch was observed.",
+            "more_indicated": True,
+            "basis": "direct_observation",
+            "evidence_refs": ["dom_snapshot"],
+            "terminal_evidence_refs": [],
+        })
         result = self.validate(fixture)
         self.assertTrue(result.valid, result.issues)
         fixture["observations"]["pagination"]["batches"][1]["sequence"] = 1
+        self.assertFalse(self.validate(fixture).valid)
+
+    def test_pagination_requires_each_prior_batch_to_indicate_more(self):
+        fixture = synthetic_package("POPULATED_MORE_PAGINATION")
+        fixture["observations"]["pagination"]["batches"].append({
+            "sequence": 2,
+            "status": "OBSERVED",
+            "observation": "Synthetic next batch was observed.",
+            "more_indicated": False,
+            "basis": "direct_observation",
+            "evidence_refs": ["dom_snapshot"],
+            "terminal_evidence_refs": ["dom_snapshot"],
+        })
+        self.assertFalse(self.validate(fixture).valid)
+
+    def test_failed_pagination_batch_is_distinct_from_terminal_state(self):
+        fixture = synthetic_package("PAGINATION_BATCH_FAILED")
+        self.assertTrue(self.validate(fixture).valid)
+        fixture["observations"]["pagination"]["state"] = "terminal_condition_observed"
         self.assertFalse(self.validate(fixture).valid)
 
     def test_terminal_state_conflicts_with_more_batches(self):
         fixture = synthetic_package("EXHAUSTION_REVIEW_RECORDED")
         fixture["observations"]["pagination"]["state"] = "more_batches_observed"
         self.assertFalse(self.validate(fixture).valid)
+
+    def test_terminal_evidence_requires_a_final_batch_not_an_empty_list(self):
+        fixture = synthetic_package("EXHAUSTION_REVIEW_RECORDED")
+        fixture["observations"]["pagination"]["batches"] = []
+        self.assertFalse(self.validate(fixture).valid)
+
+    def test_navigation_and_parsing_errors_require_matching_direct_evidence(self):
+        for label in ("NAVIGATION_ERROR", "PARSING_ERROR"):
+            with self.subTest(label=label):
+                fixture = synthetic_package(label)
+                self.assertTrue(self.validate(fixture).valid)
+                fixture["observations"]["page_error"]["kind"] = "parsing" if label == "NAVIGATION_ERROR" else "navigation"
+                self.assertFalse(self.validate(fixture).valid)
 
     def test_premature_cap_and_unknown_cap_block_exhaustion_claim(self):
         for cap in (
@@ -374,6 +445,7 @@ class DomEvidencePackageTests(unittest.TestCase):
         fixture["candidate_processing"] = {
             "source_run_ledger": {
                 "run_id": "synthetic-run-1",
+                "scope_id": "scope-1",
                 "reference": "synthetic/run-ledger.json",
                 "scope_query": "backend engineer",
                 "scope_location": "Bengaluru",
@@ -381,8 +453,17 @@ class DomEvidencePackageTests(unittest.TestCase):
             },
             "discovered_count": 2,
             "dispositions": [
-                {"candidate_id": "job-1", "disposition": "QUALIFYING"},
-                {"candidate_id": "job-2", "disposition": "FILTERED"},
+                {
+                    "candidate_id": "job-1", "source_scope_id": "scope-1",
+                    "discovery_sequence": 1, "processing_status": "PROCESSED",
+                    "disposition": "QUALIFYING",
+                },
+                {
+                    "candidate_id": "job-2", "source_scope_id": "scope-1",
+                    "discovery_sequence": 2, "processing_status": "PROCESSED",
+                    "disposition": "FILTERED",
+                    "reason_code": "OUTSIDE_TARGET_LOCATION",
+                },
             ],
         }
         self.assertTrue(self.validate(fixture).valid)
@@ -394,6 +475,7 @@ class DomEvidencePackageTests(unittest.TestCase):
         fixture["candidate_processing"] = {
             "source_run_ledger": {
                 "run_id": "run-1",
+                "scope_id": "scope-1",
                 "reference": "synthetic/run-ledger.json",
                 "scope_query": "backend engineer",
                 "scope_location": "Bengaluru",
@@ -401,8 +483,16 @@ class DomEvidencePackageTests(unittest.TestCase):
             },
             "discovered_count": 2,
             "dispositions": [
-                {"candidate_id": "job-1", "disposition": "QUALIFYING"},
-                {"candidate_id": "job-1", "disposition": "UNKNOWN"},
+                {
+                    "candidate_id": "job-1", "source_scope_id": "scope-1",
+                    "discovery_sequence": 1, "processing_status": "PROCESSED",
+                    "disposition": "QUALIFYING",
+                },
+                {
+                    "candidate_id": "job-1", "source_scope_id": "scope-1",
+                    "discovery_sequence": 2, "processing_status": "PROCESSED",
+                    "disposition": "UNKNOWN",
+                },
             ],
         }
         self.assertFalse(self.validate(fixture).valid)
@@ -411,6 +501,43 @@ class DomEvidencePackageTests(unittest.TestCase):
             "redaction_review": "reviewed",
         }
         self.assertFalse(self.validate(fixture).valid)
+
+    def test_candidate_dispositions_require_consistent_reason_codes(self):
+        fixture = synthetic_package()
+        fixture["artifacts"]["source_run_ledger"] = {
+            "reference": "synthetic/run-ledger.json",
+            "sha256": "b" * 64,
+            "redaction_review": "reviewed",
+        }
+        fixture["candidate_processing"] = {
+            "source_run_ledger": {
+                "run_id": "synthetic-run-1",
+                "scope_id": "scope-1",
+                "reference": "synthetic/run-ledger.json",
+                "scope_query": "backend engineer",
+                "scope_location": "Bengaluru",
+                "basis": "provider_assertion",
+            },
+            "discovered_count": 1,
+            "dispositions": [
+                {
+                    "candidate_id": "job-1", "source_scope_id": "scope-1",
+                    "discovery_sequence": 1, "processing_status": "PROCESSED",
+                    "disposition": "FILTERED",
+                },
+            ],
+        }
+        result = self.validate(fixture)
+        self.assertFalse(result.valid)
+        self.assertTrue(any("reason_code" in issue for issue in result.issues))
+
+        fixture["candidate_processing"]["dispositions"][0]["reason_code"] = "OUTSIDE_TARGET_LOCATION"
+        self.assertTrue(self.validate(fixture).valid)
+
+        fixture["candidate_processing"]["dispositions"][0]["reason_code"] = "PROCESSING_ERROR"
+        result = self.validate(fixture)
+        self.assertFalse(result.valid)
+        self.assertTrue(any("reason_code" in issue for issue in result.issues))
 
     def test_unsafe_references_urls_and_sensitive_text_are_rejected(self):
         changes = (
@@ -533,12 +660,19 @@ class DomEvidencePackageTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
         forbidden = {
-            "job_search", "collection_run_evidence", "offline_search_evidence",
+            "job_search", "offline_search_evidence",
             "route_audit", "easy_apply", "external_app", "playwright",
             "requests", "httpx", "urllib", "socket", "subprocess", "pathlib",
         }
         self.assertTrue(forbidden.isdisjoint(imported), imported & forbidden)
         self.assertIn("datetime", imported)
+        self.assertIn("collection_run_evidence", imported)
+        forbidden_classifier_calls = {"classify_collection_run", "classify_scope_evidence"}
+        invoked_names = {
+            node.func.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertTrue(forbidden_classifier_calls.isdisjoint(invoked_names))
         forbidden_calls = {"open", "read_text", "read_bytes", "write_text", "write_bytes", "urlopen", "Popen"}
         calls = {
             node.func.id for node in ast.walk(tree)
