@@ -4,6 +4,7 @@ from dataclasses import fields
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import job_search
 from search_page_evidence import EvidenceCompletionStatus
@@ -121,8 +122,8 @@ class CollectionEvidencePolicySpecificationTests(unittest.TestCase):
             job_search.CollectionStatus.COMPLETE,
         )
 
-    def test_only_all_processed_qualifying_count_controls_empty_classification(self):
-        empty = complete_single_scope_evidence(
+    def test_zero_candidates_without_empty_state_evidence_remains_unknown(self):
+        ambiguous_empty = complete_single_scope_evidence(
             candidate_count=0,
             processed_candidate_count=0,
             qualifying_job_count=0,
@@ -132,8 +133,8 @@ class CollectionEvidencePolicySpecificationTests(unittest.TestCase):
             filters_applied=True,
         )
         self.assertEqual(
-            job_search.classify_collection_evidence(empty),
-            job_search.CollectionStatus.COMPLETE_EMPTY,
+            job_search.classify_collection_evidence(ambiguous_empty),
+            job_search.CollectionStatus.UNKNOWN,
         )
         self.assertEqual(
             job_search.classify_collection_evidence(filtered_empty),
@@ -175,7 +176,7 @@ class CollectionEvidencePolicySpecificationTests(unittest.TestCase):
             (EvidenceCompletionStatus.UNKNOWN,),
         )
 
-    def test_policy_verified_statuses_use_existing_temp_csv_gate(self):
+    def test_offline_classifier_result_does_not_authorize_csv_publication(self):
         row = {
             "Title": "Synthetic role",
             "Company": "Synthetic company",
@@ -193,8 +194,10 @@ class CollectionEvidencePolicySpecificationTests(unittest.TestCase):
                 complete_single_scope_evidence()
             )
             complete_outcome = job_search.CollectionOutcome(complete_status, (row,))
-            self.assertTrue(job_search.publish_collection(complete_outcome, output))
-            self.assertNotEqual(output.read_bytes(), original)
+            with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+                self.assertFalse(job_search.publish_collection(complete_outcome, output))
+            writer.assert_not_called()
+            self.assertEqual(output.read_bytes(), original)
 
             output.write_bytes(original)
             unknown_status = job_search.classify_collection_evidence(
