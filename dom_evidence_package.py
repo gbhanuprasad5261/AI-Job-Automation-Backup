@@ -12,15 +12,17 @@ from enum import Enum
 from ipaddress import IPv4Address, IPv6Address
 import re
 
-
-class PageEvidenceState(str, Enum):
-    POPULATED_RESULTS_SETTLED = "POPULATED_RESULTS_SETTLED"
-    LEGITIMATE_EMPTY = "LEGITIMATE_EMPTY"
-    LOADING_OR_UNSETTLED = "LOADING_OR_UNSETTLED"
-    AUTHENTICATION_OR_INTERSTITIAL = "AUTHENTICATION_OR_INTERSTITIAL"
-    POPULATED_MORE_PAGINATION = "POPULATED_MORE_PAGINATION"
-    EXHAUSTION_REVIEW_RECORDED = "EXHAUSTION_REVIEW_RECORDED"
-    UNKNOWN = "UNKNOWN"
+from collection_run_evidence import (
+    CandidateDisposition,
+    CandidateProcessingStatus,
+    CandidateReason,
+    PageEvidenceState,
+    PaginationBatchEvidence,
+    PaginationBatchStatus,
+    PaginationEvidence,
+    PaginationObservationState,
+    classify_pagination_evidence,
+)
 
 
 class CompletionStatus(str, Enum):
@@ -50,13 +52,15 @@ _SOURCES = {
 }
 _STATES = {state.value for state in PageEvidenceState}
 _LOADING = {"settled", "loading", "unsettled", "conflicting", "unknown"}
-_PAGINATION = {
-    "more_batches_observed",
-    "terminal_condition_observed",
-    "not_observed",
-    "unknown",
+_PAGINATION = {item.value for item in PaginationObservationState}
+_DISPOSITIONS = {item.value for item in CandidateDisposition}
+_FILTER_REASON_CODES = {
+    CandidateReason.CLOSED_JOB.value,
+    CandidateReason.OUTSIDE_TARGET_LOCATION.value,
+    CandidateReason.NOT_EASY_APPLY.value,
+    CandidateReason.OTHER_FILTER.value,
 }
-_DISPOSITIONS = {"QUALIFYING", "FILTERED", "UNPROCESSED", "UNKNOWN"}
+_PROCESSING_STATUSES = {item.value for item in CandidateProcessingStatus}
 _FREE_TEXT_PATTERNS = (
     re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I),
     re.compile(r"(?<!\w)\+?(?:\d[\s().-]*){10,}(?!\w)"),
@@ -254,13 +258,15 @@ def _validate_candidate_processing(value, requested_scope, artifacts, issues):
     if not _shape(
         ledger,
         "candidate_processing.source_run_ledger",
-        ("run_id", "reference", "scope_query", "scope_location", "basis"),
+        ("run_id", "scope_id", "reference", "scope_query", "scope_location", "basis"),
         (),
         issues,
     ):
         return
     if not isinstance(ledger["run_id"], str) or not _OPAQUE_ID.fullmatch(ledger["run_id"]):
         issues.append("candidate source ledger run_id must be an opaque identifier.")
+    if not isinstance(ledger["scope_id"], str) or not _OPAQUE_ID.fullmatch(ledger["scope_id"]):
+        issues.append("candidate source ledger scope_id must be an opaque identifier.")
     _safe_reference(ledger["reference"], "candidate source ledger reference", issues, required=True)
     _safe_text(ledger["scope_query"], "candidate source ledger scope_query", issues, required=True)
     _safe_text(ledger["scope_location"], "candidate source ledger scope_location", issues, required=True)
@@ -286,22 +292,267 @@ def _validate_candidate_processing(value, requested_scope, artifacts, issues):
     if not isinstance(dispositions, list):
         issues.append("candidate_processing.dispositions must be a list.")
         return
-    ids = []
     for index, item in enumerate(dispositions):
         name = f"candidate_processing.dispositions[{index}]"
-        if not _shape(item, name, ("candidate_id", "disposition"), (), issues):
+        if not _shape(
+            item,
+            name,
+            ("candidate_id", "source_scope_id", "discovery_sequence", "processing_status", "disposition"),
+            ("reason_code", "duplicate_of_sequence"),
+            issues,
+        ):
             continue
         candidate_id = item["candidate_id"]
         if not isinstance(candidate_id, str) or not _OPAQUE_ID.fullmatch(candidate_id):
             issues.append(f"{name}.candidate_id must be a non-empty opaque identifier.")
-        else:
-            ids.append(candidate_id)
-        if not isinstance(item["disposition"], str) or item["disposition"] not in _DISPOSITIONS:
+        if item["source_scope_id"] != ledger.get("scope_id"):
+            issues.append(f"{name}.source_scope_id must match the source ledger scope_id.")
+        sequence = item["discovery_sequence"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            issues.append(f"{name}.discovery_sequence must be a positive integer.")
+        disposition = item["disposition"]
+        processing_status = item["processing_status"]
+        reason_code = item.get("reason_code")
+        duplicate_of = item.get("duplicate_of_sequence")
+        if not isinstance(processing_status, str) or processing_status not in _PROCESSING_STATUSES:
+            issues.append(f"{name}.processing_status is unsupported.")
+        if not isinstance(disposition, str) or disposition not in _DISPOSITIONS:
             issues.append(f"{name}.disposition is unsupported.")
-    if len(ids) != len(set(ids)):
-        issues.append("candidate disposition IDs must be unique within the supplied scope ledger.")
+        elif disposition == "FILTERED":
+            if not isinstance(reason_code, str) or reason_code not in _FILTER_REASON_CODES:
+                issues.append(f"{name}.reason_code must explain the filter disposition.")
+            if processing_status != CandidateProcessingStatus.PROCESSED.value:
+                issues.append(f"{name}.FILTERED disposition requires PROCESSED status.")
+        elif disposition == "UNPROCESSED":
+            if processing_status not in {
+                CandidateProcessingStatus.DISCOVERED.value,
+                CandidateProcessingStatus.PENDING.value,
+            }:
+                issues.append(f"{name}.UNPROCESSED disposition requires pending status.")
+            if reason_code is not None:
+                issues.append(f"{name}.UNPROCESSED disposition cannot claim a processing reason.")
+        elif disposition == "FAILED_PROCESSING":
+            if processing_status != CandidateProcessingStatus.FAILED.value or reason_code != CandidateReason.PROCESSING_ERROR.value:
+                issues.append(f"{name}.FAILED_PROCESSING requires FAILED status and PROCESSING_ERROR reason.")
+        elif disposition == "DUPLICATE":
+            if processing_status != CandidateProcessingStatus.DUPLICATE.value or reason_code != CandidateReason.DUPLICATE_WITHIN_SCOPE.value:
+                issues.append(f"{name}.DUPLICATE requires duplicate status and reason.")
+            if (
+                not isinstance(duplicate_of, int)
+                or isinstance(duplicate_of, bool)
+                or not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or duplicate_of < 1
+                or duplicate_of >= sequence
+            ):
+                issues.append(f"{name}.duplicate_of_sequence must reference an earlier discovery sequence.")
+        elif disposition == "UNKNOWN" and processing_status != CandidateProcessingStatus.UNKNOWN.value:
+            issues.append(f"{name}.UNKNOWN disposition requires UNKNOWN processing status.")
+        elif reason_code is not None:
+            issues.append(f"{name}.reason_code is only valid for filtered, failed, or duplicate candidates.")
+        if processing_status == CandidateProcessingStatus.UNKNOWN.value and disposition != "UNKNOWN":
+            issues.append(f"{name}.UNKNOWN processing status requires UNKNOWN disposition.")
+        if disposition in {"QUALIFYING", "FILTERED"} and processing_status != CandidateProcessingStatus.PROCESSED.value:
+            issues.append(f"{name}.{disposition} disposition requires PROCESSED status.")
+        if disposition not in {"DUPLICATE", "FAILED_PROCESSING"} and duplicate_of is not None:
+            issues.append(f"{name}.duplicate_of_sequence is only valid for DUPLICATE candidates.")
+
+    valid_sequences = [
+        item.get("discovery_sequence") for item in dispositions
+        if isinstance(item, dict)
+        and isinstance(item.get("discovery_sequence"), int)
+        and not isinstance(item.get("discovery_sequence"), bool)
+        and item.get("discovery_sequence") > 0
+    ]
+    if len(valid_sequences) != len(set(valid_sequences)):
+        issues.append("candidate discovery sequences must be unique within the scope ledger.")
+    if sorted(valid_sequences) != list(range(1, len(dispositions) + 1)):
+        issues.append("candidate discovery sequences must be contiguous starting at 1.")
+    by_sequence = {
+        item.get("discovery_sequence"): item for item in dispositions
+        if isinstance(item, dict)
+        and isinstance(item.get("discovery_sequence"), int)
+        and not isinstance(item.get("discovery_sequence"), bool)
+    }
+    first_sequence_by_id = {}
+    for item in dispositions:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = item.get("candidate_id")
+        sequence = item.get("discovery_sequence")
+        if not isinstance(candidate_id, str) or not isinstance(sequence, int) or isinstance(sequence, bool):
+            continue
+        previous = first_sequence_by_id.get(candidate_id)
+        if previous is None:
+            first_sequence_by_id[candidate_id] = sequence
+            if item.get("disposition") == "DUPLICATE":
+                issues.append("the first occurrence of a candidate cannot be marked DUPLICATE.")
+        else:
+            duplicate_of = item.get("duplicate_of_sequence")
+            target = by_sequence.get(duplicate_of) if isinstance(duplicate_of, int) and not isinstance(duplicate_of, bool) else None
+            if (
+                item.get("disposition") != "DUPLICATE"
+                or duplicate_of != previous
+                or not isinstance(target, dict)
+                or target.get("candidate_id") != candidate_id
+            ):
+                issues.append("repeated candidate IDs require an explicit duplicate disposition referencing the first occurrence.")
     if isinstance(count, int) and not isinstance(count, bool) and count != len(dispositions):
         issues.append("discovered_count must equal the number of explicit candidate dispositions.")
+
+
+def _validate_pagination(pagination, artifacts, issues):
+    if not _shape(
+        pagination,
+        "observations.pagination",
+        ("state", "batches", "exhaustion_review", "cap"),
+        (),
+        issues,
+    ):
+        return "unknown", []
+    state = pagination["state"]
+    if not isinstance(state, str) or state not in _PAGINATION:
+        issues.append("pagination.state is unsupported.")
+        state = "unknown"
+    raw_batches = pagination["batches"]
+    if not isinstance(raw_batches, list):
+        issues.append("pagination.batches must be a list.")
+        raw_batches = []
+
+    batches = []
+    model_batches = []
+    for index, batch in enumerate(raw_batches):
+        name = f"observations.pagination.batches[{index}]"
+        if not _shape(
+            batch,
+            name,
+            (
+                "sequence", "status", "observation", "more_indicated",
+                "basis", "evidence_refs", "terminal_evidence_refs",
+            ),
+            (),
+            issues,
+        ):
+            continue
+        sequence = batch["sequence"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            issues.append(f"{name}.sequence must be a positive integer.")
+        status = batch["status"]
+        if not isinstance(status, str) or status not in {item.value for item in PaginationBatchStatus}:
+            issues.append(f"{name}.status is unsupported.")
+            continue
+        _safe_text(batch["observation"], f"{name}.observation", issues, required=True)
+        if not isinstance(batch["basis"], str) or batch["basis"] not in _BASIS:
+            issues.append(f"{name}.basis is unsupported.")
+        _refs(batch["evidence_refs"], f"{name}.evidence_refs", artifacts, issues, required=True)
+        _refs(
+            batch["terminal_evidence_refs"],
+            f"{name}.terminal_evidence_refs",
+            artifacts,
+            issues,
+        )
+        more = batch["more_indicated"]
+        if status == PaginationBatchStatus.OBSERVED.value and not isinstance(more, bool):
+            issues.append(f"{name}.more_indicated must be boolean for an observed batch.")
+        if status == PaginationBatchStatus.FAILED.value:
+            if more is not None:
+                issues.append(f"{name}.more_indicated must be null for a failed batch.")
+            if batch["terminal_evidence_refs"]:
+                issues.append(f"{name} failed batch cannot contain terminal evidence.")
+        if more is True and batch["terminal_evidence_refs"]:
+            issues.append(f"{name} cannot indicate more batches and terminal evidence together.")
+        if more is False and not batch["terminal_evidence_refs"]:
+            # A false indicator without separate terminal evidence is not an
+            # exhaustion observation; it remains structurally visible as unknown.
+            pass
+        if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
+            batches.append((sequence, batch))
+            model_batches.append(
+                PaginationBatchEvidence(
+                    sequence=sequence,
+                    status=PaginationBatchStatus(status),
+                    more_indicated=more,
+                    evidence_refs=tuple(batch["evidence_refs"])
+                    if isinstance(batch["evidence_refs"], list)
+                    and all(isinstance(ref, str) for ref in batch["evidence_refs"])
+                    else (),
+                    terminal_evidence_refs=tuple(batch["terminal_evidence_refs"])
+                    if isinstance(batch["terminal_evidence_refs"], list)
+                    and all(isinstance(ref, str) for ref in batch["terminal_evidence_refs"])
+                    else (),
+                )
+            )
+
+    sequences = [sequence for sequence, _ in batches]
+    if len(sequences) != len(set(sequences)):
+        issues.append("pagination batch sequence values must be unique.")
+    if sequences != sorted(sequences):
+        issues.append("pagination batches must be listed in discovery order.")
+    if sorted(sequences) != list(range(1, len(raw_batches) + 1)):
+        issues.append("pagination batch sequence must be contiguous starting at 1.")
+    ordered_batches = [
+        batch for _, batch in sorted(batches, key=lambda item: item[0])
+    ]
+    for previous, following in zip(ordered_batches, ordered_batches[1:]):
+        if previous.get("status") != PaginationBatchStatus.OBSERVED.value or previous.get("more_indicated") is not True:
+            issues.append("every observed batch before another batch must indicate more results.")
+            break
+
+    review = pagination["exhaustion_review"]
+    if _shape(review, "observations.pagination.exhaustion_review", ("status", "method", "evidence_refs"), (), issues):
+        if not isinstance(review["status"], str) or review["status"] not in {"not_reviewed", "provider_assertion", "review_recorded"}:
+            issues.append("pagination.exhaustion_review.status is unsupported.")
+        if review["method"] is not None:
+            _safe_text(review["method"], "exhaustion_review.method", issues, required=True)
+        _refs(
+            review["evidence_refs"],
+            "exhaustion_review.evidence_refs",
+            artifacts,
+            issues,
+        )
+        if review["status"] == "review_recorded" and (not review["method"] or not review["evidence_refs"]):
+            issues.append("recorded exhaustion review requires a method and evidence reference.")
+
+    cap = pagination["cap"]
+    cap_reached = cap_prevented = None
+    if _shape(cap, "observations.pagination.cap", ("reached", "prevented_exhaustion"), (), issues):
+        cap_reached, cap_prevented = cap["reached"], cap["prevented_exhaustion"]
+        for key, item in (("reached", cap_reached), ("prevented_exhaustion", cap_prevented)):
+            if item is not None and not isinstance(item, bool):
+                issues.append(f"pagination.cap.{key} must be boolean or null.")
+
+    if state == PaginationObservationState.NOT_OBSERVED.value and raw_batches:
+        issues.append("not_observed pagination cannot contain batch records.")
+    if state == PaginationObservationState.MORE_BATCHES_OBSERVED.value:
+        if not ordered_batches or ordered_batches[-1].get("more_indicated") is not True:
+            issues.append("more_batches_observed requires the final batch to indicate another batch.")
+    if state == PaginationObservationState.TERMINAL_CONDITION_OBSERVED.value:
+        if (
+            not ordered_batches
+            or ordered_batches[-1].get("status") != PaginationBatchStatus.OBSERVED.value
+            or ordered_batches[-1].get("more_indicated") is not False
+            or not ordered_batches[-1].get("terminal_evidence_refs")
+        ):
+            issues.append("terminal_condition_observed requires terminal evidence on the final observed batch.")
+        pagination_model_state = classify_pagination_evidence(
+            PaginationEvidence(tuple(model_batches), cap_reached, cap_prevented)
+        )
+        if pagination_model_state.value != "TERMINAL_VERIFIED":
+            issues.append("terminal pagination requires contiguous batches and a safe explicit cap observation.")
+    if state == PaginationObservationState.FAILED_BATCH.value:
+        if not any(item.get("status") == PaginationBatchStatus.FAILED.value for item in ordered_batches):
+            issues.append("failed_batch pagination requires a failed batch record.")
+    if state == PaginationObservationState.UNKNOWN.value and not raw_batches:
+        pass
+    elif state not in {
+        PaginationObservationState.MORE_BATCHES_OBSERVED.value,
+        PaginationObservationState.TERMINAL_CONDITION_OBSERVED.value,
+        PaginationObservationState.FAILED_BATCH.value,
+        PaginationObservationState.NOT_OBSERVED.value,
+        PaginationObservationState.UNKNOWN.value,
+    }:
+        issues.append("pagination state is contradictory.")
+    return state, ordered_batches
 
 
 def validate_dom_evidence_package(package):
@@ -320,8 +571,8 @@ def validate_dom_evidence_package(package):
     )
     if not _shape(package, "package", required, (), issues):
         return PackageValidation(False, PageEvidenceState.UNKNOWN, tuple(issues))
-    if package["schema_version"] != "1.0":
-        issues.append("schema_version must be '1.0'.")
+    if package["schema_version"] != "1.2":
+        issues.append("schema_version must be '1.2'.")
     if package["completion_status"] != CompletionStatus.UNKNOWN.value:
         issues.append("completion_status must remain UNKNOWN.")
     artifacts = _validate_artifacts(package["artifacts"], issues)
@@ -418,7 +669,7 @@ def validate_dom_evidence_package(package):
     if _shape(
         observations,
         "observations",
-        ("sanitized_origin", "dom", "loading", "results", "pagination", "interstitial"),
+        ("sanitized_origin", "dom", "loading", "results", "pagination", "interstitial", "page_error"),
         (),
         issues,
     ):
@@ -465,6 +716,11 @@ def validate_dom_evidence_package(package):
                     issues.append("loading history sequence must be unique and contiguous starting at 1.")
                 if history_states and isinstance(loading["state"], str) and history_states[-1] != loading["state"]:
                     issues.append("loading state conflicts with the final loading-history observation.")
+                if "settled" in history_states and any(
+                    state in {"loading", "unsettled", "conflicting"}
+                    for state in history_states[history_states.index("settled") + 1:]
+                ):
+                    issues.append("a settled observation cannot regress to loading within one capture history.")
         results = observations["results"]
         card_count = None
         empty_observed = None
@@ -482,50 +738,9 @@ def validate_dom_evidence_package(package):
                 if not isinstance(empty["basis"], str) or empty["basis"] not in _BASIS:
                     issues.append("empty_state.basis is unsupported.")
                 _refs(empty["evidence_refs"], "empty_state.evidence_refs", artifacts, issues)
-        pagination = observations["pagination"]
-        pagination_state = "unknown"
-        cap = {}
-        if _shape(pagination, "observations.pagination", ("state", "batches", "exhaustion_review", "cap"), (), issues):
-            pagination_state = pagination["state"]
-            if not isinstance(pagination_state, str) or pagination_state not in _PAGINATION:
-                issues.append("pagination.state is unsupported.")
-            batches = pagination["batches"]
-            if not isinstance(batches, list):
-                issues.append("pagination.batches must be a list.")
-                batches = []
-            seen_sequences = []
-            for index, batch in enumerate(batches):
-                name = f"pagination.batches[{index}]"
-                if _shape(batch, name, ("sequence", "observation", "basis", "evidence_refs"), (), issues):
-                    sequence = batch["sequence"]
-                    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-                        issues.append(f"{name}.sequence must be a positive integer.")
-                    else:
-                        seen_sequences.append(sequence)
-                    _safe_text(batch["observation"], f"{name}.observation", issues, required=True)
-                    if not isinstance(batch["basis"], str) or batch["basis"] not in _BASIS:
-                        issues.append(f"{name}.basis is unsupported.")
-                    _refs(batch["evidence_refs"], f"{name}.evidence_refs", artifacts, issues, required=True)
-            if seen_sequences and sorted(seen_sequences) != list(range(1, len(seen_sequences) + 1)):
-                issues.append("pagination batch sequence must be unique and contiguous starting at 1.")
-            review = pagination["exhaustion_review"]
-            if _shape(review, "pagination.exhaustion_review", ("status", "method", "evidence_refs"), (), issues):
-                if not isinstance(review["status"], str) or review["status"] not in {"not_reviewed", "provider_assertion", "review_recorded"}:
-                    issues.append("pagination.exhaustion_review.status is unsupported.")
-                if review["method"] is not None:
-                    _safe_text(review["method"], "exhaustion_review.method", issues, required=True)
-                _refs(review["evidence_refs"], "exhaustion_review.evidence_refs", artifacts, issues)
-                if review["status"] == "review_recorded" and (not review["method"] or not review["evidence_refs"]):
-                    issues.append("recorded exhaustion review requires a method and evidence reference.")
-            cap = pagination["cap"]
-            if _shape(cap, "pagination.cap", ("reached", "prevented_exhaustion"), (), issues):
-                for key in ("reached", "prevented_exhaustion"):
-                    if cap[key] is not None and not isinstance(cap[key], bool):
-                        issues.append(f"pagination.cap.{key} must be boolean or null.")
-            if pagination_state == "more_batches_observed" and not batches:
-                issues.append("more_batches_observed requires at least one documented batch observation.")
-            if pagination_state == "terminal_condition_observed" and batches:
-                issues.append("terminal pagination conflicts with additional batch observations.")
+        pagination_state, _pagination_batches = _validate_pagination(
+            observations["pagination"], artifacts, issues
+        )
         interstitial = observations["interstitial"]
         interstitial_observed = None
         if _shape(interstitial, "observations.interstitial", ("observed", "kind", "basis", "evidence_refs"), (), issues):
@@ -537,6 +752,15 @@ def validate_dom_evidence_package(package):
             if not isinstance(interstitial["basis"], str) or interstitial["basis"] not in _BASIS:
                 issues.append("interstitial.basis is unsupported.")
             _refs(interstitial["evidence_refs"], "interstitial.evidence_refs", artifacts, issues)
+        page_error = observations["page_error"]
+        if page_error is not None:
+            if _shape(page_error, "observations.page_error", ("kind", "description", "basis", "evidence_refs"), (), issues):
+                if not isinstance(page_error["kind"], str) or page_error["kind"] not in {"navigation", "parsing"}:
+                    issues.append("page_error.kind must be navigation or parsing.")
+                _safe_text(page_error["description"], "page_error.description", issues, required=True)
+                if not isinstance(page_error["basis"], str) or page_error["basis"] != "direct_observation":
+                    issues.append("page_error.basis must be direct_observation.")
+                _refs(page_error["evidence_refs"], "page_error.evidence_refs", artifacts, issues, required=True)
 
         interpretation = package["interpretations"]
         if _shape(interpretation, "interpretations", ("observed_state", "claims"), (), issues):
@@ -614,6 +838,7 @@ def _validate_state_requirements(state, scope, identity, match_status, observati
     results = observations.get("results") if isinstance(observations.get("results"), dict) else {}
     pagination = observations.get("pagination") if isinstance(observations.get("pagination"), dict) else {}
     interstitial = observations.get("interstitial") if isinstance(observations.get("interstitial"), dict) else {}
+    page_error = observations.get("page_error") if isinstance(observations.get("page_error"), dict) else {}
     card_count = results.get("visible_card_count")
     empty = results.get("empty_state") if isinstance(results.get("empty_state"), dict) else {}
     batches = pagination.get("batches") if isinstance(pagination.get("batches"), list) else []
@@ -624,12 +849,13 @@ def _validate_state_requirements(state, scope, identity, match_status, observati
                 issues.append(f"{field} must be recorded as a direct observation.")
             _refs(value.get("evidence_refs"), field, artifacts, issues, required=True)
 
-    if state in {
+    result_states = {
         PageEvidenceState.POPULATED_RESULTS_SETTLED,
         PageEvidenceState.LEGITIMATE_EMPTY,
         PageEvidenceState.POPULATED_MORE_PAGINATION,
         PageEvidenceState.EXHAUSTION_REVIEW_RECORDED,
-    }:
+    }
+    if state in result_states:
         if not isinstance(scope, dict) or not scope.get("query") or not scope.get("location"):
             issues.append("this state requires requested query and location.")
         if match_status != "matched":
@@ -651,46 +877,91 @@ def _validate_state_requirements(state, scope, identity, match_status, observati
         direct_refs(dom, "DOM evidence")
         if interstitial.get("observed") is True:
             issues.append("search-results state conflicts with an observed interstitial.")
+        if page_error:
+            issues.append("search-results state conflicts with a recorded navigation or parsing error.")
 
     if state in {PageEvidenceState.POPULATED_RESULTS_SETTLED, PageEvidenceState.POPULATED_MORE_PAGINATION} and (
         not isinstance(card_count, int) or isinstance(card_count, bool) or card_count <= 0
     ):
         issues.append("populated state requires a positive visible card count.")
     if state == PageEvidenceState.LEGITIMATE_EMPTY:
-        if card_count != 0 or empty.get("observed") is not True:
-            issues.append("legitimate empty requires zero cards and an observed empty state.")
+        if not isinstance(card_count, int) or isinstance(card_count, bool) or card_count != 0 or empty.get("observed") is not True:
+            issues.append("legitimate empty requires zero cards and a positive empty-state observation.")
         direct_refs(empty, "empty-state evidence")
-        if pagination.get("state") == "more_batches_observed":
+        if pagination.get("state") in {
+            PaginationObservationState.MORE_BATCHES_OBSERVED.value,
+            PaginationObservationState.TERMINAL_CONDITION_OBSERVED.value,
+        }:
             issues.append("legitimate empty conflicts with observed additional batches.")
     if state == PageEvidenceState.LOADING_OR_UNSETTLED:
         if loading.get("state") not in {"loading", "unsettled", "conflicting"}:
             issues.append("loading state requires loading, unsettled, or conflicting evidence.")
         direct_refs(loading, "loading evidence")
-    if state == PageEvidenceState.AUTHENTICATION_OR_INTERSTITIAL:
-        if interstitial.get("observed") is not True or not isinstance(interstitial.get("kind"), str) or not interstitial["kind"].strip():
-            issues.append("interstitial state requires an observed, specifically described interstitial.")
+    if state == PageEvidenceState.AUTHENTICATION_REQUIRED:
+        if interstitial.get("observed") is not True or interstitial.get("kind") != "authentication_required":
+            issues.append("authentication state requires a direct authentication-required observation.")
+        direct_refs(interstitial, "interstitial evidence")
+    if state == PageEvidenceState.CHALLENGE_OR_INTERSTITIAL:
+        kind = interstitial.get("kind")
+        if interstitial.get("observed") is not True or not isinstance(kind, str) or kind not in {"challenge", "interstitial"}:
+            issues.append("challenge/interstitial state requires a direct challenge or interstitial observation.")
         direct_refs(interstitial, "interstitial evidence")
     if state == PageEvidenceState.POPULATED_MORE_PAGINATION:
-        if pagination.get("state") != "more_batches_observed" or not batches:
-            issues.append("additional-pagination state requires observed additional batches.")
+        if pagination.get("state") != PaginationObservationState.MORE_BATCHES_OBSERVED.value or not batches:
+            issues.append("additional-pagination state requires an observed batch indicating more results.")
+        elif not isinstance(batches[-1], dict) or batches[-1].get("more_indicated") is not True:
+            issues.append("additional-pagination state conflicts with the final batch observation.")
     if isinstance(card_count, int) and not isinstance(card_count, bool) and card_count > 0 and empty.get("observed") is True:
         issues.append("positive visible-card evidence conflicts with an observed empty state.")
     if state == PageEvidenceState.EXHAUSTION_REVIEW_RECORDED:
         if not isinstance(card_count, int) or isinstance(card_count, bool) or card_count < 0:
             issues.append("exhaustion state requires a non-negative visible card count.")
         review = pagination.get("exhaustion_review") if isinstance(pagination.get("exhaustion_review"), dict) else {}
-        if pagination.get("state") != "terminal_condition_observed" or review.get("status") != "review_recorded":
+        if pagination.get("state") != PaginationObservationState.TERMINAL_CONDITION_OBSERVED.value or review.get("status") != "review_recorded":
             issues.append("exhaustion state requires a terminal observation and recorded independent review.")
+        if (
+            not batches
+            or not isinstance(batches[-1], dict)
+            or batches[-1].get("status") != PaginationBatchStatus.OBSERVED.value
+            or batches[-1].get("more_indicated") is not False
+            or not batches[-1].get("terminal_evidence_refs")
+        ):
+            issues.append("exhaustion requires explicit terminal evidence on the final batch.")
         verification = provenance.get("independent_verification", {}) if isinstance(provenance, dict) else {}
         if not isinstance(verification, dict) or verification.get("status") != "review_recorded":
             issues.append("exhaustion requires a recorded independent-review assertion.")
         reviewed_claims = verification.get("reviewed_claims") if isinstance(verification, dict) else None
         if not isinstance(reviewed_claims, list) or "pagination_exhaustion" not in reviewed_claims:
             issues.append("independent verification must list pagination_exhaustion as a reviewed claim.")
-        if batches:
-            issues.append("exhaustion conflicts with observed additional batches.")
         cap = pagination.get("cap") if isinstance(pagination.get("cap"), dict) else {}
         if not isinstance(cap.get("reached"), bool) or not isinstance(cap.get("prevented_exhaustion"), bool):
             issues.append("exhaustion requires explicit cap and cap-impact observations.")
         elif cap["prevented_exhaustion"] is True or (cap["reached"] is True and cap["prevented_exhaustion"] is not False):
             issues.append("a cap that may have prevented exhaustion conflicts with exhaustion.")
+    if state == PageEvidenceState.PAGINATION_BATCH_FAILED:
+        if pagination.get("state") != PaginationObservationState.FAILED_BATCH.value or not any(
+            isinstance(batch, dict) and batch.get("status") == PaginationBatchStatus.FAILED.value
+            for batch in batches
+        ):
+            issues.append("pagination failure state requires a failed batch record.")
+    if state in {PageEvidenceState.NAVIGATION_ERROR, PageEvidenceState.PARSING_ERROR}:
+        expected_kind = "navigation" if state is PageEvidenceState.NAVIGATION_ERROR else "parsing"
+        if page_error.get("kind") != expected_kind:
+            issues.append(f"{state.value} requires matching page-error evidence.")
+        direct_refs(page_error, "page-error evidence")
+    elif page_error and state not in {
+        PageEvidenceState.UNKNOWN,
+        PageEvidenceState.LOADING_OR_UNSETTLED,
+    }:
+        issues.append("page-error evidence conflicts with the selected page state.")
+    if state in {PageEvidenceState.AUTHENTICATION_REQUIRED, PageEvidenceState.CHALLENGE_OR_INTERSTITIAL}:
+        if card_count not in (None, 0) or empty.get("observed") is True:
+            issues.append("authentication/challenge evidence cannot be interpreted as search results or empty results.")
+    if interstitial.get("observed") is True and state not in {
+        PageEvidenceState.AUTHENTICATION_REQUIRED,
+        PageEvidenceState.CHALLENGE_OR_INTERSTITIAL,
+        PageEvidenceState.UNKNOWN,
+    }:
+        issues.append("an observed interstitial conflicts with the selected page state.")
+    if pagination.get("state") == PaginationObservationState.FAILED_BATCH.value and state is not PageEvidenceState.PAGINATION_BATCH_FAILED:
+        issues.append("a failed pagination batch requires PAGINATION_BATCH_FAILED page state.")
