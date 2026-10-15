@@ -195,6 +195,11 @@ class CollectionRunTests(unittest.TestCase):
         self.assertEqual(diagnostic.extracted_link_count, 1)
         self.assertEqual(diagnostic.scroll_attempts, 3)
         self.assertEqual(diagnostic.collection_outcome, job_search.CollectionStatus.UNKNOWN)
+        self.assertIs(outcome.evidence_status, CollectionStatus.UNKNOWN)
+        self.assertEqual(
+            outcome.run_evidence.requested_scopes[0].scope_id,
+            diagnostic.scope_id,
+        )
 
     def test_missing_navigation_response_data_is_recorded_as_unknown(self):
         outcome = self.run_collector(
@@ -227,6 +232,7 @@ class CollectionRunTests(unittest.TestCase):
             connect_error=RuntimeError("not connected"),
         )
         self.assertEqual(outcome.status, job_search.CollectionStatus.FAILED)
+        self.assertIs(outcome.evidence_status, CollectionStatus.FAILED)
         self.assertEqual(len(outcome.search_diagnostics), 1)
         self.assertFalse(outcome.search_diagnostics[0].search_attempted)
         self.assertEqual(outcome.search_diagnostics[0].scope_sequence, 1)
@@ -366,6 +372,13 @@ class CollectionRunTests(unittest.TestCase):
                 for candidate in diagnostic.candidate_occurrences
             )
         )
+
+    def test_integrated_evidence_cannot_authorize_publication(self):
+        outcome = self.run_collector(FakePage(links=("101",)))
+        self.assertIs(outcome.evidence_status, CollectionStatus.UNKNOWN)
+        with mock.patch.object(job_search, "_write_jobs_csv_atomically") as writer:
+            self.assertFalse(job_search.publish_collection(outcome, "unused.csv"))
+        writer.assert_not_called()
 
     def test_per_search_cap_is_recorded_without_proving_completion(self):
         outcome = self.run_collector(
