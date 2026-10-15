@@ -6,6 +6,14 @@ import re
 import tempfile
 from urllib.parse import quote, urlsplit
 
+from collection_diagnostics_adapter import adapt_collection_outcome
+from collection_run_evidence import (
+    CollectionRunEvidence,
+    CollectionStatus as EvidenceStatus,
+    SearchScope,
+    classify_collection_run,
+)
+
 from playwright.sync_api import sync_playwright
 
 try:
@@ -51,6 +59,8 @@ class CollectionOutcome:
     issues: tuple = ()
     bounded_by_limit: bool = False
     search_diagnostics: tuple = ()
+    run_evidence: CollectionRunEvidence | None = None
+    evidence_status: EvidenceStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -289,23 +299,38 @@ def classify_collection_evidence(evidence):
 
 
 def _collection_outcome(jobs, issues=(), fatal=False, bounded_by_limit=False,
-                         search_diagnostics=()):
-    """Classify only outcomes supported by observed collection evidence."""
+                         search_diagnostics=(), requested_scopes=()):
+    """Build diagnostics and classify conservatively from explicit evidence."""
     if fatal:
-        status = CollectionStatus.FAILED
+        initial_status = CollectionStatus.FAILED
     elif issues:
-        status = CollectionStatus.INCOMPLETE
+        initial_status = CollectionStatus.INCOMPLETE
     else:
-        # Current search pages expose no verified completion or empty-result
-        # signal. A clean navigation and parser pass therefore remains unknown.
-        status = CollectionStatus.UNKNOWN
+        initial_status = CollectionStatus.UNKNOWN
 
-    return CollectionOutcome(
-        status=status,
+    requested_scopes = tuple(requested_scopes)
+    frozen_diagnostics = _freeze_search_diagnostics(
+        search_diagnostics, initial_status
+    )
+    outcome = CollectionOutcome(
+        status=initial_status,
         jobs=tuple(jobs),
         issues=tuple(issues),
         bounded_by_limit=bounded_by_limit,
+        search_diagnostics=frozen_diagnostics,
+    )
+    evidence = adapt_collection_outcome(outcome, requested_scopes)
+    evidence_status = classify_collection_run(evidence)
+    status = CollectionStatus(evidence_status.value)
+
+    return CollectionOutcome(
+        status=status,
+        jobs=outcome.jobs,
+        issues=outcome.issues,
+        bounded_by_limit=outcome.bounded_by_limit,
         search_diagnostics=_freeze_search_diagnostics(search_diagnostics, status),
+        run_evidence=evidence,
+        evidence_status=evidence_status,
     )
 
 
@@ -351,9 +376,10 @@ def _write_jobs_csv_atomically(jobs, output_file):
 def publish_collection(outcome, output_file=OUTPUT_FILE):
     """Keep production publication closed until verified evidence is available.
 
-    No production evidence adapter currently verifies search identity,
-    exhaustion, and candidate accounting. Status values and offline evidence
-    models therefore cannot authorize replacing the published CSV.
+    The diagnostics adapter maps observed counters and candidate dispositions,
+    but cannot verify search identity, settled results, exhaustion, or complete
+    filter accounting. Status values and evidence objects cannot authorize
+    replacing the published CSV.
     """
     if not isinstance(outcome, CollectionOutcome):
         return False
@@ -364,7 +390,8 @@ def publish_collection(outcome, output_file=OUTPUT_FILE):
         return False
 
     # There is deliberately no token or status-only bypass. Keep the atomic
-    # writer isolated until a trusted production evidence adapter exists.
+    # writer isolated until production acquisition can establish every required
+    # completion signal and that evidence path is independently reviewed.
     return False
 
 
@@ -1038,13 +1065,18 @@ def _collect_search_jobs():
     scope_record_by_position = {}
     scope_sequence = 0
     scope_records_by_identity = {}
+    requested_scopes = []
     for keyword_index, keyword in enumerate(keywords, start=1):
         for location_index, location in enumerate(search_locations, start=1):
             scope_sequence += 1
+            scope_id = f"scope-{scope_sequence:04d}"
+            requested_scopes.append(
+                SearchScope(str(keyword), str(location), scope_id)
+            )
             record = {
                 "keyword": str(keyword),
                 "location": str(location),
-                "scope_id": f"scope-{scope_sequence:04d}",
+                "scope_id": scope_id,
                 "scope_sequence": scope_sequence,
                 "duplicate_scope": False,
                 "search_attempted": False,
@@ -1106,7 +1138,8 @@ def _collect_search_jobs():
                 f"Error: {e}"
             )
             return _collection_outcome(
-                [], issues, fatal=True, search_diagnostics=search_diagnostic_records
+                [], issues, fatal=True, search_diagnostics=search_diagnostic_records,
+                requested_scopes=requested_scopes,
             )
 
         if not browser.contexts:
@@ -1115,7 +1148,8 @@ def _collect_search_jobs():
                 "No browser context found."
             )
             return _collection_outcome(
-                [], issues, fatal=True, search_diagnostics=search_diagnostic_records
+                [], issues, fatal=True, search_diagnostics=search_diagnostic_records,
+                requested_scopes=requested_scopes,
             )
 
         context = (
@@ -1498,6 +1532,7 @@ def _collect_search_jobs():
                 issues,
                 bounded_by_limit=bounded_by_limit,
                 search_diagnostics=search_diagnostic_records,
+                requested_scopes=requested_scopes,
             )
             print(f"Collection outcome: {outcome.status.value}")
             print("Existing jobs.csv was preserved.")
@@ -1912,6 +1947,7 @@ def _collect_search_jobs():
             issues,
             bounded_by_limit=bounded_by_limit,
             search_diagnostics=search_diagnostic_records,
+            requested_scopes=requested_scopes,
         )
         published = publish_collection(outcome, OUTPUT_FILE)
 
