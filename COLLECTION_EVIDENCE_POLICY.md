@@ -150,16 +150,19 @@ batch is INCOMPLETE, an unknown cap effect is UNKNOWN, and a cap that may have
 stopped work before terminal evidence is INCOMPLETE. These are consistency
 rules for supplied observations, not validation of any live site's controls.
 
-## Offline diagnostics adapter boundary
+## Production diagnostics adapter boundary
 
 `collection_diagnostics_adapter.py` is a one-way offline transformation into
 the canonical model. It requires the caller to provide the requested scope set;
 it does not reconstruct that set from observed diagnostics. It preserves the
 producer's candidate occurrence order, per-scope candidate IDs, reason codes,
-processing statuses, scope sequence, duplicate links, cap observations, and error counts. A
-missing requested-scope record remains missing and classifies as INCOMPLETE.
-The adapter is not imported by `job_search.py` and does not connect to
-publication.
+processing statuses, scope sequence, duplicate links, cap observations, and
+error counts. `job_search.py` now passes the requested scopes created directly
+from its configured keyword/location pairs and attaches both the canonical
+evidence and its diagnostic classification to `CollectionOutcome`. The
+requested set is created before browser setup, so setup failures and cap-skipped
+scopes remain visible to the model. A missing requested-scope record remains
+missing and classifies as INCOMPLETE.
 
 The collector does not record observed query/location identity, settled
 loading, a verified legitimate-empty state, pagination batches or exhaustion,
@@ -168,8 +171,17 @@ leaves these fields absent. It may not derive them from navigation success,
 fixed waits, visible counts, screenshots, no exceptions, or the `valid` field
 of `dom_evidence_package.PackageValidation`. Candidate accounting alone
 therefore remains UNKNOWN for clean non-duplicate runs; explicit skipped work,
-recorded errors, or a validated cross-scope duplicate remains INCOMPLETE.
-Nothing in the adapter authorizes `COMPLETE`, `COMPLETE_EMPTY`, or publication.
+recorded errors, or a validated cross-scope duplicate remains INCOMPLETE. A
+clean navigation, visible links, and processed candidate details do not fill
+those missing fields. The production outcome uses the canonical diagnostic
+classification, which can conservatively refine a run to INCOMPLETE when its
+recorded diagnostics establish unprocessed scope or candidate work. It cannot
+produce COMPLETE or COMPLETE_EMPTY from the current diagnostics.
+
+`publish_collection()` remains closed and rejects every outcome. The attached
+evidence and classification are diagnostic data only; neither is an
+authorization capability, and no manually constructed status or evidence
+object reaches the atomic writer through the publisher.
 
 `candidate_occurrences` counts every ordered occurrence, including repeated
 selector observations. `candidate_identity_ids` separately preserves the
@@ -180,8 +192,9 @@ against an earlier occurrence in the requested run order. Output-level
 deduplication remains distinct from scope-level disposition and must not erase
 the occurrence ledger.
 
-This is not production integration. Production collection continues to emit
-UNKNOWN for otherwise clean runs and publication remains fail-closed.
+This is limited in-memory diagnostics integration, not page-state evidence
+acquisition or publication integration. Production collection continues to
+emit UNKNOWN for otherwise clean runs and publication remains fail-closed.
 
 The artifact readers' Windows path-containment and replacement-race concerns
 remain a separate unresolved security blocker. The future adapter must not
