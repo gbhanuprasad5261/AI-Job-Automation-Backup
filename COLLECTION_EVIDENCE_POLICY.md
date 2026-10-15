@@ -53,16 +53,17 @@ The offline multi-scope model applies these structural rules:
 - Every candidate must be explicitly QUALIFYING or FILTERED, and the scope
   must affirm that intended filters were applied. UNPROCESSED is INCOMPLETE;
   missing or unknown disposition evidence is UNKNOWN.
+- FILTERED occurrences require one reason code from the shared vocabulary:
+  CLOSED_JOB, OUTSIDE_TARGET_LOCATION, NOT_EASY_APPLY, or OTHER_FILTER.
+  UNPROCESSED may record PROCESSING_ERROR. These codes describe supplied
+  evidence; they do not prove that the filter or processing failure occurred.
 
-`filters_applied` is a scope-level assertion: `True` asserts that the producer
-accounted for all intended filters for that scope; `False` establishes that
-filter work remains and is INCOMPLETE; missing or malformed evidence is
-UNKNOWN. The current model does not name individual filters, verify their
-execution, record which filter caused a candidate to be FILTERED, or represent
-separate contradictory filter observations. `FILTERED` records disposition
-only, not a filter reason. A per-filter or candidate-level audit ledger would
-require a separately defined filter vocabulary and policy; it is not implied
-by this model.
+`filters_applied` remains a scope-level assertion: `True` asserts that the
+producer accounted for all intended filters for that scope; `False` establishes
+that filter work remains and is INCOMPLETE; missing or malformed evidence is
+UNKNOWN. A FILTERED occurrence now carries a reason code, but neither that code
+nor `filters_applied` independently verifies execution or represents separate
+observations for each filter.
 
 An observed cap is not automatically incomplete if exhaustion was
 independently verified before the cap prevented any required work. If the cap
@@ -73,7 +74,10 @@ exhaustion is unknown, classify UNKNOWN.
 
 `job_search.CollectionEvidence` remains an aggregate single-record helper; it
 does not model per-query/location records or a candidate disposition ledger,
-and its classifier is not called by the production collector. The separate
+does not contain an explicit legitimate-empty page observation, and its
+classifier is not called by the production collector. It therefore leaves a
+zero-candidate result UNKNOWN; fully processed candidates that are all filtered
+may still be COMPLETE_EMPTY under the supplied filter assertions. The separate
 `collection_run_evidence.py` module models multi-scope evidence and candidate
 dispositions as an offline policy only. It does not establish that supplied
 assertions are true, inspect pages, or connect to production collection or
@@ -81,9 +85,90 @@ publication. The production collector continues to produce UNKNOWN for clean
 runs because it has no evidence to prove search exhaustion. The offline
 screenshot/metadata validator always returns UNKNOWN.
 
+Production search diagnostics retain selector-level candidate link
+occurrences before per-scope and cross-scope deduplication. Each occurrence
+records its scope-local order, selector, processing state, final disposition,
+and a reason code for filtering or deduplication when observed. These are
+collector diagnostics, not verified completion evidence: overlapping selectors
+can observe the same rendered link more than once, and configured scan caps
+can stop discovery before later links are examined. Candidate-page processing
+continues to leave the collection outcome UNKNOWN or INCOMPLETE as appropriate.
+
+Production publication remains closed because no production adapter verifies
+the required page identity, settled state, exhaustion, and candidate evidence.
+`publish_collection()` rejects all outcomes, including manually constructed
+COMPLETE/COMPLETE_EMPTY statuses and structurally valid offline classifier
+results. No token or status-only bypass authorizes replacement. The atomic
+writer remains isolated behind this fail-closed boundary; no current workflow
+reaches it through `publish_collection()`.
+
 Missing values must remain missing; a fixture label, displayed total,
 screenshot, nonzero link count, fixed wait, or absence of exceptions must never
 manufacture verification.
+
+## Page-state and pagination evidence vocabulary
+
+The shared offline state vocabulary distinguishes
+`POPULATED_RESULTS_SETTLED`, `LEGITIMATE_EMPTY`, `LOADING_OR_UNSETTLED`,
+`AUTHENTICATION_REQUIRED`, `CHALLENGE_OR_INTERSTITIAL`, `NAVIGATION_ERROR`,
+`PARSING_ERROR`, `PAGINATION_BATCH_FAILED`, `POPULATED_MORE_PAGINATION`,
+`EXHAUSTION_REVIEW_RECORDED`, and `UNKNOWN`. A non-unknown state requires its
+state-specific observations and evidence references in the DOM package
+validator. A label remains a supplied interpretation; structural validation
+does not verify the referenced bytes or prove the page actually had that
+state. Settled search states require directly referenced query/location
+observations, a matching assertion, settled loading history, and a sanitized
+DOM-artifact reference. Empty additionally requires zero visible cards and a
+directly referenced empty-state observation. Authentication and challenge
+states require a distinct interstitial kind and cannot be interpreted as empty
+search results. Navigation and parsing errors require matching direct error
+observations. Missing or conflicting evidence is rejected or left UNKNOWN.
+An exhausted scope with zero discovered candidates must be explicitly classified
+as `LEGITIMATE_EMPTY`; an exhaustion-review record alone cannot establish an
+empty result.
+
+The offline pagination contract requires unique, contiguous one-based batch
+sequences. Every earlier observed batch must say that another batch is
+indicated; the final batch must either indicate more (INCOMPLETE) or carry an
+explicit terminal evidence reference. A terminal claim also requires a
+recorded independent-review assertion and explicit cap-impact fields. A failed
+batch is INCOMPLETE, an unknown cap effect is UNKNOWN, and a cap that may have
+stopped work before terminal evidence is INCOMPLETE. These are consistency
+rules for supplied observations, not validation of any live site's controls.
+
+## Future production adapter contract (not implemented)
+
+A future adapter must consume collector-native observations per requested
+scope and preserve the run sequence, requested keyword/location, observed
+keyword/location with evidence references, identity-match state, loading
+state, page interpretation, pagination/batch observations, cap impact,
+candidate occurrences, dispositions/reason codes, and unresolved errors.
+Every requested scope must have a record, including scopes not attempted after
+a cap or fatal setup failure. Candidate IDs are scoped occurrences; output
+deduplication must not erase occurrences in other scopes.
+
+The adapter must map absent or unsupported observations to UNKNOWN and may not
+derive identity, settled state, empty results, exhaustion, or candidate
+accounting from navigation success, fixed waits, visible counts, screenshots,
+no exceptions, or the `valid` field of `dom_evidence_package.PackageValidation`.
+That validator checks package structure only and remains disconnected from
+publication. No production adapter currently supplies the required verified
+site observations, so production collection continues to emit UNKNOWN for
+otherwise clean runs and publication remains fail-closed.
+
+The artifact readers' Windows path-containment and replacement-race concerns
+remain a separate unresolved security blocker. The future adapter must not
+read evidence artifacts through those readers until a supported Windows
+security contract and platform tests have been reviewed.
+
+Required specialist acceptance must define a trusted root, document the
+supported Windows versions and filesystems, and demonstrate root-relative
+handle opening that rejects intermediate and final reparse traversal. The
+specialist must address symbolic links, junctions, mount points and other
+reparse tags; same-handle identity/type/size checks; bounded reads and hashing;
+replacement and growth races; access denial; and fail-closed behavior. Tests
+must include real Windows filesystem coverage for reparse and race semantics;
+mocked tests alone cannot establish kernel or filesystem guarantees.
 
 No production collector, classifier, publisher, browser, CDP, network, or
 application workflow is connected by this specification.
