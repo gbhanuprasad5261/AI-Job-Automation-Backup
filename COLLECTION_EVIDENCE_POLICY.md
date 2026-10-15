@@ -108,8 +108,9 @@ can observe the same rendered link more than once, and configured scan caps
 can stop discovery before later links are examined. Candidate-page processing
 continues to leave the collection outcome UNKNOWN or INCOMPLETE as appropriate.
 
-Production publication remains closed because no production adapter verifies
-the required page identity, settled state, exhaustion, and candidate evidence.
+Production publication remains closed because the production diagnostics
+adapter cannot verify the required page identity, settled state, exhaustion,
+and complete filter evidence.
 `publish_collection()` rejects all outcomes, including manually constructed
 COMPLETE/COMPLETE_EMPTY statuses and structurally valid offline classifier
 results. No token or status-only bypass authorizes replacement. The atomic
@@ -149,6 +150,25 @@ recorded independent-review assertion and explicit cap-impact fields. A failed
 batch is INCOMPLETE, an unknown cap effect is UNKNOWN, and a cap that may have
 stopped work before terminal evidence is INCOMPLETE. These are consistency
 rules for supplied observations, not validation of any live site's controls.
+
+## Production evidence availability
+
+| Requirement | Evidence currently recorded | Availability classification | Boundary |
+| --- | --- | --- | --- |
+| Requested versus observed query/location identity | Requested keyword/location and scope ID are recorded; only final URL origin is recorded from the page | REQUIRES INDEPENDENT SITE-SPECIFIC VALIDATION | The page's observed query/location is not captured or compared. |
+| Settled result state | `DOMContentLoaded` navigation and fixed waits | NOT ESTABLISHED | Neither is a result-settled signal. |
+| Legitimate empty results | Extracted-link count can be zero | REQUIRES INDEPENDENT SITE-SPECIFIC VALIDATION | Zero links cannot distinguish empty results from loading, parser failure, interstitial, or unsupported structure. |
+| Authentication/interstitial/challenge state | A URL substring check for `login` exists; navigation failures are counted | REQUIRES INDEPENDENT SITE-SPECIFIC VALIDATION | The diagnostic record does not identify page state, and no challenge/interstitial evidence is captured. |
+| Pagination continuation and terminal state | Scroll attempts/failures and per-search extracted links | NOT ESTABLISHED | No batch sequence, continuation observation, or terminal observation is recorded. |
+| Cap impact | Per-search/global cap flags, skipped scopes, and scope attempt flags | AVAILABLE FROM CURRENT PRODUCTION DIAGNOSTICS | Cap activation and skipped requested scopes are observable; whether a cap interrupted verified exhaustion is not. |
+| Candidate occurrence accounting | Ordered recognized candidate occurrences, duplicate links, and processing dispositions | AVAILABLE FROM CURRENT PRODUCTION DIAGNOSTICS | The ledger is limited to links recognized by existing selectors; parse errors and caps remain explicit unresolved evidence. |
+| Filter and processing dispositions | Candidate processing status, disposition, and reason code; unresolved errors | NOT ESTABLISHED | Per-candidate outcomes are recorded, but there is no scope-level proof that every intended filter ran successfully. |
+| Unresolved errors | Navigation, selector/parser, scroll, candidate-page counters, and run issue list | AVAILABLE FROM CURRENT PRODUCTION DIAGNOSTICS | Any positive recorded error prevents a successful classification; counts remain diagnostic and can overlap. |
+| Scope/run provenance | Ordered requested scopes and matching diagnostic scope IDs | AVAILABLE FROM CURRENT PRODUCTION DIAGNOSTICS | No durable run identifier, capture timestamp, or code revision is recorded; request identity is not observed page identity. |
+
+The adapter/classifier integration below exposes these recorded facts and
+leaves missing observations absent. No item in this matrix supplies
+independent site-specific completion evidence.
 
 ## Production diagnostics adapter boundary
 
