@@ -548,6 +548,18 @@ class CollectionRunAggregationTests(unittest.TestCase):
         self.assertEqual(classify_collection_run(duplicate_request), CollectionStatus.UNKNOWN)
         self.assertEqual(classify_collection_run(duplicate_observation), CollectionStatus.UNKNOWN)
 
+    def test_malformed_scope_records_are_unknown_without_raising(self):
+        present = complete_scope()
+        for malformed_scope in (None, object(), SearchScope("", "", "")):
+            with self.subTest(malformed_scope=type(malformed_scope).__name__):
+                malformed = ScopeEvidence(scope=malformed_scope)
+                run = complete_run(
+                    present,
+                    malformed,
+                    requested_scopes=(present.scope,),
+                )
+                self.assertEqual(classify_collection_run(run), CollectionStatus.UNKNOWN)
+
     def test_unexpected_scope_is_unknown(self):
         requested = SearchScope("engineer", "remote", "scope:engineer:remote")
         requested_evidence = complete_scope("engineer", "remote")
@@ -557,6 +569,24 @@ class CollectionRunAggregationTests(unittest.TestCase):
             unexpected,
             requested_scopes=(requested,),
         )
+        self.assertEqual(classify_collection_run(run), CollectionStatus.UNKNOWN)
+
+    def test_observed_keyword_and_location_must_match_requested_scope(self):
+        requested = SearchScope("engineer", "remote", "scope:shared")
+        evidence = complete_scope("developer", "Bengaluru")
+        substituted_scope = replace(evidence.scope, scope_id=requested.scope_id)
+        candidates = tuple(
+            replace(candidate, source_scope_id=requested.scope_id)
+            for candidate in evidence.candidates
+        )
+        evidence = replace(
+            evidence,
+            scope=substituted_scope,
+            observed_scope=substituted_scope,
+            candidates=candidates,
+        )
+
+        run = complete_run(evidence, requested_scopes=(requested,))
         self.assertEqual(classify_collection_run(run), CollectionStatus.UNKNOWN)
 
     def test_successful_scope_never_overrides_incomplete_or_unknown_scope(self):
@@ -594,6 +624,23 @@ class CollectionRunAggregationTests(unittest.TestCase):
             ),
             CollectionStatus.FAILED,
         )
+
+    def test_navigation_failure_precedes_missing_requested_scope(self):
+        failed_scope = SearchScope("engineer", "remote", "scope:engineer:remote")
+        missing_scope = SearchScope("developer", "Bengaluru", "scope:developer:bengaluru")
+        navigation_failure = ScopeEvidence(
+            scope=failed_scope,
+            page_state=PageEvidenceState.NAVIGATION_ERROR,
+        )
+        run = CollectionRunEvidence(
+            requested_scopes=(failed_scope, missing_scope),
+            scopes=(navigation_failure,),
+            fatal_failure=False,
+            unresolved_error_count=0,
+        )
+
+        self.assertEqual(classify_scope_evidence(navigation_failure), CollectionStatus.FAILED)
+        self.assertEqual(classify_collection_run(run), CollectionStatus.FAILED)
 
     def test_malformed_run_fatal_flag_cannot_produce_complete(self):
         scope = complete_scope()
