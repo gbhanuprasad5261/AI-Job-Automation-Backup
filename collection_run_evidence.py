@@ -564,7 +564,11 @@ def classify_collection_run(evidence):
 
     scope_records = evidence.scopes if isinstance(evidence.scopes, tuple) else ()
     if any(
-        isinstance(scope, ScopeEvidence) and scope.fatal_failure is True
+        isinstance(scope, ScopeEvidence)
+        and (
+            scope.fatal_failure is True
+            or scope.page_state is PageEvidenceState.NAVIGATION_ERROR
+        )
         for scope in scope_records
     ):
         return CollectionStatus.FAILED
@@ -613,12 +617,22 @@ def classify_collection_run(evidence):
         not isinstance(scope, ScopeEvidence) for scope in evidence.scopes
     ):
         return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
+    if any(not _valid_scope(scope.scope) for scope in evidence.scopes):
+        return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
 
     observed_scopes = [scope.scope for scope in evidence.scopes if _valid_scope(scope.scope)]
     observed_ids = [scope.scope_id for scope in observed_scopes]
     if len(observed_ids) != len(set(observed_ids)):
         return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
     if any(scope_id not in {item.scope_id for item in requested} for scope_id in observed_ids):
+        return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
+
+    requested_by_id = {scope.scope_id: scope for scope in requested}
+    if any(
+        _scope_identity(scope)
+        != _scope_identity(requested_by_id[scope.scope_id])
+        for scope in observed_scopes
+    ):
         return CollectionStatus.INCOMPLETE if known_incomplete else CollectionStatus.UNKNOWN
 
     requested_positions = {
