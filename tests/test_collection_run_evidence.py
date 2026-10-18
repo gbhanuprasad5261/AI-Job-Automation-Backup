@@ -188,6 +188,22 @@ class PaginationEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(classify_pagination_evidence(conflict), PaginationState.UNKNOWN)
 
+    def test_nonterminal_batch_cannot_include_terminal_evidence(self):
+        evidence = PaginationEvidence(
+            (
+                self.batch(1, True, terminal=("contradictory-terminal",)),
+                self.batch(2, False, terminal=("terminal",)),
+            ),
+            cap_reached=False,
+            cap_prevented_exhaustion=False,
+        )
+
+        self.assertEqual(classify_pagination_evidence(evidence), PaginationState.UNKNOWN)
+        self.assertEqual(
+            classify_scope_evidence(replace(complete_scope(), pagination=evidence)),
+            CollectionStatus.UNKNOWN,
+        )
+
 
 class ScopeClassificationTests(unittest.TestCase):
     def test_complete_populated_and_complete_empty(self):
