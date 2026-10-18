@@ -222,6 +222,8 @@ def classify_pagination_evidence(evidence):
             for ref in batch.terminal_evidence_refs
         ):
             return PaginationState.UNKNOWN
+        if batch.more_indicated and batch.terminal_evidence_refs:
+            return PaginationState.UNKNOWN
 
     if len(sequences) != len(set(sequences)):
         return PaginationState.UNKNOWN
