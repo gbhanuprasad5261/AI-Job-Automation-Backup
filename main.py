@@ -1,4 +1,10 @@
-from config import LINKEDIN_EMAIL, LINKEDIN_PASSWORD
+"""Safe placeholder entry point; no credentials or workflows are exposed."""
 
-print("Email:", LINKEDIN_EMAIL)
-print("Password:", "*" * len(LINKEDIN_PASSWORD))
+
+def main():
+    """Keep this legacy entry point inert instead of displaying secrets."""
+    return None
+
+
+if __name__ == "__main__":
+    main()
