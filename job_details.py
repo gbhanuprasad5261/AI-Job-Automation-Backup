@@ -5,12 +5,50 @@ import re
 
 from playwright.sync_api import sync_playwright
 from config import CHROME_CDP_URL
+from output_files import write_replaced_output
 
 
 INPUT_FILE = "jobs.csv"
 OUTPUT_FILE = "data/job_details.csv"
 DIAGNOSTICS_FILE = "data/job_details_diagnostics.json"
 SDUI_DESCRIPTION_WAIT_MS = 2000
+
+
+def _write_extraction_outputs(results, diagnostics):
+    """Replace each completed extraction output after its serialization."""
+    fieldnames = [
+        "Title",
+        "Company",
+        "Location",
+        "Experience",
+        "Easy Apply",
+        "Skills",
+        "Link",
+        "Description",
+    ]
+
+    for job in results:
+        job["Description"] = (
+            job.get("Description", "")
+            .replace("\r", " ")
+            .replace("\n", " ")
+            .strip()
+        )
+
+    def write_csv(file):
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_ALL,
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    def write_diagnostics(file):
+        json.dump(diagnostics, file, ensure_ascii=False, indent=2)
+
+    write_replaced_output(OUTPUT_FILE, write_csv, newline="")
+    write_replaced_output(DIAGNOSTICS_FILE, write_diagnostics)
 
 
 def extract_text(page, selectors):
@@ -539,21 +577,34 @@ def extract_job_details():
         print(f"{INPUT_FILE} not found.")
         return
 
-    os.makedirs("data", exist_ok=True)
-
     with open(
         INPUT_FILE,
         "r",
         encoding="utf-8"
     ) as file:
-        reader = csv.DictReader(file)
+        reader = csv.DictReader(file, strict=True)
+        required_fields = {"Title", "Company", "Location", "Easy Apply", "Link"}
+        missing_fields = required_fields - set(reader.fieldnames or ())
+        if missing_fields:
+            raise ValueError(
+                "Malformed jobs input; missing required columns: "
+                + ", ".join(sorted(missing_fields))
+            )
         jobs = list(reader)
+
+    for row_number, job in enumerate(jobs, start=2):
+        if None in job or any(value is None for value in job.values()):
+            raise ValueError(
+                f"Malformed jobs input; row {row_number} has an inconsistent field count."
+            )
 
     print(f"Found {len(jobs)} jobs in {INPUT_FILE}")
 
     if not jobs:
         print("No jobs found.")
         return
+
+    os.makedirs("data", exist_ok=True)
 
     results = []
     description_diagnostics = []
@@ -688,46 +739,7 @@ def extract_job_details():
                     "Description": ""
                 })
 
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "Title",
-                "Company",
-                "Location",
-                "Experience",
-                "Easy Apply",
-                "Skills",
-                "Link",
-                "Description"
-            ],
-            quoting=csv.QUOTE_ALL
-        )
-
-        writer.writeheader()
-
-        for job in results:
-            job["Description"] = (
-                job.get("Description", "")
-                .replace("\r", " ")
-                .replace("\n", " ")
-                .strip()
-            )
-
-            writer.writerow(job)
-
-    with open(
-        DIAGNOSTICS_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-        json.dump(description_diagnostics, file, ensure_ascii=False, indent=2)
+    _write_extraction_outputs(results, description_diagnostics)
 
     descriptions_found = sum(
         1
