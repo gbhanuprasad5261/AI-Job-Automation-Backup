@@ -328,8 +328,7 @@ def calculate_priority(score):
 def analyze_jobs():
 
     if not os.path.exists(INPUT_FILE):
-        print(f"{INPUT_FILE} not found.")
-        return
+        raise FileNotFoundError(f"{INPUT_FILE} not found.")
 
     # ------------------------------------------------------------
     # Load job details

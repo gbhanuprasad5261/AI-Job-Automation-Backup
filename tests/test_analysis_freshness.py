@@ -69,7 +69,7 @@ class AnalysisFreshnessTests(unittest.TestCase):
         headers=None,
         getmtime_side_effect=None,
     ):
-        if rows:
+        if rows is not None:
             self.rows.update(rows)
         self._write_all()
         if headers:
@@ -118,6 +118,26 @@ class AnalysisFreshnessTests(unittest.TestCase):
             self._select(mtimes={"jobs": 100, "details": 100, "analysis": 100}),
             [self.JOB],
         )
+
+    def test_empty_source_does_not_make_preserved_outputs_selectable(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            result = self._select(
+                mtimes={"jobs": 100, "details": 100, "analysis": 100},
+                rows={"jobs": []},
+            )
+        self.assertEqual(result, [])
+        self.assertIn("no job rows were found", output.getvalue())
+
+    def test_empty_details_do_not_make_preserved_analysis_selectable(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            result = self._select(
+                mtimes={"jobs": 100, "details": 100, "analysis": 100},
+                rows={"details": []},
+            )
+        self.assertEqual(result, [])
+        self.assertIn("no job rows were found", output.getvalue())
 
     def test_jobs_older_than_details_allows_consistent_selection(self):
         self.assertEqual(

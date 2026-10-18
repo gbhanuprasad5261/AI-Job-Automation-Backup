@@ -4,7 +4,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import job_analyzer
 import job_details
@@ -235,6 +236,90 @@ class CsvOutputDurabilityTests(unittest.TestCase):
                         )
         finally:
             os.chdir(previous_cwd)
+
+    def test_partial_extraction_writes_partial_rows_without_run_status(self):
+        input_path = self.root / "jobs.csv"
+        csv_path = self.root / "details.csv"
+        diagnostics_path = self.root / "diagnostics.json"
+        input_path.write_text(
+            "Title,Company,Location,Easy Apply,Link\n"
+            "No Link,Example,Bengaluru,Yes,\n"
+            "Fails During Navigation,Example,Bengaluru,Yes,https://example.test/job\n",
+            encoding="utf-8",
+        )
+
+        page = MagicMock()
+        page.goto.side_effect = RuntimeError("simulated navigation failure")
+        context = SimpleNamespace(pages=[page], new_page=lambda: page)
+        browser = SimpleNamespace(contexts=[context])
+        chromium = SimpleNamespace(connect_over_cdp=lambda _url: browser)
+        playwright_context = SimpleNamespace(chromium=chromium)
+        playwright_manager = MagicMock()
+        playwright_manager.__enter__.return_value = playwright_context
+
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with (
+                patch.object(job_details, "INPUT_FILE", str(input_path)),
+                patch.object(job_details, "OUTPUT_FILE", str(csv_path)),
+                patch.object(job_details, "DIAGNOSTICS_FILE", str(diagnostics_path)),
+                patch.object(job_details, "sync_playwright", return_value=playwright_manager),
+            ):
+                job_details.extract_job_details()
+        finally:
+            os.chdir(previous_cwd)
+
+        with csv_path.open(encoding="utf-8", newline="") as file:
+            rows = list(csv.DictReader(file))
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Title"], "Fails During Navigation")
+        self.assertEqual(rows[0]["Description"], "")
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("simulated navigation failure", diagnostics[0]["error"])
+        self.assertNotIsInstance(diagnostics, dict)
+
+    def test_extraction_failure_before_output_writes_preserves_previous_pair(self):
+        input_path = self.root / "jobs.csv"
+        csv_path = self.root / "details.csv"
+        diagnostics_path = self.root / "diagnostics.json"
+        input_path.write_text(
+            "Title,Company,Location,Easy Apply,Link\n"
+            "Backend Engineer,Example,Bengaluru,Yes,https://example.test/job\n",
+            encoding="utf-8",
+        )
+        previous_csv = b"previous details\n"
+        previous_diagnostics = "previous diagnostics"
+        csv_path.write_bytes(previous_csv)
+        diagnostics_path.write_text(previous_diagnostics, encoding="utf-8")
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with (
+                patch.object(job_details, "INPUT_FILE", str(input_path)),
+                patch.object(job_details, "OUTPUT_FILE", str(csv_path)),
+                patch.object(job_details, "DIAGNOSTICS_FILE", str(diagnostics_path)),
+                patch.object(
+                    job_details,
+                    "sync_playwright",
+                    side_effect=RuntimeError("simulated extraction startup failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "simulated extraction startup failure",
+                ):
+                    job_details.extract_job_details()
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(csv_path.read_bytes(), previous_csv)
+        self.assertEqual(
+            diagnostics_path.read_text(encoding="utf-8"),
+            previous_diagnostics,
+        )
 
     def test_analyzer_transformation_failure_preserves_previous_analysis(self):
         input_path = self.root / "job_details.csv"

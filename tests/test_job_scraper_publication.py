@@ -81,13 +81,16 @@ class FakePlaywright:
 
 class StandaloneScraperPublicationTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory(
-            dir=Path(__file__).resolve().parents[1]
-        )
+        self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.output = Path(self.temp_dir.name) / "jobs.csv"
         self.original = b"existing jobs must remain unchanged\r\n"
         self.output.write_bytes(self.original)
+
+    def test_fixture_directory_is_outside_project_tree(self):
+        project_root = Path(__file__).resolve().parents[1]
+        fixture_dir = Path(self.temp_dir.name).resolve()
+        self.assertFalse(fixture_dir.is_relative_to(project_root))
 
     def run_scraper(self, page, connect_error=None):
         playwright = FakePlaywright(page, connect_error=connect_error)

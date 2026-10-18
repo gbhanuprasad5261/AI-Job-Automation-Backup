@@ -574,8 +574,7 @@ def extract_description(page, diagnostics=None):
 
 def extract_job_details():
     if not os.path.exists(INPUT_FILE):
-        print(f"{INPUT_FILE} not found.")
-        return
+        raise FileNotFoundError(f"{INPUT_FILE} not found.")
 
     with open(
         INPUT_FILE,
