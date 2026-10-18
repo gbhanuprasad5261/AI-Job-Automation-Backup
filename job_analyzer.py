@@ -4,6 +4,7 @@ import re
 
 import config
 from skill_matcher import match_resume
+from output_files import write_replaced_output
 from profile import PROFILE
 
 
@@ -330,8 +331,6 @@ def analyze_jobs():
         print(f"{INPUT_FILE} not found.")
         return
 
-    os.makedirs("data", exist_ok=True)
-
     # ------------------------------------------------------------
     # Load job details
     # ------------------------------------------------------------
@@ -342,12 +341,29 @@ def analyze_jobs():
         encoding="utf-8",
     ) as file:
 
-        reader = csv.DictReader(file)
+        reader = csv.DictReader(file, strict=True)
+        required_fields = {
+            "Title", "Company", "Location", "Easy Apply", "Link", "Description",
+        }
+        missing_fields = required_fields - set(reader.fieldnames or ())
+        if missing_fields:
+            raise ValueError(
+                "Malformed details input; missing required columns: "
+                + ", ".join(sorted(missing_fields))
+            )
         jobs = list(reader)
+
+    for row_number, job in enumerate(jobs, start=2):
+        if None in job or any(value is None for value in job.values()):
+            raise ValueError(
+                f"Malformed details input; row {row_number} has an inconsistent field count."
+            )
 
     if not jobs:
         print("No jobs found.")
         return
+
+    os.makedirs("data", exist_ok=True)
 
     analyzed_jobs = []
 
@@ -570,13 +586,7 @@ def analyze_jobs():
         "Link",
     ]
 
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-
+    def write_analysis(file):
         writer = csv.DictWriter(
             file,
             fieldnames=fieldnames,
@@ -588,6 +598,8 @@ def analyze_jobs():
         for job in analyzed_jobs:
 
             writer.writerow(job)
+
+    write_replaced_output(OUTPUT_FILE, write_analysis, newline="")
 
     # ============================================================
     # TOP RECOMMENDATIONS
