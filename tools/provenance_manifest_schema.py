@@ -416,7 +416,8 @@ def validate_manifest(manifest: Any) -> SchemaValidationResult:
         if input_generation is not None and source is not None:
             _check_source_reference(source, input_generation)
         _validate_previous(manifest["previous_generation"], stage, manifest["run_id"], source["sha256"] if source else None, findings)
-        findings.extend(_proposal_findings(manifest, source, accounting, occurrences))
+        if dependencies:
+            findings.append("POLICY_DEPENDENCIES_UNRESOLVED")
         findings.append("D6_D7_FAILED_DIAGNOSTIC_POLICY_OPEN")
         return SchemaValidationResult(True, False, "NOT_AUTHORIZED", OPEN_DECISIONS, tuple(sorted(dependencies)), tuple(sorted(set(findings))))
 
