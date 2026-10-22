@@ -342,11 +342,10 @@ class ProvenanceSchemaDifferentialTests(unittest.TestCase):
             occurrences=None, outputs={}, failure={"code": "SOURCE_INVALID"})
         failed_verifier = (_encoded(fm), {}, fm, failed_verifier[3], failed_verifier[4])
         failed_schema_result = _evaluate_schema(failed_schema)
-        # A failed run must never be accepted. Preserve ERROR as its own
-        # observation: current schema v2 raises NameError in its FAILED path.
-        self.assertIn(failed_schema_result["outcome"], {"REJECT", "ERROR"})
-        if failed_schema_result["outcome"] == "ERROR":
-            self.assertEqual(failed_schema_result["raw"]["exception"], "NameError")
+        # Schema validity is distinct from selection or publication authority.
+        self.assertEqual(failed_schema_result["outcome"], "ACCEPT")
+        self.assertEqual(failed_schema_result["raw"]["authorization"], "NOT_AUTHORIZED")
+        self.assertFalse(failed_schema_result["raw"]["policy_resolved"])
         self.assertEqual(_evaluate_store(failed_store)["outcome"], "ACCEPT")
         failed_result = _evaluate_verifier(failed_verifier)
         self.assertEqual(failed_result["outcome"], "REJECT")
