@@ -63,6 +63,10 @@ ALLOWED_MODULES = frozenset({
     "test_job_details_extraction",
     "test_job_scraper_publication",
     "test_offline_pipeline_demo",
+    "test_offline_provenance_verifier",
+    "test_offline_generation_contract_integration",
+    "test_provenance_manifest_schema",
+    "test_provenance_schema_differential",
     "test_pipeline_generation_store",
     "test_skill_matcher",
 })
@@ -545,3 +549,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
