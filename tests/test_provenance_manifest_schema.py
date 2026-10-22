@@ -174,6 +174,12 @@ def _analysis_manifest(*, details_data=b"details row\\n", details_rows=1,
     return value
 
 
+def _failed_details_manifest():
+    value = _details_manifest(status="FAILED", source_rows=1, processed=0, skipped=0, failed=1)
+    value["failure"] = {"code": "DETAILS_STAGE_FAILED"}
+    return value
+
+
 class CanonicalManifestSchemaTests(unittest.TestCase):
     def test_valid_synthetic_source_is_schema_valid_but_never_authorized(self):
         result = schema.validate_manifest(_source_manifest())
@@ -318,6 +324,89 @@ class CanonicalManifestSchemaTests(unittest.TestCase):
         all_skipped = _details_manifest(source_rows=1, processed=0, skipped=1, failed=0)
         result = schema.validate_manifest(all_skipped)
         self.assertIn("D6_ALL_SKIPPED_COMPLETE_POLICY_OPEN", result.unresolved_findings)
+
+    def test_failed_manifest_validates_deliberately_without_authorizing_use(self):
+        value = _failed_details_manifest()
+        result = schema.validate_manifest(value)
+        self.assertTrue(result.schema_valid)
+        self.assertFalse(result.policy_resolved)
+        self.assertEqual(result.authorization, "NOT_AUTHORIZED")
+        self.assertIn("D6_D7_FAILED_DIAGNOSTIC_POLICY_OPEN", result.unresolved_findings)
+
+    def test_failed_manifest_rejects_missing_malformed_and_contradictory_metadata(self):
+        value = _failed_details_manifest()
+        value["failure"] = None
+        self._assert_code(value, "OUTCOME_CONTRADICTION")
+
+        value = _failed_details_manifest()
+        value["failure"] = {"code": "not-a-code"}
+        self._assert_code(value, "FAILURE_INVALID")
+
+        value = _failed_details_manifest()
+        value["failure"] = {"code": "DETAILS_STAGE_FAILED", "detail": "unexpected"}
+        self._assert_code(value, "FIELD_SET_INVALID")
+
+        value = _failed_details_manifest()
+        value["outputs"] = {
+            "details_csv": _output("details_csv", b"unexpected output", 1),
+            "diagnostics_json": _output("diagnostics_json", b"[]", 0),
+        }
+        self._assert_code(value, "OUTCOME_CONTRADICTION")
+
+        value = _failed_details_manifest()
+        value["status"] = "COMPLETE"
+        self._assert_code(value, "OUTCOME_CONTRADICTION")
+
+    def test_failed_manifest_rejects_missing_required_fields_and_bad_parent_reference(self):
+        value = _failed_details_manifest()
+        del value["failure"]["code"]
+        self._assert_code(value, "FIELD_SET_INVALID")
+
+        value = _failed_details_manifest()
+        value["input_generation"]["run_id"] = "not-a-uuid"
+        self._assert_code(value, "IDENTIFIER_INVALID")
+
+    def test_failed_parent_reference_shape_does_not_verify_parent_manifest_bytes(self):
+        value = _failed_details_manifest()
+        # The schema API receives only this reference, not the parent manifest bytes.
+        value["input_generation"]["manifest_sha256"] = "f" * 64
+        result = schema.validate_manifest(value)
+        self.assertTrue(result.schema_valid)
+        self.assertEqual(result.authorization, "NOT_AUTHORIZED")
+
+    def test_failed_previous_generation_shape_does_not_authenticate_rollback(self):
+        value = _failed_details_manifest()
+        value["previous_generation"] = {
+            "stage": "job_details",
+            "run_id": RUN_PRIOR,
+            "status": "COMPLETE",
+            "manifest_sha256": "a" * 64,
+            "source_sha256": value["source"]["sha256"],
+        }
+        result = schema.validate_manifest(value)
+        self.assertTrue(result.schema_valid)
+        self.assertEqual(result.authorization, "NOT_AUTHORIZED")
+
+        invalid = copy.deepcopy(value)
+        del invalid["previous_generation"]["manifest_sha256"]
+        self._assert_code(invalid, "FIELD_SET_INVALID")
+        invalid = copy.deepcopy(value)
+        invalid["previous_generation"]["status"] = "FAILED"
+        self._assert_code(invalid, "PREVIOUS_GENERATION_INVALID")
+
+    def test_failed_validation_is_deterministic_and_malformed_inputs_fail_deliberately(self):
+        valid = _failed_details_manifest()
+        results = [schema.validate_manifest(copy.deepcopy(valid)) for _ in range(3)]
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+
+        malformed_inputs = (None, [], {}, {"schema_version": 2, "stage": []})
+        for malformed in malformed_inputs:
+            with self.subTest(malformed=malformed), self.assertRaises(schema.SchemaValidationError) as first:
+                schema.validate_manifest(malformed)
+            with self.subTest(malformed_again=malformed), self.assertRaises(schema.SchemaValidationError) as second:
+                schema.validate_manifest(malformed)
+            self.assertEqual((first.exception.code, str(first.exception)), (second.exception.code, str(second.exception)))
 
     def test_diagnostics_must_reference_declared_roles_and_occurrences(self):
         value = _details_manifest()
