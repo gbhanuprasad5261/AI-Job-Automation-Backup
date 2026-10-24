@@ -5,6 +5,7 @@ import re
 
 from playwright.sync_api import sync_playwright
 from config import CHROME_CDP_URL
+from csv_contracts import missing_required_columns
 from output_files import write_replaced_output
 
 
@@ -583,7 +584,7 @@ def extract_job_details():
     ) as file:
         reader = csv.DictReader(file, strict=True)
         required_fields = {"Title", "Company", "Location", "Easy Apply", "Link"}
-        missing_fields = required_fields - set(reader.fieldnames or ())
+        missing_fields = missing_required_columns(reader.fieldnames, required_fields)
         if missing_fields:
             raise ValueError(
                 "Malformed jobs input; missing required columns: "

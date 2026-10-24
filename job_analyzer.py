@@ -3,6 +3,7 @@ import os
 import re
 
 import config
+from csv_contracts import missing_required_columns
 from skill_matcher import match_resume
 from output_files import write_replaced_output
 from profile import PROFILE
@@ -344,7 +345,7 @@ def analyze_jobs():
         required_fields = {
             "Title", "Company", "Location", "Easy Apply", "Link", "Description",
         }
-        missing_fields = required_fields - set(reader.fieldnames or ())
+        missing_fields = missing_required_columns(reader.fieldnames, required_fields)
         if missing_fields:
             raise ValueError(
                 "Malformed details input; missing required columns: "
