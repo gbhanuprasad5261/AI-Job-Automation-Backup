@@ -17,6 +17,31 @@ from execution_policy import DRY_RUN_SKIPPED_BROWSER, EXECUTION_POLICY
 
 
 class OfflinePipelineDemoTests(unittest.TestCase):
+    def test_dry_run_policy_maps_saved_hints_without_live_route_confirmation(self):
+        cases = (
+            ({"Easy Apply": " YES ", "Link": "https://example.test/easy"}, "LinkedIn Easy Apply", "https://example.test/easy"),
+            ({"Easy Apply": "0", "URL": "https://example.test/external"}, "External application candidate", "https://example.test/external"),
+            ({"Easy Apply": "unknown"}, None, ""),
+        )
+        with patch.object(config, "DRY_RUN", True):
+            for job, expected_route, expected_url in cases:
+                with self.subTest(job=job):
+                    decision = EXECUTION_POLICY.dry_run_result(job)
+                    self.assertEqual(decision["status"], DRY_RUN_SKIPPED_BROWSER)
+                    self.assertEqual(decision["route_hint"], expected_route)
+                    self.assertEqual(decision["job_url"], expected_url)
+                    self.assertEqual(decision["live_route_confirmed"], False)
+                    self.assertEqual(EXECUTION_POLICY.dry_run_result(job), decision)
+            self.assertFalse(EXECUTION_POLICY.allows_browser_actions())
+            self.assertFalse(EXECUTION_POLICY.allows_persistence())
+            self.assertFalse(EXECUTION_POLICY.allows_diagnostic_artifacts())
+
+        with patch.object(config, "DRY_RUN", False):
+            self.assertFalse(EXECUTION_POLICY.dry_run)
+            self.assertTrue(EXECUTION_POLICY.allows_browser_actions())
+            self.assertTrue(EXECUTION_POLICY.allows_persistence())
+            self.assertTrue(EXECUTION_POLICY.allows_diagnostic_artifacts())
+
     def test_normalized_fixture_flows_through_analysis_selection_dry_run_and_isolated_tracker(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
