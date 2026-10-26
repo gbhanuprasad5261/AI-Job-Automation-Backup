@@ -45,6 +45,16 @@ class BoundedOfflineRunnerTests(unittest.TestCase):
         status, _ = runner.classify_module_result(exit_code=1, timed_out=False, summary=summary)
         self.assertEqual(status, "FAIL")
 
+    def test_complete_zero_test_summary_is_a_failure(self):
+        summary = runner.parse_unittest_summary("", "Ran 0 tests in 0.000s\n\nOK\n")
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["tests_run"], 0)
+        status, reasons = runner.classify_module_result(
+            exit_code=0, timed_out=False, summary=summary
+        )
+        self.assertEqual(status, "FAIL")
+        self.assertEqual(reasons, ["no tests were discovered"])
+
     def test_exit_without_final_summary_is_incomplete(self):
         summary = runner.parse_unittest_summary("test_one ... ok\n", "")
         self.assertFalse(summary["complete"])
@@ -52,6 +62,38 @@ class BoundedOfflineRunnerTests(unittest.TestCase):
             runner.classify_module_result(exit_code=0, timed_out=False, summary=summary)[0],
             "INCOMPLETE",
         )
+
+    def test_subprocess_start_failure_is_a_reported_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = runner.execute_command(
+                ["missing-python-executable"],
+                cwd=root,
+                timeout_seconds=1,
+                stdout_path=root / "stdout.bin",
+                stderr_path=root / "stderr.bin",
+                popen_factory=Mock(side_effect=FileNotFoundError("synthetic executable missing")),
+            )
+
+        self.assertFalse(result["started"])
+        self.assertIn("synthetic executable missing", result["start_error"])
+        summary = runner.parse_unittest_summary("", "")
+        status, reasons = runner.classify_module_result(
+            exit_code=result["exit_code"],
+            timed_out=result["timed_out"],
+            summary=summary,
+            start_error=result["start_error"],
+        )
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("could not start" in reason for reason in reasons))
+
+    def test_nonzero_process_exit_overrides_an_ok_unittest_summary(self):
+        summary = runner.parse_unittest_summary("", "Ran 2 tests in 0.010s\n\nOK\n")
+        status, reasons = runner.classify_module_result(
+            exit_code=7, timed_out=False, summary=summary
+        )
+        self.assertEqual(status, "FAIL")
+        self.assertIn("process exited with code 7", reasons)
 
     def test_timeout_values_must_be_positive_and_finite(self):
         for value in (0, -1, "nan", "inf", "invalid"):
@@ -231,6 +273,50 @@ class BoundedOfflineRunnerTests(unittest.TestCase):
                 report["runner_source_sha256"],
                 __import__("hashlib").sha256(Path(runner.__file__).read_bytes()).hexdigest(),
             )
+            self.assertTrue(Path(report["report_file"]).is_file())
+
+    def test_timeout_and_termination_details_are_preserved_in_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            tests = project / "tests"
+            tests.mkdir(parents=True)
+            (tests / "test_bounded_offline_runner.py").write_text("", encoding="utf-8")
+            termination = {
+                "succeeded": False,
+                "method": "synthetic terminator",
+                "detail": "synthetic child remained alive",
+            }
+
+            def timed_out_executor(command, *, stdout_path, stderr_path, **_kwargs):
+                stdout_path.write_bytes(b"partial output\n")
+                stderr_path.write_bytes(b"partial error\n")
+                return {
+                    "started": True,
+                    "exit_code": None,
+                    "timed_out": True,
+                    "timeout_status": "per_module_timeout",
+                    "termination": termination,
+                    "start_error": None,
+                    "elapsed_seconds": 1.0,
+                    "not_started_reason": None,
+                }
+
+            report = runner.run_modules(
+                ["test_bounded_offline_runner"],
+                python_executable=sys.executable,
+                timeout_seconds=1,
+                report_root=base / "reports",
+                project_root=project,
+                executor=timed_out_executor,
+            )
+            module = report["modules"][0]
+            self.assertEqual(module["status"], "TIMED_OUT")
+            self.assertEqual(module["timeout_status"], "per_module_timeout")
+            self.assertEqual(module["termination"], termination)
+            self.assertEqual(module["stdout_excerpt"], "partial output")
+            self.assertEqual(module["stderr_excerpt"], "partial error")
+            self.assertEqual(report["overall_status"], "INCOMPLETE")
             self.assertTrue(Path(report["report_file"]).is_file())
 
     def test_aggregate_counts_failed_and_errored_modules(self):
