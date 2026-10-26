@@ -192,6 +192,64 @@ class ManifestContractCompatibilityTests(unittest.TestCase):
         self.assertEqual(result["failure_code"], "UNEXPECTED_VALIDATION_EXCEPTION")
         self.assertFalse(result["accepted"])
 
+    def test_manifest_envelope_errors_are_stable_and_fail_closed(self):
+        cases = (
+            ("wrong_bytes_type", {"manifest": _v2_source(), "manifest_bytes": "not bytes"}, "MANIFEST_BYTES_INVALID"),
+            ("invalid_utf8", {"manifest_bytes": b"\xff"}, "MANIFEST_JSON_INVALID"),
+            ("malformed_json", {"manifest_bytes": b"{"}, "MANIFEST_JSON_INVALID"),
+            ("non_finite_json_number", {"manifest_bytes": b'{"schema_version":NaN}'}, "MANIFEST_JSON_INVALID"),
+            ("duplicate_json_key", {"manifest_bytes": b'{"schema_version":2,"schema_version":2}'}, "DUPLICATE_JSON_KEY"),
+            ("non_object_json", {"manifest_bytes": b"[]"}, "MANIFEST_ENVELOPE_INVALID"),
+        )
+        for label, arguments, expected_code in cases:
+            with self.subTest(case=label):
+                first = compat.validate_for_component(target="schema_v2", source_schema_version=2, **arguments)
+                second = compat.validate_for_component(target="schema_v2", source_schema_version=2, **arguments)
+                self.assertEqual(first, second)
+                self.assertEqual(first["failure_code"], expected_code)
+                self.assertFalse(first["accepted"])
+                self.assertFalse(first["eligible"])
+                self.assertEqual(first["authorization"], "NOT_AUTHORIZED")
+
+    def test_manifest_object_and_exact_bytes_must_agree(self):
+        manifest = _v2_source()
+        supplied = copy.deepcopy(manifest)
+        supplied["stage"] = "job_details"
+        result = compat.validate_for_component(
+            manifest, target="schema_v2", source_schema_version=2,
+            manifest_bytes=_encode(supplied),
+        )
+        self.assertEqual(result["failure_code"], "MANIFEST_BYTES_DISAGREE")
+        self.assertFalse(result["accepted"])
+
+    def test_empty_and_incorrectly_typed_values_reach_deterministic_contract_errors(self):
+        cases = (
+            ("empty_run_id", lambda value: value.update(run_id=""), "IDENTIFIER_INVALID"),
+            ("empty_stage", lambda value: value.update(stage=""), "STAGE_INVALID"),
+            ("empty_producer_id", lambda value: value["producer"].update(id=""), "FIELD_TYPE_INVALID"),
+            ("producer_wrong_shape", lambda value: value.update(producer=[]), "FIELD_SET_INVALID"),
+            ("empty_status", lambda value: value.update(status=""), "STATUS_UNSUPPORTED"),
+        )
+        for label, mutate, expected_code in cases:
+            with self.subTest(case=label):
+                manifest = _v2_source()
+                mutate(manifest)
+                first = compat.validate_for_component(manifest, target="schema_v2", source_schema_version=2)
+                second = compat.validate_for_component(copy.deepcopy(manifest), target="schema_v2", source_schema_version=2)
+                self.assertEqual(first, second)
+                self.assertEqual(first["failure_code"], expected_code)
+                self.assertFalse(first["accepted"])
+                self.assertEqual(first["authorization"], "NOT_AUTHORIZED")
+
+    def test_verifier_rejects_absent_exact_native_manifest_bytes(self):
+        result = compat.validate_for_component(
+            json.loads(_verifier_v1_empty_source()[0]),
+            target="offline_verifier_v1", source_schema_version=1,
+            artifacts_by_role={"jobs_csv": SOURCE_DATA}, expected_stage="source",
+        )
+        self.assertEqual(result["failure_code"], "MANIFEST_BYTES_REQUIRED")
+        self.assertFalse(result["accepted"])
+
     def test_results_are_deterministic(self):
         manifest = _v2_source()
         first = compat.validate_for_component(manifest, target="schema_v2", source_schema_version=2)
