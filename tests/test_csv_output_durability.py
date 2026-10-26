@@ -34,6 +34,18 @@ class CsvOutputDurabilityTests(unittest.TestCase):
         self.assertEqual(destination.read_text(encoding="utf-8"), "header\nnew row\n")
         self.assertEqual(self._temporary_files(destination), [])
 
+    def test_repeated_replacements_leave_only_the_latest_complete_output(self):
+        destination = self.root / "output.csv"
+        destination.write_text("original\n", encoding="utf-8")
+
+        for contents in ("first replacement\n", "second replacement\n"):
+            output_files.write_replaced_output(
+                destination, lambda file, value=contents: file.write(value)
+            )
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "second replacement\n")
+        self.assertEqual(self._temporary_files(destination), [])
+
     def test_serialization_failure_preserves_existing_destination_and_cleans_temp(self):
         destination = self.root / "output.csv"
         destination.write_text("previous valid contents\n", encoding="utf-8")
@@ -58,6 +70,23 @@ class CsvOutputDurabilityTests(unittest.TestCase):
 
         self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
         self.assertEqual(self._temporary_files(destination), [])
+
+    def test_temporary_cleanup_failure_does_not_mask_serialization_error(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        def fail_after_partial_write(file):
+            file.write("partial contents\n")
+            raise ValueError("original serialization failure")
+
+        with patch.object(output_files.os, "remove", side_effect=OSError("cleanup denied")):
+            with self.assertRaisesRegex(ValueError, "original serialization failure"):
+                output_files.write_replaced_output(destination, fail_after_partial_write)
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        leftovers = self._temporary_files(destination)
+        self.assertEqual(len(leftovers), 1)
+        leftovers[0].unlink()
 
     def test_temporary_file_creation_failure_preserves_existing_destination(self):
         destination = self.root / "output.csv"
