@@ -342,6 +342,67 @@ class OfflineGenerationLifecycleTests(unittest.TestCase):
         self.assertEqual(result["stages"]["manifest_schema_v2"]["exception_type"], "RuntimeError")
         self.assertEqual(result["aggregate_outcome"], "ERROR")
 
+    def test_unknown_occurrence_disposition_rejects_inconsistent_lifecycle_state(self):
+        source_bytes = (lifecycle.JOB_HEADER + "".join(RECORDS)).encode("utf-8")
+        source = lifecycle._source_manifest(source_bytes, len(RECORDS), "COMPLETE")
+        manifest, _ = lifecycle._details_manifest(
+            source, source_bytes, "PARTIAL", ["PROCESSED", "FAILED"]
+        )
+        occurrences = copy.deepcopy(manifest["occurrences"])
+        occurrences[1]["disposition"] = "RETRY"
+        result = lifecycle.run_offline_lifecycle(
+            RECORDS,
+            status="PARTIAL",
+            dispositions=["PROCESSED", "FAILED"],
+            manifest_overrides={"occurrences": occurrences},
+        )
+        self.assertEqual(
+            result["stages"]["manifest_schema_v2"]["failure_code"],
+            "OCCURRENCE_DISPOSITION_INVALID",
+        )
+        self.assertEqual(result["aggregate_outcome"], "REJECTED")
+        self.assertFalse(result["production_selection_authorized"])
+        self.assertFalse(result["publication_authorized"])
+
+    def test_duplicate_source_rows_remain_distinct_ordinal_occurrences(self):
+        duplicate_rows = [RECORDS[0], RECORDS[0]]
+        result = lifecycle.run_offline_lifecycle(duplicate_rows, status="COMPLETE")
+        self.assertEqual(result["source_record_count"], 2)
+        self.assertEqual(result["declared_accounting"]["source_occurrences"], 2)
+        self.assertEqual(result["declared_accounting"]["processed_occurrences"], 2)
+        self.assertEqual(result["stages"]["manifest_schema_v2"]["outcome"], "VALID")
+        self.assertIs(result["production_selection_authorized"], False)
+
+    def test_duplicate_occurrence_identifier_is_rejected_in_synthetic_state(self):
+        source_bytes = (lifecycle.JOB_HEADER + "".join(RECORDS)).encode("utf-8")
+        source = lifecycle._source_manifest(source_bytes, len(RECORDS), "COMPLETE")
+        manifest, _ = lifecycle._details_manifest(
+            source, source_bytes, "COMPLETE", ["PROCESSED"] * len(RECORDS)
+        )
+        occurrences = copy.deepcopy(manifest["occurrences"])
+        occurrences[1]["occurrence_key"] = occurrences[0]["occurrence_key"]
+        result = lifecycle.run_offline_lifecycle(
+            RECORDS, status="COMPLETE", manifest_overrides={"occurrences": occurrences}
+        )
+        self.assertEqual(
+            result["stages"]["manifest_schema_v2"]["failure_code"],
+            "OCCURRENCE_ACCOUNTING_INVALID",
+        )
+        self.assertEqual(result["aggregate_outcome"], "REJECTED")
+        self.assertIs(result["publication_authorized"], False)
+
+    def test_repeated_interruption_then_failure_and_recovery_do_not_share_state(self):
+        interrupted_one = lifecycle.run_offline_lifecycle(RECORDS, status="IN_PROGRESS")
+        interrupted_two = lifecycle.run_offline_lifecycle(RECORDS, status="IN_PROGRESS")
+        failed = lifecycle.run_offline_lifecycle(RECORDS, status="FAILED")
+        recovered = lifecycle.run_offline_lifecycle(RECORDS, status="COMPLETE")
+        self.assertEqual(interrupted_one, interrupted_two)
+        self.assertEqual(interrupted_one["aggregate_outcome"], "INCOMPLETE")
+        self.assertEqual(failed["aggregate_outcome"], "FAILED_NOT_AUTHORIZED")
+        self.assertEqual(recovered["aggregate_outcome"], "NATIVE_CONTRACTS_VALIDATED_CROSS_VERSION_INCOMPATIBLE")
+        self.assertIsNone(recovered["stages"]["synthetic_manifest_state"]["previous_generation"])
+        self.assertIs(recovered["publication_authorized"], False)
+
     def test_repeated_execution_is_deterministic(self):
         first = lifecycle.run_offline_lifecycle(RECORDS, status="PARTIAL", dispositions=["PROCESSED", "FAILED"])
         second = lifecycle.run_offline_lifecycle(RECORDS, status="PARTIAL", dispositions=["PROCESSED", "FAILED"])
