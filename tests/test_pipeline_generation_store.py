@@ -434,6 +434,24 @@ class PipelineGenerationStoreTests(unittest.TestCase):
         with self.assertRaises(store.GenerationValidationError):
             store.parse_manifest(b"\xff")
 
+    def test_manifest_serialization_is_deterministic_and_does_not_mutate_input(self):
+        manifest, _ = self._details_manifest()
+        original = copy.deepcopy(manifest)
+
+        first = store.serialize_manifest(manifest)
+        second = store.serialize_manifest(copy.deepcopy(manifest))
+
+        self.assertEqual(first, second)
+        self.assertEqual(manifest, original)
+        self.assertEqual(store.parse_manifest(first), original)
+
+    def test_fingerprint_rejects_non_bytes_without_coercion(self):
+        for value in ("payload", bytearray(b"payload"), memoryview(b"payload"), None):
+            with self.subTest(value_type=type(value).__name__), self.assertRaisesRegex(
+                TypeError, "data must be bytes"
+            ):
+                store.fingerprint_bytes(value)
+
     def test_exact_byte_fingerprint_and_parse_input_contract(self):
         payload = b'{"value":"original"}'
         fingerprint = store.fingerprint_bytes(payload)
