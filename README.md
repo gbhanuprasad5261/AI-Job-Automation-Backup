@@ -30,3 +30,26 @@ Reports go to a unique run directory under the system temporary directory at `ai
 Module status is `PASS` only when the process exits zero, unittest emits a complete final summary, and at least one test was discovered. A nonzero exit, reported failure/error, or zero discovered tests is `FAIL`. A timeout, missing/incomplete summary, or module not reached by the overall deadline is `INCOMPLETE` (timed-out modules are identified separately). Skipped tests are counted; they do not count as passed. Overall status cannot be `PASS` if any module failed, timed out, lacked a complete summary, or was not completed.
 
 On timeout, inspect that module's preserved output and termination result before deciding whether to rerun it. Windows first sends Ctrl-Break to the dedicated process group and falls back to `taskkill` scoped to the launched PID and its tree; POSIX uses a dedicated process group. A termination failure is explicitly reported and must be investigated before another run. This runner is a test-isolation aid, not a security boundary; it does not authorize live workflows or Windows filesystem adversarial tests.
+
+## Engineering backlog (updated 2026-10-26)
+
+### Completed and verified
+
+- Extended `tests/test_csv_contracts.py` with isolated header and Link cases covering empty, duplicate, missing, extra, and reordered headers; HTTP/HTTPS values; missing, whitespace, non-string, malformed, relative, invalid-port, and hostname-edge inputs; deterministic reason codes; and an assertion that importing the contract helpers does not load configuration or browser modules. No network requests are made.
+- Reviewed `job_details.py` and `job_analyzer.py`. Their module imports include Playwright and configuration/profile dependencies; the pure CSV contract stays in `csv_contracts.py`. The Link validator remains a standalone helper and has no production call-site integration.
+- Expanded manifest compatibility cases for malformed byte envelopes, duplicate JSON keys, invalid UTF-8/JSON, object/byte disagreement, empty and incorrectly typed fields, missing verifier bytes, incompatible versions, fail-closed results, and deterministic errors.
+- Expanded lifecycle coverage for duplicate input rows as distinct ordinal occurrences, duplicate occurrence identifiers, repeated interruption, failure followed by recovery, and non-inheriting state. No persistent transition engine or uniqueness rule for logical identity is defined by this synthetic lifecycle.
+- Added runner-report tests for timeout category, failed termination detail, partial logs, subprocess startup failures, nonzero exits despite an `OK` unittest summary, and zero-test runs. The runner source and allowlist remain unchanged.
+- Added strict malformed-header parsing, non-bytes fingerprint rejection, temp-cleanup-error preservation, repeated atomic output replacement, deterministic manifest serialization, and direct dry-run policy edge cases.
+- Lifecycle tests cover unsupported dispositions with consistent accounting, duplicate occurrence identifiers, repeated interruption, and failure/recovery. The lifecycle has no persistent transition engine; no transition policy was inferred.
+- Focused modules: `test_csv_contracts` **20**, `test_manifest_contract_compat` **16**, `test_offline_generation_lifecycle` **29**, `test_bounded_offline_runner` **17**, `test_pipeline_generation_store` **31**, `test_csv_output_durability` **21**, and `test_offline_pipeline_demo` **2** passed (**136 total**). Bounded offline allowlist: **32 modules, 565 passed, 0 failed, 0 errors, 0 skipped, 0 timed out, 0 incomplete**. Run report: `C:\Users\gbhan\Documents\Codex\phase118-full-reports\20261026T173657183281Z-5fc1d15feea84f93b2b59b646626a489\summary.json`.
+
+### Open blockers and boundaries
+
+- D1–D13 remain unresolved; production generation integration remains **NO-GO**. The Phase 66 security rejection remains in force.
+- This work verifies pure helper and synthetic offline behavior only. It does not validate live URLs, Windows filesystem security, trusted-root containment, crash durability, or production workflow behavior.
+- Link validator production integration, publication changes, workflow-runner configuration changes, and application submission remain outside the approved scope.
+
+### Next recommended task
+
+Obtain the required owner decisions for D1–D13 and the independent specialist resolution for the storage/security boundary. Only after those gates are documented should a separately authorized integration proposal be prepared; do not treat these helper tests as approval to integrate or publish.
