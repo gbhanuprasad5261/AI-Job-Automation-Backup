@@ -180,6 +180,13 @@ class PipelineGenerationStoreTests(unittest.TestCase):
 
         self.assertEqual(stage_path.read_text(encoding="utf-8"), "existing non-directory content")
 
+    def test_stage_creation_filesystem_error_propagates_without_generation(self):
+        with patch.object(Path, "mkdir", side_effect=PermissionError("synthetic stage denied")):
+            with self.assertRaisesRegex(PermissionError, "synthetic stage denied"):
+                store.create_generation(self.root, "job_details", self.RUN_ID)
+
+        self.assertEqual(list(self.root.iterdir()), [])
+
     def test_generated_generation_ids_are_unique_across_repeated_calls(self):
         first = store.create_generation(self.root, "job_details")
         second = store.create_generation(self.root, "job_details")
@@ -456,6 +463,16 @@ class PipelineGenerationStoreTests(unittest.TestCase):
             store.parse_manifest(b'{"schema_version":1,"schema_version":1}')
         with self.assertRaises(store.GenerationValidationError):
             store.parse_manifest(b"\xff")
+
+    def test_strict_json_rejects_non_object_manifest_roots_deterministically(self):
+        for payload in (b"null", b"[]", b"\"manifest\"", b"7"):
+            with self.subTest(payload=payload):
+                messages = []
+                for _ in range(2):
+                    with self.assertRaises(store.GenerationValidationError) as caught:
+                        store.parse_manifest(payload)
+                    messages.append(str(caught.exception))
+                self.assertEqual(messages, ["manifest must be an object"] * 2)
 
     def test_manifest_serialization_is_deterministic_and_does_not_mutate_input(self):
         manifest, _ = self._details_manifest()
