@@ -151,6 +151,9 @@ class PipelineGenerationStoreTests(unittest.TestCase):
             "7c9d5c21-66eb-1ee7-84b8-2523d3bbf1d2",
             self.RUN_ID.upper(),
             "00000000-0000-0000-0000-000000000000",
+            None,
+            123,
+            b"7c9d5c21-66eb-4ee7-84b8-2523d3bbf1d2",
         )
         for run_id in invalid:
             with self.subTest(run_id=run_id), self.assertRaises(store.GenerationValidationError):
@@ -167,6 +170,26 @@ class PipelineGenerationStoreTests(unittest.TestCase):
             store.create_generation(self.root / "missing", "job_details", self.PRIOR_ID)
         with self.assertRaises(store.GenerationValidationError):
             store.create_generation(self.root, "job_details", "")
+
+    def test_stage_path_file_conflict_fails_without_overwriting_it(self):
+        stage_path = self.root / "job_details"
+        stage_path.write_text("existing non-directory content", encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            store.create_generation(self.root, "job_details", self.RUN_ID)
+
+        self.assertEqual(stage_path.read_text(encoding="utf-8"), "existing non-directory content")
+
+    def test_generated_generation_ids_are_unique_across_repeated_calls(self):
+        first = store.create_generation(self.root, "job_details")
+        second = store.create_generation(self.root, "job_details")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parent, second.parent)
+        self.assertEqual(store.validate_run_id(first.name), first.name)
+        self.assertEqual(store.validate_run_id(second.name), second.name)
+        self.assertTrue(first.is_dir())
+        self.assertTrue(second.is_dir())
 
     def test_invalid_stage_is_rejected_for_generation_creation(self):
         with self.assertRaises(store.GenerationValidationError):
@@ -562,6 +585,47 @@ class PipelineGenerationStoreTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(store.GenerationValidationError, "does not match"):
             store.validate_pointer(pointer, manifest=manifest, current_source_sha256="c" * 64)
+
+    def test_explicit_rollback_rejects_incomplete_or_invalid_recovery_metadata(self):
+        manifest, _ = self._details_manifest(run_id=self.PRIOR_ID)
+        failed_manifest, _ = self._details_manifest(status="FAILED")
+        valid_pointer = {
+            "schema_version": 1,
+            "stage": "job_details",
+            "latest_attempt": {"run_id": self.RUN_ID, "status": "FAILED"},
+            "selected_generation_id": self.PRIOR_ID,
+            "previous_complete_generation_id": self.PRIOR_ID,
+            "selection_mode": "EXPLICIT_ROLLBACK",
+            "recovery_event": {
+                "authorized_by": "owner",
+                "authorization_ref": "approval-123",
+                "at": self.COMPLETED,
+                "reason": "restore prior generation",
+                "source_sha256": manifest["source"]["sha256"],
+            },
+        }
+        invalid_events = []
+        missing_field = copy.deepcopy(valid_pointer)
+        del missing_field["recovery_event"]["authorization_ref"]
+        invalid_events.append(("missing_field", missing_field))
+        blank_reason = copy.deepcopy(valid_pointer)
+        blank_reason["recovery_event"]["reason"] = "  "
+        invalid_events.append(("blank_reason", blank_reason))
+        malformed_time = copy.deepcopy(valid_pointer)
+        malformed_time["recovery_event"]["at"] = "2026-10-18T12:01:00+00:00"
+        invalid_events.append(("malformed_time", malformed_time))
+        malformed_fingerprint = copy.deepcopy(valid_pointer)
+        malformed_fingerprint["recovery_event"]["source_sha256"] = "g" * 64
+        invalid_events.append(("malformed_fingerprint", malformed_fingerprint))
+
+        for label, pointer in invalid_events:
+            with self.subTest(case=label), self.assertRaises(store.GenerationValidationError):
+                store.validate_pointer(
+                    pointer,
+                    manifest=manifest,
+                    current_source_sha256=manifest["source"]["sha256"],
+                    latest_attempt_manifest=failed_manifest,
+                )
 
 
 if __name__ == "__main__":
