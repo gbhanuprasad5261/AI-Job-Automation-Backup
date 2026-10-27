@@ -96,6 +96,30 @@ class _FakePage:
 
 
 class JobDetailsExtractionTests(unittest.TestCase):
+    def test_clean_lines_collapses_whitespace_and_discards_blank_lines(self):
+        self.assertEqual(
+            job_details.clean_lines("  Bengaluru   India  \n\n Full-time\t role \r\n  "),
+            ["Bengaluru India", "Full-time role"],
+        )
+        self.assertEqual(job_details.clean_lines(" \n\t\r\n"), [])
+
+    def test_location_fragment_helper_distinguishes_places_and_metadata(self):
+        cases = (
+            ("Bengaluru, Karnataka, India", True),
+            ("Hybrid", True),
+            ("Remote, India", True),
+            ("Promoted", False),
+            ("2 days ago", False),
+            ("Full-time", False),
+            ("Remote", False),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                # Bare "Remote" currently returns false, despite a later source comment saying it is accepted.
+                first = job_details.looks_like_location(value)
+                self.assertEqual(first, expected)
+                self.assertEqual(job_details.looks_like_location(value), first)
+
     def test_populated_description_extracts_immediately_without_wait(self):
         description = "A meaningful description with responsibilities and qualifications."
         page = _FakePage(
