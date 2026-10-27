@@ -60,6 +60,33 @@ class CsvOutputDurabilityTests(unittest.TestCase):
         self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
         self.assertEqual(self._temporary_files(destination), [])
 
+    def test_encoding_failure_after_partial_serialization_preserves_destination(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        def fail_on_invalid_utf8(file):
+            file.write("partial temporary output\n")
+            file.write("\ud800")
+
+        with self.assertRaises(UnicodeEncodeError):
+            output_files.write_replaced_output(destination, fail_on_invalid_utf8)
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        self.assertEqual(self._temporary_files(destination), [])
+
+    def test_failed_serialization_does_not_create_a_new_destination(self):
+        destination = self.root / "new-output.csv"
+
+        def fail_after_partial_write(file):
+            file.write("partial output\n")
+            raise OSError("synthetic interrupted serialization")
+
+        with self.assertRaisesRegex(OSError, "synthetic interrupted serialization"):
+            output_files.write_replaced_output(destination, fail_after_partial_write)
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(self._temporary_files(destination), [])
+
     def test_replace_failure_preserves_existing_destination_and_cleans_temp(self):
         destination = self.root / "output.csv"
         destination.write_text("previous valid contents\n", encoding="utf-8")
@@ -101,6 +128,47 @@ class CsvOutputDurabilityTests(unittest.TestCase):
                 output_files.write_replaced_output(destination, lambda file: file.write("new\n"))
 
         self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+
+    def test_fsync_failure_preserves_existing_destination_and_cleans_temp(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        with patch.object(output_files.os, "fsync", side_effect=OSError("synthetic fsync failure")):
+            with self.assertRaisesRegex(OSError, "synthetic fsync failure"):
+                output_files.write_replaced_output(
+                    destination, lambda file: file.write("fully serialized but not synced\n")
+                )
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        self.assertEqual(self._temporary_files(destination), [])
+
+    def test_interrupted_write_preserves_existing_destination_and_cleans_temp(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        def interrupt_after_partial_write(file):
+            file.write("partial replacement\n")
+            raise KeyboardInterrupt("synthetic interruption")
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "synthetic interruption"):
+            output_files.write_replaced_output(destination, interrupt_after_partial_write)
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        self.assertEqual(self._temporary_files(destination), [])
+
+    def test_successful_write_recovers_after_failed_replace(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        with patch.object(output_files.os, "replace", side_effect=OSError("replace denied")):
+            with self.assertRaisesRegex(OSError, "replace denied"):
+                output_files.write_replaced_output(destination, lambda file: file.write("failed\n"))
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        self.assertEqual(self._temporary_files(destination), [])
+
+        output_files.write_replaced_output(destination, lambda file: file.write("recovered\n"))
+        self.assertEqual(destination.read_text(encoding="utf-8"), "recovered\n")
+        self.assertEqual(self._temporary_files(destination), [])
 
     def test_analyzer_write_failure_does_not_truncate_previous_analysis(self):
         input_path = self.root / "job_details.csv"
