@@ -134,6 +134,20 @@ class ManifestContractCompatibilityTests(unittest.TestCase):
         result = compat.validate_for_component(_v2_source(), target="schema_v2", source_schema_version=1)
         self.assertEqual(result["failure_code"], "DECLARED_VERSION_MISMATCH")
 
+    def test_boolean_schema_version_is_not_accepted_as_integer_version(self):
+        manifest = _v2_source()
+        manifest["schema_version"] = True
+        first = compat.validate_for_component(
+            manifest, target="schema_v2", source_schema_version=2
+        )
+        second = compat.validate_for_component(
+            copy.deepcopy(manifest), target="schema_v2", source_schema_version=2
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["failure_code"], "DECLARED_VERSION_MISMATCH")
+        self.assertFalse(first["accepted"])
+        self.assertFalse(first["eligible"])
+
     def test_unknown_and_missing_fields_are_rejected_by_native_schema(self):
         unknown = _v2_source()
         unknown["unreviewed"] = True
@@ -199,6 +213,7 @@ class ManifestContractCompatibilityTests(unittest.TestCase):
             ("malformed_json", {"manifest_bytes": b"{"}, "MANIFEST_JSON_INVALID"),
             ("non_finite_json_number", {"manifest_bytes": b'{"schema_version":NaN}'}, "MANIFEST_JSON_INVALID"),
             ("duplicate_json_key", {"manifest_bytes": b'{"schema_version":2,"schema_version":2}'}, "DUPLICATE_JSON_KEY"),
+            ("nested_duplicate_json_key", {"manifest_bytes": b'{"schema_version":2,"nested":{"value":1,"value":2}}'}, "DUPLICATE_JSON_KEY"),
             ("non_object_json", {"manifest_bytes": b"[]"}, "MANIFEST_ENVELOPE_INVALID"),
         )
         for label, arguments, expected_code in cases:
