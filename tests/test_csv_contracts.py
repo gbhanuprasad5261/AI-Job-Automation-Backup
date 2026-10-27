@@ -127,6 +127,8 @@ class LinkValueValidationTests(unittest.TestCase):
             "http://example.com/jobs/1",
             "https://example.com/jobs/1?source=synthetic",
             "HTTPS://example.com:443/jobs/1",
+            "https://example.com:0/jobs/1",
+            "https://example.com:65535/jobs/1",
             "http://[2001:db8::1]:8080/jobs/1",
         ):
             with self.subTest(value=value):
@@ -193,6 +195,9 @@ class LinkValueValidationTests(unittest.TestCase):
             "http://example.com:",
             "http://example.com:abc/jobs/1",
             "http://example.com:65536/jobs/1",
+            "https://[2001:db8::1]:65536/jobs/1",
+            "https://example.com/nbsp\u00a0path",
+            "https://example.com/c1\u0085path",
             "http://user:secret@example.com/jobs/1",
             "https://example.com/a b",
             " https://example.com/jobs/1",
