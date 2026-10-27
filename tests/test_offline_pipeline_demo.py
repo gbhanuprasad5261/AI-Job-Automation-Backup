@@ -42,6 +42,19 @@ class OfflinePipelineDemoTests(unittest.TestCase):
             self.assertTrue(EXECUTION_POLICY.allows_persistence())
             self.assertTrue(EXECUTION_POLICY.allows_diagnostic_artifacts())
 
+    def test_malformed_saved_fields_stay_deterministic_and_non_authorizing(self):
+        job = {"Easy Apply": ["Yes"], "Title": None, "Company": 7, "Link": None, "URL": "synthetic-url"}
+        with patch.object(config, "DRY_RUN", False):
+            first = EXECUTION_POLICY.dry_run_result(job)
+            second = EXECUTION_POLICY.dry_run_result(job)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], DRY_RUN_SKIPPED_BROWSER)
+        self.assertIsNone(first["route_hint"])
+        self.assertEqual(first["job_url"], "synthetic-url")
+        self.assertFalse(first["live_route_confirmed"])
+        self.assertFalse(first["application_eligible"])
+
     def test_normalized_fixture_flows_through_analysis_selection_dry_run_and_isolated_tracker(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
