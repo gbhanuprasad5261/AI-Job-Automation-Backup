@@ -280,6 +280,15 @@ class OfflineGenerationLifecycleTests(unittest.TestCase):
                 lifecycle.run_offline_lifecycle(RECORDS, status="UNKNOWN")
         dispatch.assert_not_called()
 
+    def test_non_string_source_rows_fail_before_any_validator_dispatch(self):
+        for bad_record in (None, 7, b"synthetic row"):
+            with self.subTest(record_type=type(bad_record).__name__), patch(
+                "tools.offline_generation_lifecycle.compat.validate_for_component"
+            ) as dispatch:
+                with self.assertRaisesRegex(TypeError, "source_records must contain"):
+                    lifecycle.run_offline_lifecycle([RECORDS[0], bad_record])
+                dispatch.assert_not_called()
+
     def test_analyzer_binding_byte_and_identifier_faults_remain_rejected(self):
         original = generation_store.validate_analyzer_input_binding
         def changed_bytes(analyzer, details, **kwargs):
