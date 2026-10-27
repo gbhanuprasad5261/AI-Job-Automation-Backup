@@ -98,6 +98,32 @@ class CsvOutputDurabilityTests(unittest.TestCase):
         self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
         self.assertEqual(self._temporary_files(destination), [])
 
+    def test_replace_failure_does_not_create_new_destination_and_cleans_temp(self):
+        destination = self.root / "new-output.csv"
+
+        with patch.object(output_files.os, "replace", side_effect=OSError("replace denied")):
+            with self.assertRaisesRegex(OSError, "replace denied"):
+                output_files.write_replaced_output(destination, lambda file: file.write("new\n"))
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(self._temporary_files(destination), [])
+
+    def test_replace_and_cleanup_failures_preserve_destination_and_surface_replace_error(self):
+        destination = self.root / "output.csv"
+        destination.write_text("previous valid contents\n", encoding="utf-8")
+
+        with (
+            patch.object(output_files.os, "replace", side_effect=OSError("replace denied")),
+            patch.object(output_files.os, "remove", side_effect=OSError("cleanup denied")),
+        ):
+            with self.assertRaisesRegex(OSError, "replace denied"):
+                output_files.write_replaced_output(destination, lambda file: file.write("new\n"))
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "previous valid contents\n")
+        leftovers = self._temporary_files(destination)
+        self.assertEqual(len(leftovers), 1)
+        leftovers[0].unlink()
+
     def test_temporary_cleanup_failure_does_not_mask_serialization_error(self):
         destination = self.root / "output.csv"
         destination.write_text("previous valid contents\n", encoding="utf-8")
