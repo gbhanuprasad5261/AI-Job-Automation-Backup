@@ -52,6 +52,47 @@ class DescriptionQualityTests(unittest.TestCase):
                 result = next(csv.DictReader(file))
             return result, matcher
 
+    def test_experience_extraction_handles_ranges_minima_and_missing_requirements(self):
+        cases = (
+            ("Minimum 4 years of experience", 4),
+            ("Requires 3-5 years of relevant experience", 3),
+            ("2 to 5 years experience", 2),
+            ("Entry-level role", 0),
+            ("Graduate degree required", 0),
+            ("", 0),
+            (None, 0),
+            ("Minimum 5 years, but 2-3 years of experience is sufficient", 2),
+        )
+        for description, expected in cases:
+            with self.subTest(description=description):
+                first = job_analyzer.extract_experience_years(description)
+                second = job_analyzer.extract_experience_years(description)
+                self.assertEqual(first, expected)
+                self.assertEqual(second, first)
+
+    def test_experience_labels_prioritize_numeric_years_and_classify_entry_level(self):
+        cases = (
+            ((3, "Fresher role"), "3+ years"),
+            ((1, "One year preferred"), "1+ years"),
+            ((0, "Entry-level role"), "Fresher / Entry Level"),
+            ((None, "Fresh graduate welcome"), "Fresher / Entry Level"),
+            ((0, "Bachelor degree required"), "Not specified"),
+            ((0, ""), "Not specified"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(job_analyzer.get_experience_label(*arguments), expected)
+
+    def test_location_matching_and_priority_boundaries_are_stable(self):
+        for location, expected in (("Greater Bengaluru Area", True), ("Remote role", True), ("Boston", False), (None, False), ("", False)):
+            with self.subTest(location=location):
+                self.assertEqual(job_analyzer.location_matches(location), expected)
+
+        with patch.object(config, "MIN_MATCH_SCORE", 70):
+            for score, expected in ((69, "LOW"), (70, "MEDIUM"), (84, "MEDIUM"), (85, "HIGH")):
+                with self.subTest(score=score):
+                    self.assertEqual(job_analyzer.calculate_priority(score), expected)
+
     def test_empty_description_is_insufficient_and_ineligible(self):
         result, matcher = self._analyze("")
         self.assertEqual(result["Data Status"], "INSUFFICIENT_DATA")
