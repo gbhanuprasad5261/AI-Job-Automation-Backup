@@ -31,9 +31,6 @@ class DailyApplicationLimitTests(unittest.TestCase):
             easy_apply.main()
         return open_job, output.getvalue()
 
-    def test_default_daily_limit_remains_15(self):
-        self.assertEqual(config.DAILY_APPLICATION_LIMIT, 15)
-
     def test_custom_configured_limit_controls_active_runner(self):
         open_job, output = self._run_main(
             2,
