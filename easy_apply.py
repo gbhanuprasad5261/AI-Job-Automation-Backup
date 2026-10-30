@@ -2048,12 +2048,9 @@ def open_easy_apply(job):
 
                     result = prepare_external_application_page(
                         page=page,
-                        resume_path="resume/resume.pdf",
-                        name="G Bhanu Prasad",
-                        email="gbhanuprasad1236@gmail.com",
-                        phone="9392801041",
-                        current_location="Bengaluru",
-                        current_company="N/A",
+                        application_identity=application_identity,
+                        title=application_title,
+                        company=application_company,
                     )
 
                     if result == "SUBMITTED":
