@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import application_tracker
 import easy_apply
 
 
@@ -162,6 +163,66 @@ class AtomicStatusWriteTests(unittest.TestCase):
 
         self.assertEqual(self.history_path.read_bytes(), original)
         self.assertEqual(self._temporary_files(self.history_path), [])
+
+    def test_application_tracker_replace_failure_preserves_file_and_cleans_temp(self):
+        original = self.tracker_path.read_bytes()
+        temp_path = Path(str(self.tracker_path) + ".tmp")
+        with (
+            patch.object(application_tracker, "OUTPUT_FILE", str(self.tracker_path)),
+            patch.object(
+                application_tracker.os,
+                "replace",
+                side_effect=OSError("synthetic tracker replacement failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic tracker replacement failure"):
+                application_tracker.save_tracker([dict(self.JOB)])
+
+        self.assertEqual(self.tracker_path.read_bytes(), original)
+        self.assertFalse(temp_path.exists())
+
+    def test_application_tracker_temp_creation_failure_preserves_file(self):
+        original = self.tracker_path.read_bytes()
+        temp_path = Path(str(self.tracker_path) + ".tmp")
+        with (
+            patch.object(application_tracker, "OUTPUT_FILE", str(self.tracker_path)),
+            patch(
+                "builtins.open",
+                side_effect=OSError("synthetic temp creation failure"),
+            ) as open_file,
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic temp creation failure"):
+                application_tracker.save_tracker([dict(self.JOB)])
+
+        open_file.assert_called_once_with(
+            str(temp_path), "w", newline="", encoding="utf-8"
+        )
+        self.assertEqual(self.tracker_path.read_bytes(), original)
+        self.assertFalse(temp_path.exists())
+
+    def test_application_tracker_write_failure_preserves_file_and_cleans_temp(self):
+        original = self.tracker_path.read_bytes()
+        temp_path = Path(str(self.tracker_path) + ".tmp")
+
+        class FailingWriter:
+            def __init__(self, output, **_kwargs):
+                self.output = output
+
+            def writeheader(self):
+                self.output.write("partial header\n")
+
+            def writerow(self, _row):
+                raise OSError("synthetic tracker serialization failure")
+
+        with (
+            patch.object(application_tracker, "OUTPUT_FILE", str(self.tracker_path)),
+            patch.object(application_tracker.csv, "DictWriter", FailingWriter),
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic tracker serialization failure"):
+                application_tracker.save_tracker([dict(self.JOB)])
+
+        self.assertEqual(self.tracker_path.read_bytes(), original)
+        self.assertFalse(temp_path.exists())
 
 
 if __name__ == "__main__":
