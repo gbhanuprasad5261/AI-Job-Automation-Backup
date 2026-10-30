@@ -99,6 +99,58 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertEqual(saved["control"]["tag"], "a")
         self.assertEqual(saved["control"]["text_preview"], "Apply now")
 
+    def test_filesystem_write_failure_is_swallowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "diagnostics.jsonl")
+            with (
+                patch.object(config, "DRY_RUN", False),
+                patch("builtins.open", side_effect=OSError("synthetic disk write failure")),
+            ):
+                self.assertFalse(write_diagnostic({"event": "synthetic"}, path=path))
+
+            self.assertFalse(os.path.exists(path))
+
+    def test_non_directory_parent_returns_false_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = os.path.join(directory, "not-a-directory")
+            with open(parent, "w", encoding="utf-8") as output:
+                output.write("sentinel")
+            path = os.path.join(parent, "diagnostics.jsonl")
+
+            with patch.object(config, "DRY_RUN", False):
+                self.assertFalse(write_diagnostic({"event": "synthetic"}, path=path))
+
+            self.assertTrue(os.path.isfile(parent))
+            self.assertFalse(os.path.exists(path))
+            with open(parent, encoding="utf-8") as source:
+                self.assertEqual(source.read(), "sentinel")
+
+    def test_output_write_failure_returns_false(self):
+        class FailingWriter:
+            exit_called = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                self.exit_called = True
+                return False
+
+            def write(self, _record):
+                raise OSError("synthetic write failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "diagnostics.jsonl")
+            writer = FailingWriter()
+            with (
+                patch.object(config, "DRY_RUN", False),
+                patch("builtins.open", return_value=writer) as open_file,
+            ):
+                self.assertFalse(write_diagnostic({"event": "synthetic"}, path=path))
+
+            open_file.assert_called_once_with(path, "a", encoding="utf-8")
+            self.assertTrue(writer.exit_called)
+
     def test_missing_optional_control_attributes_do_not_crash(self):
         control = FakeElement(tag="button", text="Apply")
         info = element_diagnostic(control)
