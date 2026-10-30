@@ -11,6 +11,9 @@ import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 import config
+from profile import get_application_profile
+from application_approval import confirm_application_submission
+from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
 
@@ -20,12 +23,13 @@ try:
 except Exception:
     pass
 
-CURRENT_LOCATION = os.getenv("CURRENT_LOCATION", "Bengaluru")
-CURRENT_COMPANY = os.getenv("CURRENT_COMPANY", "N/A")
+_PROFILE_DEFAULTS = get_application_profile()
+CURRENT_LOCATION = _PROFILE_DEFAULTS["current_location"]
+CURRENT_COMPANY = _PROFILE_DEFAULTS["current_company"]
 CURRENT_CTC = "0"
 EXPECTED_CTC = "5,00,000"
 GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/gbhanuprasad5261")
-RESUME_PATH = os.getenv("RESUME_PATH", "resume/resume.pdf")
+RESUME_PATH = _PROFILE_DEFAULTS["resume_path"]
 SUCCESSFACTORS_PASSWORD = os.getenv("SUCCESSFACTORS_PASSWORD", "").strip()
 AUTO_SUBMIT = config.AUTO_SUBMIT
 
@@ -459,7 +463,9 @@ def _fill_known_fields(
         # For this candidate the intended answer is N/A, so overwrite any
         # prefilled value such as QSpiders.
         if "current company" in q or ("company" in q and "current" in q):
-            value = current_company or "N/A"
+            value = current_company
+            if not value:
+                continue
             try:
                 element.fill(value)
                 count += 1
@@ -472,6 +478,8 @@ def _fill_known_fields(
         # the configured candidate value.
         if "current location" in q or ("location" in q and "current" in q):
             value = current_location
+            if not value:
+                continue
             try:
                 element.scroll_into_view_if_needed()
             except Exception:
@@ -511,9 +519,18 @@ def _fill_known_fields(
             value = email
         elif "phone" in q or "mobile" in q or "telephone" in q:
             value = phone
-        elif "first name" in q or "firstname" in q:
+        elif (
+            "first name" in q
+            or "firstname" in q
+            or "given name" in q
+        ):
             value = name.split()[0] if name else ""
-        elif "last name" in q or "lastname" in q or "surname" in q:
+        elif (
+            "last name" in q
+            or "lastname" in q
+            or "surname" in q
+            or "family name" in q
+        ):
             value = " ".join(name.split()[1:]) if len(name.split()) > 1 else ""
         elif "current location" in q or "location" in q and "current" in q:
             value = current_location
@@ -744,100 +761,13 @@ def _fill_google_forms_known_fields(
 
 
 def _google_forms_confirmed_radio_answers(page: Page) -> int:
-    """Select only Google Form radio answers explicitly confirmed by the candidate."""
-    answers = {
-        "will you available for 6 months internship": "Yes",
-        "will you be available for an in-office internship from in hsr location, 5 days a week": "Yes",
-        "how soon are you available to join": "Immediate",
-        "any prior internship experience": "Yes",
-        "do you have project experience with node.js": "No",
-        "do you have project experience with postgresql": "No",
-        "do you have project experience with react.js": "No",
-    }
+    """Leave candidate-specific radio questions unanswered without profile facts.
 
-    count = 0
-    processed = set()
-
-    try:
-        radios = page.locator("[role='radio'], input[type='radio']")
-        total = radios.count()
-    except Exception:
-        return 0
-
-    for i in range(total):
-        radio = radios.nth(i)
-        if not _visible(radio):
-            continue
-
-        question = _google_question_text(radio)
-        normalized = " ".join(question.split()).lower()
-        desired = None
-        matched_key = None
-
-        for question_key, answer in answers.items():
-            if question_key in normalized:
-                desired = answer
-                matched_key = question_key
-                break
-
-        if desired is None or matched_key in processed:
-            continue
-
-        processed.add(matched_key)
-
-        try:
-            item = radio.locator("xpath=ancestor::*[@role='listitem'][1]")
-            if not item.count():
-                item = radio.locator("xpath=..")
-        except Exception:
-            item = radio.locator("xpath=..")
-
-        clicked = False
-
-        # Google Forms custom radios expose each option as role=radio.
-        try:
-            options = item.locator("[role='radio']")
-            for j in range(options.count()):
-                option = options.nth(j)
-                if not _visible(option):
-                    continue
-                label = (
-                    option.get_attribute("aria-label")
-                    or option.inner_text()
-                    or ""
-                ).strip()
-                if label.lower() == desired.lower():
-                    option.click()
-                    page.wait_for_timeout(150)
-                    clicked = True
-                    break
-        except Exception:
-            pass
-
-        # Fallback for native radio inputs/labels.
-        if not clicked:
-            try:
-                labels = item.locator("label")
-                for j in range(labels.count()):
-                    label = labels.nth(j)
-                    if not _visible(label):
-                        continue
-                    if (label.inner_text() or "").strip().lower() == desired.lower():
-                        label.click()
-                        page.wait_for_timeout(150)
-                        clicked = True
-                        break
-            except Exception:
-                pass
-
-        if clicked:
-            print(
-                f"Google Form confirmed answer selected: "
-                f"{normalized[:90]} -> {desired}"
-            )
-            count += 1
-
-    return count
+    The shared profile has no availability, internship-history, or project-
+    experience answers. Required-question validation keeps such forms in
+    review instead of selecting hard-coded candidate answers.
+    """
+    return 0
 
 
 def _google_forms_required_empty_count(page: Page) -> int:
@@ -966,6 +896,9 @@ def _prepare_google_form(
     current_location: str,
     current_company: str,
     resume_path: str = RESUME_PATH,
+    application_identity=None,
+    title="",
+    company="",
 ) -> str:
     """Prepare and, when safe, submit a Google Form using known candidate data.
 
@@ -1011,12 +944,23 @@ def _prepare_google_form(
         print("No detectable unanswered required Google Form questions on this page.")
 
     print("Google Form prepared with known candidate data.")
-    return _auto_submit_google_form(page)
+    return _auto_submit_google_form(
+        page,
+        application_identity=application_identity,
+        title=title,
+        company=company,
+    )
 
 
 
-def _auto_submit_google_form(page: Page) -> str:
+def _auto_submit_google_form(
+    page: Page, application_identity=None, title="", company=""
+) -> str:
     """Submit Google Forms only after required-question verification."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: Google Forms submission skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
         print("UNKNOWN_QUESTIONS_POLICY=REVIEW: Google Form submission stopped for manual review.")
         return "READY_FOR_REVIEW"
@@ -1050,6 +994,9 @@ def _auto_submit_google_form(page: Page) -> str:
 
     if submit is None:
         print("Google Form final Submit control was not found.")
+        return "READY_FOR_REVIEW"
+
+    if not confirm_application_submission(application_identity, title, company):
         return "READY_FOR_REVIEW"
 
     previous_url = page.url
@@ -1857,8 +1804,14 @@ def _external_submission_verified(page: Page, previous_url: str) -> bool:
     return False
 
 
-def _auto_submit_external_application(page: Page) -> str:
+def _auto_submit_external_application(
+    page: Page, application_identity=None, title="", company=""
+) -> str:
     """Submit only a fully populated external application when AUTO_SUBMIT is enabled."""
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external application submission skipped.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     if UNKNOWN_QUESTIONS_POLICY == "REVIEW":
         print("UNKNOWN_QUESTIONS_POLICY=REVIEW: external submission stopped for manual review.")
         return "READY_FOR_REVIEW"
@@ -1876,6 +1829,9 @@ def _auto_submit_external_application(page: Page) -> str:
     submit_control = _find_final_submit_control(page)
     if submit_control is None:
         print("No unambiguous final application Submit control was found.")
+        return "READY_FOR_REVIEW"
+
+    if not confirm_application_submission(application_identity, title, company):
         return "READY_FOR_REVIEW"
 
     previous_url = page.url
@@ -2061,9 +2017,6 @@ def _select_known_dropdowns(page: Page) -> int:
 
             q = _field_text(element)
 
-            # Brillio/Lever demographic survey: the required dropdown is
-            # explicitly "What is your location?" and its country options
-            # include India. This is a known candidate-profile value.
             if "what is your location" in q:
                 try:
                     current = element.input_value().strip()
@@ -2073,13 +2026,17 @@ def _select_known_dropdowns(page: Page) -> int:
                 if current and current.lower() not in {"select", "select..."}:
                     continue
 
+                country = get_application_profile().get("country", "")
+                if not country:
+                    continue
+
                 try:
-                    element.select_option(label="India")
-                    print("Selected known dropdown: What is your location? -> India")
+                    element.select_option(label=country)
+                    print("Selected known dropdown: What is your location? -> profile country")
                     count += 1
                     continue
                 except Exception as e:
-                    print(f"Could not select India for location dropdown: {e}")
+                    print(f"Could not select profile country for location dropdown: {e}")
 
     except Exception:
         pass
@@ -2512,14 +2469,28 @@ def _external_page_has_error(page: Page) -> bool:
 
 def prepare_external_application_page(
     page: Page,
-    resume_path: str = "",
-    name: str = "",
-    email: str = "",
-    phone: str = "",
-    current_location: str = CURRENT_LOCATION,
-    current_company: str = CURRENT_COMPANY,
+    resume_path: str = None,
+    name: str = None,
+    email: str = None,
+    phone: str = None,
+    current_location: str = None,
+    current_company: str = None,
+    application_identity=None,
+    title="",
+    company="",
 ):
     """Handle an external ATS page without guessing unknown questions."""
+    profile_values = get_application_profile()
+    name = profile_values["name"] if name is None else name
+    email = profile_values["email"] if email is None else email
+    phone = profile_values["phone"] if phone is None else phone
+    current_location = profile_values["current_location"] if current_location is None else current_location
+    current_company = profile_values["current_company"] if current_company is None else current_company
+    resume_path = profile_values["resume_path"] if resume_path is None else resume_path
+    if not EXECUTION_POLICY.allows_browser_actions():
+        print("DRY_RUN: external application preparation skipped before page interaction.")
+        return DRY_RUN_SKIPPED_BROWSER
+
     body = _text(page)
     ats = detect_ats(page.url, body)
     print(f"External ATS detected: {ats}")
@@ -2603,6 +2574,9 @@ def prepare_external_application_page(
             current_location,
             current_company,
             resume_path or RESUME_PATH,
+            application_identity=application_identity,
+            title=title,
+            company=company,
         )
 
     if ats == "SUCCESSFACTORS" or "successfactors.eu" in (page.url or "").lower() or "successfactors.com" in (page.url or "").lower():
@@ -2656,7 +2630,12 @@ def prepare_external_application_page(
         return "READY_FOR_REVIEW"
 
     print("No visible required fields remain empty.")
-    return _auto_submit_external_application(page)
+    return _auto_submit_external_application(
+        page,
+        application_identity=application_identity,
+        title=title,
+        company=company,
+    )
 
 def external_apply(*args, **kwargs):
     """Compatibility wrapper for generic external application handling."""
@@ -2666,4 +2645,10 @@ def external_apply(*args, **kwargs):
     remaining = list(args[1:])
     while len(remaining) < 4:
         remaining.append("")
-    return prepare_external_application_page(page, *remaining[:4])
+    return prepare_external_application_page(
+        page,
+        *remaining[:4],
+        application_identity=kwargs.get("application_identity"),
+        title=kwargs.get("title", ""),
+        company=kwargs.get("company", ""),
+    )
