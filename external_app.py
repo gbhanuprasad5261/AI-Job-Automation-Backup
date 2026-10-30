@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import config
 from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
+from application_approval import confirm_application_submission
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
 from runtime_diagnostics import (
@@ -1257,6 +1258,9 @@ def _prepare_google_form(
     current_location: str,
     current_company: str,
     resume_path: str = RESUME_PATH,
+    application_identity=None,
+    title="",
+    company="",
 ) -> str:
     """Prepare and, when safe, submit a Google Form using known candidate data.
 
@@ -1317,11 +1321,18 @@ def _prepare_google_form(
         print("No detectable unanswered required Google Form questions on this page.")
 
     print("Google Form prepared with known candidate data.")
-    return _auto_submit_google_form(page)
+    return _auto_submit_google_form(
+        page,
+        application_identity=application_identity,
+        title=title,
+        company=company,
+    )
 
 
 
-def _auto_submit_google_form(page: Page) -> str:
+def _auto_submit_google_form(
+    page: Page, application_identity=None, title="", company=""
+) -> str:
     """Submit Google Forms only after required-question verification."""
     if not EXECUTION_POLICY.allows_browser_actions():
         print("DRY_RUN: Google Forms submission skipped.")
@@ -1360,6 +1371,9 @@ def _auto_submit_google_form(page: Page) -> str:
 
     if submit is None:
         print("Google Form final Submit control was not found.")
+        return "READY_FOR_REVIEW"
+
+    if not confirm_application_submission(application_identity, title, company):
         return "READY_FOR_REVIEW"
 
     previous_url = page.url
@@ -2217,7 +2231,9 @@ def _external_submission_verified(page: Page, previous_url: str) -> bool:
     return False
 
 
-def _auto_submit_external_application(page: Page) -> str:
+def _auto_submit_external_application(
+    page: Page, application_identity=None, title="", company=""
+) -> str:
     """Submit only a fully populated external application when AUTO_SUBMIT is enabled."""
     if not EXECUTION_POLICY.allows_browser_actions():
         print("DRY_RUN: external application submission skipped.")
@@ -2240,6 +2256,9 @@ def _auto_submit_external_application(page: Page) -> str:
     submit_control = _find_final_submit_control(page)
     if submit_control is None:
         print("No unambiguous final application Submit control was found.")
+        return "READY_FOR_REVIEW"
+
+    if not confirm_application_submission(application_identity, title, company):
         return "READY_FOR_REVIEW"
 
     previous_url = page.url
@@ -2920,6 +2939,9 @@ def prepare_external_application_page(
             current_location,
             current_company,
             resume_path or RESUME_PATH,
+            application_identity=application_identity,
+            title=title,
+            company=company,
         )
 
     if ats == "SUCCESSFACTORS" or "successfactors.eu" in (page.url or "").lower() or "successfactors.com" in (page.url or "").lower():
@@ -2993,7 +3015,12 @@ def prepare_external_application_page(
         print("UNKNOWN_QUESTIONS_POLICY=REVIEW: stopping for manual review.")
         return "READY_FOR_REVIEW"
 
-    return _auto_submit_external_application(page)
+    return _auto_submit_external_application(
+        page,
+        application_identity=application_identity,
+        title=title,
+        company=company,
+    )
 
 def external_apply(*args, **kwargs):
     """Compatibility wrapper for generic external application handling."""
@@ -3003,4 +3030,10 @@ def external_apply(*args, **kwargs):
     remaining = list(args[1:])
     while len(remaining) < 4:
         remaining.append("")
-    return prepare_external_application_page(page, *remaining[:4])
+    return prepare_external_application_page(
+        page,
+        *remaining[:4],
+        application_identity=kwargs.get("application_identity"),
+        title=kwargs.get("title", ""),
+        company=kwargs.get("company", ""),
+    )

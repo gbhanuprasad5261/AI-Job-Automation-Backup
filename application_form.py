@@ -3,6 +3,7 @@ import re
 import time
 import config
 from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
+from application_approval import confirm_application_submission
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
 
@@ -3566,8 +3567,8 @@ def verify_final_review_page(page: Page, container=None) -> bool:
     return True
 
 
-def handle_final_submission(page: Page):
-    """Submit the Easy Apply application only when AUTO_SUBMIT is enabled.
+def handle_final_submission(page: Page, application_identity=None, title="", company=""):
+    """Submit only when AUTO_SUBMIT and exact per-application approval allow it.
 
     The caller reaches this function only after the current application page has
     passed the required-field and unknown-question safety checks. The final
@@ -3600,6 +3601,15 @@ def handle_final_submission(page: Page):
         print("Easy Apply container is unavailable before final submission.")
         return "FAILED"
 
+    unanswered = inspect_required_fields(container)
+    unknown_optional, unknown_required = _unanswered_unknown_text_questions(container)
+    if unanswered or unknown_required or (
+        UNKNOWN_QUESTIONS_POLICY == "REVIEW" and unknown_optional
+    ):
+        print("Required or review-only application questions remain unanswered.")
+        print("Submission blocked before approval.")
+        return "READY_FOR_REVIEW"
+
     submit_button = find_submit_button(container, page)
     if submit_button is None:
         print("Final Submit button was not safely detected.")
@@ -3623,6 +3633,9 @@ def handle_final_submission(page: Page):
     except Exception as exc:
         print(f"Could not verify Submit button state: {exc}")
         return "FAILED"
+
+    if not confirm_application_submission(application_identity, title, company):
+        return "READY_FOR_REVIEW"
 
     print(f"Final submission control: {button_text}")
     print("AUTO_SUBMIT is enabled. Submitting application...")
@@ -3651,7 +3664,10 @@ def handle_final_submission(page: Page):
 
 
 def inspect_and_prepare_form(
-    page: Page
+    page: Page,
+    application_identity=None,
+    title="",
+    company="",
 ):
 
     if not EXECUTION_POLICY.allows_browser_actions():
@@ -3777,7 +3793,10 @@ def inspect_and_prepare_form(
             )
 
             return handle_final_submission(
-                page
+                page,
+                application_identity=application_identity,
+                title=title,
+                company=company,
             )
 
         # ----------------------------------------------------
@@ -3816,7 +3835,12 @@ def inspect_and_prepare_form(
             print("All detected required fields are filled.")
             print("AUTO_SUBMIT is disabled for safety.")
             print("No Submit button will be clicked by automation.")
-            return handle_final_submission(page)
+            return handle_final_submission(
+                page,
+                application_identity=application_identity,
+                title=title,
+                company=company,
+            )
 
         moved = move_to_next_page(
             page

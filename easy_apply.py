@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import os
 import re
 import tempfile
@@ -1741,6 +1742,15 @@ def open_easy_apply(job):
 
         return False
 
+    job_id_for_approval = job.get("Job ID") or job.get("JobID") or ""
+    if job_id_for_approval:
+        application_identity = f"linkedin-job:{str(job_id_for_approval).strip()}"
+    else:
+        link_fingerprint = hashlib.sha256(link.strip().encode("utf-8")).hexdigest()
+        application_identity = f"linkedin-link-sha256:{link_fingerprint}"
+    application_title = str(job.get("Title") or "").strip()
+    application_company = str(job.get("Company") or "").strip()
+
     print()
     print("=" * 70)
     print("OPENING JOB")
@@ -2348,7 +2358,10 @@ def open_easy_apply(job):
         try:
 
             application_result = inspect_and_prepare_form(
-                page
+                page,
+                application_identity=application_identity,
+                title=application_title,
+                company=application_company,
             )
 
             if application_result == "SUBMITTED":
