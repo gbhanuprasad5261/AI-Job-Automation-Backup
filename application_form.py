@@ -2,10 +2,13 @@ import os
 import re
 import time
 import config
+from profile import get_application_profile
 from execution_policy import EXECUTION_POLICY, DRY_RUN_SKIPPED_BROWSER
 from application_approval import confirm_application_submission
 from playwright.sync_api import Page
 from config import UNKNOWN_QUESTIONS_POLICY
+
+_APPLICATION_PROFILE = get_application_profile()
 
 
 # ============================================================
@@ -16,53 +19,36 @@ from config import UNKNOWN_QUESTIONS_POLICY
 # Configuration
 # ------------------------------------------------------------
 
-RESUME_PATH = os.path.abspath(
-    os.path.join("resume", "resume.pdf")
+RESUME_PATH = (
+    os.path.abspath(_APPLICATION_PROFILE["resume_path"])
+    if _APPLICATION_PROFILE["resume_path"]
+    else ""
 )
 
-# IMPORTANT:
-# Put your real details here if they are not already available
-# through your config.py / environment variables.
+# Shared profile data is used where available. Blank profile fields remain
+# unset; explicit APPLICANT_* environment overrides retain precedence.
 
-APPLICANT_NAME = os.getenv(
-    "APPLICANT_NAME",
-    "G Bhanu Prasad"
-)
+APPLICANT_NAME = _APPLICATION_PROFILE["name"]
 
-EMAIL = os.getenv(
-    "APPLICANT_EMAIL",
-    "gbhanuprasad1236@gmail.com"
-)
+EMAIL = _APPLICATION_PROFILE["email"]
 
-PHONE = os.getenv(
-    "APPLICANT_PHONE",
-    "9392801041"
-)
+PHONE = _APPLICATION_PROFILE["phone"]
 
-YEARS_OF_EXPERIENCE = os.getenv(
-    "YEARS_OF_EXPERIENCE",
-    "0"
-)
+YEARS_OF_EXPERIENCE = _APPLICATION_PROFILE["experience_years"]
 
 # User-confirmed LinkedIn Easy Apply answers.
 NET_CORE_EXPERIENCE = os.getenv("NET_CORE_EXPERIENCE", "0")
 ENGINEERING_EXPERIENCE = os.getenv("ENGINEERING_EXPERIENCE", "0")
 
-CITY = os.getenv(
-    "APPLICANT_CITY",
-    "Bengaluru"
-)
+CITY = _APPLICATION_PROFILE["city"]
 
-COUNTRY = os.getenv(
-    "APPLICANT_COUNTRY",
-    "India"
-)
+COUNTRY = _APPLICATION_PROFILE["country"]
 
-STATE = os.getenv("APPLICANT_STATE", "Karnataka")
-DEGREE = os.getenv("APPLICANT_DEGREE", "B.Tech")
-FIELD_OF_STUDY = os.getenv("APPLICANT_FIELD_OF_STUDY", "Computer Science and Engineering(AI&DS)")
+STATE = _APPLICATION_PROFILE["state"]
+DEGREE = _APPLICATION_PROFILE["degree"]
+FIELD_OF_STUDY = _APPLICATION_PROFILE["field_of_study"]
 UNIVERSITY = os.getenv("APPLICANT_UNIVERSITY", "Siddartha Institute of Science and Technology")
-GRADUATION_YEAR = os.getenv("GRADUATION_YEAR", "2025")
+GRADUATION_YEAR = _APPLICATION_PROFILE["graduation_year"]
 EDUCATION_START_MONTH = os.getenv("EDUCATION_START_MONTH", "June")
 EDUCATION_START_YEAR = os.getenv("EDUCATION_START_YEAR", "2021")
 EDUCATION_END_MONTH = os.getenv("EDUCATION_END_MONTH", "April")
@@ -80,14 +66,14 @@ SSC_END_YEAR = os.getenv("SSC_END_YEAR", "2019")
 CGPA = os.getenv("CGPA", "7.29")
 CURRENT_CTC = os.getenv("CURRENT_CTC", "0")
 EXPECTED_CTC = os.getenv("EXPECTED_CTC", "500000")
-NOTICE_PERIOD = os.getenv("NOTICE_PERIOD", "0")
+NOTICE_PERIOD = os.getenv("NOTICE_PERIOD", "")
 WORK_AUTHORIZED = os.getenv("WORK_AUTHORIZED", "Yes")
 REQUIRES_SPONSORSHIP = os.getenv("REQUIRES_SPONSORSHIP", "No")
-WILLING_TO_RELOCATE = os.getenv("WILLING_TO_RELOCATE", "Yes")
-WILLING_ONSITE = os.getenv("WILLING_ONSITE", "Yes")
-INTERNSHIP_EXPERIENCE = os.getenv("INTERNSHIP_EXPERIENCE", "Yes")
-SHIFT_COMFORT = os.getenv("SHIFT_COMFORT", "Yes")
-WEEKEND_COMFORT = os.getenv("WEEKEND_COMFORT", "Yes")
+WILLING_TO_RELOCATE = os.getenv("WILLING_TO_RELOCATE", "")
+WILLING_ONSITE = os.getenv("WILLING_ONSITE", "")
+INTERNSHIP_EXPERIENCE = os.getenv("INTERNSHIP_EXPERIENCE", "")
+SHIFT_COMFORT = os.getenv("SHIFT_COMFORT", "")
+WEEKEND_COMFORT = os.getenv("WEEKEND_COMFORT", "")
 WORK_PERMIT = os.getenv("WORK_PERMIT", "Yes")
 DISABILITY = os.getenv("DISABILITY", "No")
 CRIMINAL_HISTORY = os.getenv("CRIMINAL_HISTORY", "No")
@@ -529,8 +515,8 @@ def fill_name(container):
 
     # First name / last name handling
 
-    first_name = "G"
-    last_name = "Bhanu Prasad"
+    first_name = _APPLICATION_PROFILE["first_name"]
+    last_name = _APPLICATION_PROFILE["last_name"]
 
     filled = False
 
@@ -589,6 +575,15 @@ def fill_name(container):
                         last_name
                     ):
                         print("Last name filled.")
+                        filled = True
+
+                elif "full name" in combined:
+
+                    if fill_if_empty(
+                        element,
+                        _APPLICATION_PROFILE["name"]
+                    ):
+                        print("Full name filled.")
                         filled = True
 
         except Exception:
@@ -1378,7 +1373,7 @@ def _value_for_text_question(combined):
         return EXPECTED_CTC
 
     if "notice period" in q:
-        return NOTICE_PERIOD
+        return NOTICE_PERIOD if NOTICE_PERIOD.strip() else None
 
     # User-confirmed experience answers.
     if ".net core" in q or "dotnet core" in q or "dot net core" in q:
@@ -1402,7 +1397,7 @@ def _value_for_text_question(combined):
 
     # Education
     if "degree" in q or "highest qualification" in q:
-        return DEGREE
+        return DEGREE if DEGREE.strip() else None
 
     if (
         "field of study" in q
@@ -1410,7 +1405,7 @@ def _value_for_text_question(combined):
         or "specialisation" in q
         or "major" in q
     ):
-        return FIELD_OF_STUDY
+        return FIELD_OF_STUDY if FIELD_OF_STUDY.strip() else None
 
     if (
         "university" in q
@@ -1424,7 +1419,7 @@ def _value_for_text_question(combined):
         or "year graduated" in q
         or "year of graduation" in q
     ):
-        return GRADUATION_YEAR
+        return GRADUATION_YEAR if GRADUATION_YEAR.strip() else None
 
     if (
         "cgpa" in q
@@ -1435,13 +1430,13 @@ def _value_for_text_question(combined):
 
     # Location
     if "city" in q:
-        return CITY
+        return CITY if CITY.strip() else None
 
     if "state" in q:
-        return STATE
+        return STATE if STATE.strip() else None
 
     if "country" in q:
-        return COUNTRY
+        return COUNTRY if COUNTRY.strip() else None
 
     # LinkedIn profile URL
     if "linkedin profile" in q or "linkedin url" in q or ("profile" in q and "linkedin" in q):
@@ -2221,6 +2216,8 @@ def _choose_safe_radio_answer(question, answers):
     ]
 
     def find(value):
+        if not isinstance(value, str) or not value.strip():
+            return None
         value = value.lower()
 
         for label, low in normalized:
@@ -2298,21 +2295,6 @@ def _choose_safe_radio_answer(question, answers):
         "recent graduate"
     ]):
         return find(FRESHER)
-
-    # Known LinkedIn Yes/No question:
-    # "Paste a link to code you have written*"
-    if any(x in q for x in [
-        "paste a link to code",
-        "link to code you have written",
-        "code you have written"
-    ]):
-        return find("Yes")
-
-    if (
-        "professional experience" in q
-        or "previous professional experience" in q
-    ):
-        return find("No")
 
     if any(x in q for x in [
         "years of experience",
