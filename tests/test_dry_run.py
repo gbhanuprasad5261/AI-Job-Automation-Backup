@@ -242,7 +242,12 @@ class DryRunExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(result, "READY_FOR_REVIEW")
         fill_fields.assert_called_once()
         radio_answers.assert_called_once_with(page)
-        submit.assert_called_once_with(page)
+        submit.assert_called_once_with(
+            page,
+            application_identity=None,
+            title="",
+            company="",
+        )
 
 
 if __name__ == "__main__":
