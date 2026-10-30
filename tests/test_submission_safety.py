@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import application_form
 import config
@@ -306,7 +306,17 @@ class OpenFormPersistenceTests(unittest.TestCase):
             detection_result=detection_result,
         )
 
-        prepare_form.assert_called_once()
+        prepare_form.assert_called_once_with(
+            ANY,
+            application_identity=(
+                "linkedin-link-sha256:"
+                + hashlib.sha256(
+                    b"https://www.linkedin.com/jobs/view/1234567890/"
+                ).hexdigest()
+            ),
+            title="Backend Developer",
+            company="Example Co",
+        )
         sdui_event = next(
             call.args[0]
             for call in diagnostic_writer.call_args_list
@@ -392,12 +402,27 @@ class OpenFormPersistenceTests(unittest.TestCase):
             patch.object(easy_apply, "check_external_eligibility", return_value="UNKNOWN"),
             patch.object(easy_apply, "find_easy_apply_button", return_value=None),
             patch.object(easy_apply, "find_external_apply_link", return_value="https://careers.example.test/apply"),
-            patch.object(easy_apply, "prepare_external_application_page", return_value="SUBMITTED"),
+            patch.object(
+                easy_apply,
+                "prepare_external_application_page",
+                return_value="SUBMITTED",
+            ) as prepare_external,
             patch.object(easy_apply, "record_application_status", return_value=False) as record_status,
         ):
             result = easy_apply.open_easy_apply(job)
 
         self.assertTrue(result)
+        prepare_external.assert_called_once_with(
+            page=page,
+            application_identity=(
+                "linkedin-link-sha256:"
+                + hashlib.sha256(
+                    b"https://www.linkedin.com/jobs/view/1234567890/"
+                ).hexdigest()
+            ),
+            title="Backend Developer",
+            company="Example Co",
+        )
         record_status.assert_called_once_with(
             job,
             "APPLIED",
