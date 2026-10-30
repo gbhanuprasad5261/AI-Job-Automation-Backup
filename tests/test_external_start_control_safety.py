@@ -213,9 +213,12 @@ class ExternalStartControlSafetyTests(unittest.TestCase):
             patch.object(config, "AUTO_SUBMIT", True),
             patch.object(external_app, "UNKNOWN_QUESTIONS_POLICY", "SKIP"),
             patch.object(external_app, "_required_empty_count", return_value=0),
+            patch.object(external_app, "confirm_application_submission", return_value=True),
             patch.object(external_app, "_external_submission_verified", return_value=True),
         ):
-            result = external_app._auto_submit_external_application(page)
+            result = external_app._auto_submit_external_application(
+                page, "synthetic-job:1", "Synthetic role", "Example employer"
+            )
 
         self.assertEqual(result, "SUBMITTED")
         submit.click.assert_called_once_with()
