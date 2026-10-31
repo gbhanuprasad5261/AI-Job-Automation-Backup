@@ -247,6 +247,91 @@ class AnalysisFreshnessTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIn("does not match its URL", output.getvalue())
 
+    def test_one_job_id_cannot_map_to_multiple_urls_in_a_pipeline_stage(self):
+        conflicting_rows = [
+            {"Title": "Role A", "Link": "https://careers.example.test/a", "Job ID": "synthetic-42"},
+            {"Title": "Role B", "Link": "https://careers.example.test/b", "Job ID": "synthetic-42"},
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            result = self._select(
+                rows={
+                    "jobs": conflicting_rows,
+                    "details": conflicting_rows,
+                    "analysis": conflicting_rows,
+                },
+                headers={
+                    stage: ["Title", "Link", "Job ID"]
+                    for stage in ("jobs", "details", "analysis")
+                },
+            )
+        self.assertEqual(result, [])
+        self.assertIn("conflicts with multiple normalized URLs", output.getvalue())
+
+    def test_one_normalized_url_cannot_map_to_multiple_job_ids(self):
+        conflicting_rows = [
+            {"Title": "Role A", "Link": "https://careers.example.test/shared", "Job ID": "synthetic-42"},
+            {"Title": "Role B", "Link": "https://careers.example.test/shared?tracking=two", "Job ID": "synthetic-43"},
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            result = self._select(
+                rows={
+                    "jobs": conflicting_rows,
+                    "details": conflicting_rows,
+                    "analysis": conflicting_rows,
+                },
+                headers={
+                    stage: ["Title", "Link", "Job ID"]
+                    for stage in ("jobs", "details", "analysis")
+                },
+            )
+        self.assertEqual(result, [])
+        self.assertIn("conflicting job IDs", output.getvalue())
+
+    def test_repeated_job_id_and_same_normalized_url_remains_consistent(self):
+        consistent_rows = {
+            "jobs": {
+                "Title": "Backend Engineer",
+                "Link": "https://careers.example.test/role?tracking=source",
+                "Job ID": "synthetic-44",
+            },
+            "details": {
+                "Title": "Backend Engineer",
+                "Link": "https://careers.example.test/role?tracking=details",
+                "Job ID": "synthetic-44",
+            },
+            "analysis": {
+                "Title": "Backend Engineer",
+                "Link": "https://careers.example.test/role?tracking=analysis",
+                "Job ID": "synthetic-44",
+            },
+        }
+        result = self._select(
+            rows={
+                stage: [dict(consistent_rows[stage])]
+                for stage in ("jobs", "details", "analysis")
+            },
+            headers={
+                stage: ["Title", "Link", "Job ID"]
+                for stage in ("jobs", "details", "analysis")
+            },
+            analysis_jobs=[{
+                **self.JOB,
+                "Link": "https://careers.example.test/role?tracking=two",
+            }],
+        )
+        self.assertEqual(len(result), 1)
+
+    def test_missing_url_with_job_id_does_not_recommend(self):
+        row = {"Title": "Role", "Link": "", "Job ID": "synthetic-45"}
+        result = self._select(
+            rows={stage: [dict(row)] for stage in ("jobs", "details", "analysis")},
+            headers={stage: ["Title", "Link", "Job ID"] for stage in ("jobs", "details", "analysis")},
+            analysis_jobs=[{**self.JOB, "Link": ""}],
+        )
+        self.assertEqual(result, [])
+
     def test_identity_comparison_is_independent_of_row_order(self):
         self.assertEqual(self._select(), [self.JOB])
 
