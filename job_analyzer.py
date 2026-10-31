@@ -498,6 +498,11 @@ def analyze_jobs():
             if not location_matches(location):
                 skipped_location += 1
 
+        # Preserve incomplete rows for review, but never promote a job without
+        # the identity fields required by downstream application handling.
+        if not title or not company or not link:
+            application_eligible = "No"
+
         # ========================================================
         # STORE ANALYZED JOB
         # ========================================================
