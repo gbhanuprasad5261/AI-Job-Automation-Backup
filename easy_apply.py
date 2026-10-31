@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import math
 import os
 import re
 import tempfile
@@ -569,6 +570,29 @@ def _normalize_url(value):
 def _normalize_text(value):
     return " ".join((value or "").strip().lower().split())
 
+
+def _build_application_identity(job, resolved_link=None):
+    """Build the existing approval identity, rejecting explicit ID conflicts."""
+    link = resolved_link or convert_to_job_url(job.get("Link", ""))
+    if not link:
+        return None
+
+    raw_job_id = job.get("Job ID") or job.get("JobID") or ""
+    job_id = str(raw_job_id).strip()
+    url_id_match = re.search(r"/jobs/view/(\d+)(?:/|$)", _normalize_url(link))
+    url_job_id = url_id_match.group(1) if url_id_match else ""
+
+    if job_id:
+        if url_job_id and job_id != url_job_id:
+            return None
+        normalized_url_fingerprint = hashlib.sha256(
+            _normalize_url(link).encode("utf-8")
+        ).hexdigest()
+        return f"linkedin-job:{job_id}:url-sha256:{normalized_url_fingerprint}"
+
+    link_fingerprint = hashlib.sha256(link.strip().encode("utf-8")).hexdigest()
+    return f"linkedin-link-sha256:{link_fingerprint}"
+
 def _unique_title_company_match(rows, title, company, job_url=""):
     """Return a sole title/company candidate unless its URL conflicts."""
     if not title or not company:
@@ -639,6 +663,20 @@ def parse_match_score(value):
         return 0.0
 
 
+def _finite_match_score(value):
+    """Return a parsed finite score, or None for malformed score text."""
+    raw = str(value or "").strip()
+    if raw.endswith("%"):
+        raw = raw[:-1].strip()
+    if not raw or "%" in raw:
+        return None
+    try:
+        score = float(raw)
+    except (ValueError, TypeError):
+        return None
+    return score if math.isfinite(score) else None
+
+
 def is_allowed_location(location):
     text = (location or "").strip().lower()
 
@@ -681,6 +719,8 @@ def _read_job_identities(file_path):
                 None,
             )
             identities = Counter()
+            job_id_urls = {}
+            url_job_ids = {}
             for row in reader:
                 raw_url = (row.get(url_column) or "").strip()
                 normalized_url = _normalize_url(convert_to_job_url(raw_url))
@@ -693,6 +733,19 @@ def _read_job_identities(file_path):
                     )
                     return None
                 job_id = raw_id or (url_id.group(1) if url_id else "")
+
+                if job_id and normalized_url:
+                    urls_for_id = job_id_urls.setdefault(job_id, set())
+                    urls_for_id.add(normalized_url)
+                    ids_for_url = url_job_ids.setdefault(normalized_url, set())
+                    ids_for_url.add(job_id)
+                    if len(urls_for_id) > 1 or len(ids_for_url) > 1:
+                        print(
+                            f"Cannot verify job identity in {file_path}: a job ID "
+                            "conflicts with multiple normalized URLs or a URL has "
+                            "conflicting job IDs. No application candidates selected."
+                        )
+                        return None
 
                 if job_id:
                     identities[("job_id", job_id)] += 1
@@ -798,12 +851,41 @@ def get_recommended_jobs():
     if not jobs:
         return []
 
+    # Do not let score sorting choose a winner among conflicting records for
+    # one normalized URL. Compare identity and application-routing fields;
+    # score differences remain subject to the existing highest-score ordering.
+    metadata_by_url = {}
+    for job in jobs:
+        job_url = _normalize_url(
+            convert_to_job_url(job.get("Link", ""))
+        )
+        if not job_url:
+            continue
+        raw_job_id = job.get("Job ID") or job.get("JobID") or ""
+        url_id_match = re.search(r"/jobs/view/(\d+)(?:/|$)", job_url)
+        identity_id = str(raw_job_id).strip() or (
+            url_id_match.group(1) if url_id_match else ""
+        )
+        signature = (
+            identity_id,
+            _normalize_text(job.get("Title")),
+            _normalize_text(job.get("Company")),
+            _normalize_text(job.get("Location")),
+            _normalize_text(job.get("Easy Apply")),
+        )
+        metadata_by_url.setdefault(job_url, set()).add(signature)
+    ambiguous_urls = {
+        job_url
+        for job_url, signatures in metadata_by_url.items()
+        if len(signatures) > 1
+    }
+
     recommended = []
 
     for job in jobs:
-        score = parse_match_score(
-            job.get("Match Score", "0")
-        )
+        score = _finite_match_score(job.get("Match Score"))
+        if score is None:
+            continue
 
         location = (
             job.get("Location") or ""
@@ -813,9 +895,23 @@ def get_recommended_jobs():
             job.get("Title") or ""
         ).strip()
 
+        company = (
+            job.get("Company") or ""
+        ).strip()
+
+        job_url = _normalize_url(
+            convert_to_job_url(job.get("Link", ""))
+        )
+
         status = get_application_status(job)
 
         if score < config.MIN_MATCH_SCORE:
+            continue
+
+        if not title or not company or not job_url:
+            continue
+
+        if job_url in ambiguous_urls:
             continue
 
         if not is_allowed_location(location):
@@ -836,18 +932,23 @@ def get_recommended_jobs():
         ):
             continue
 
-        recommended.append(job)
+        recommended.append((score, job_url, job))
 
-    recommended.sort(
-        key=lambda x: parse_match_score(
-            x.get("Match Score", "0")
-        ),
-        reverse=True
-    )
+    recommended.sort(key=lambda item: item[0], reverse=True)
+
+    # Repeated listings for the same normalized URL should not create
+    # duplicate candidates. Sorting preserves the highest-scoring row.
+    unique_recommendations = []
+    seen_job_urls = set()
+    for _, job_url, job in recommended:
+        if job_url in seen_job_urls:
+            continue
+        seen_job_urls.add(job_url)
+        unique_recommendations.append(job)
 
     # Retain enough eligible candidates so closed/unavailable/unsupported jobs
     # can be skipped while the daily confirmed-application limit is enforced.
-    return recommended[:MAX_CANDIDATE_JOBS_PER_RUN]
+    return unique_recommendations[:MAX_CANDIDATE_JOBS_PER_RUN]
 
 
 
@@ -1742,12 +1843,10 @@ def open_easy_apply(job):
 
         return False
 
-    job_id_for_approval = job.get("Job ID") or job.get("JobID") or ""
-    if job_id_for_approval:
-        application_identity = f"linkedin-job:{str(job_id_for_approval).strip()}"
-    else:
-        link_fingerprint = hashlib.sha256(link.strip().encode("utf-8")).hexdigest()
-        application_identity = f"linkedin-link-sha256:{link_fingerprint}"
+    application_identity = _build_application_identity(job, resolved_link=link)
+    if not application_identity:
+        print("Job ID does not match the selected job URL; stopping for review.")
+        return False
     application_title = str(job.get("Title") or "").strip()
     application_company = str(job.get("Company") or "").strip()
 
